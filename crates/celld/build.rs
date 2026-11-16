@@ -15,7 +15,10 @@
 //! other V8 code in: a mirror or URL for the binding, the trybuild shortcut
 //! (which skips the archive), a build from source, and a debug build (which
 //! selects another archive). Any failure stops celld from linking, whichever
-//! build script runs first. A target without a pinned archive fails too.
+//! build script runs first. A target without a pinned archive fails too:
+//! each target's pin is its own (`.cargo/config.toml` for
+//! x86_64-unknown-linux-gnu, `.cargo/<target>.toml`, given with `--config`,
+//! for another).
 //!
 //! Which `v8` features are on is not checked here: only this repository's
 //! manifests can turn them on (Cargo.lock shows celld alone depends on v8),
@@ -64,7 +67,8 @@ fn main() {
     assert!(
         archive.ends_with(&format!("/librusty_v8_release_{target}.a.gz")),
         "no pinned V8 archive for {target}: RUSTY_V8_ARCHIVE is {archive:?}; \
-         build from the repository so .cargo/config.toml applies (docs/v8.md)"
+         build from the repository so .cargo/config.toml applies, and for a target \
+         with a pin of its own pass it: cargo --config .cargo/{target}.toml (docs/v8.md)"
     );
     let archive_sha = std::env::var("RUSTY_V8_ARCHIVE_SHA256").unwrap_or_default();
     assert!(
