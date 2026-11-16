@@ -557,9 +557,23 @@ impl OutputCursor {
     }
 }
 
-/// A line of output as text, without its carriage return.
+/// A line of output as text, without its carriage return. The guest wrote
+/// it, so it is logged as data: a control character other than a tab, or
+/// one that reorders text, is escaped (`\r`, `\u{1b}`, `\u{202e}`), as a
+/// terminal showing the node's log would act on it, and could show a line
+/// with a prefix the guest wrote.
 fn text(line: &[u8]) -> String {
-    String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(line)).into_owned()
+    let line = String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(line));
+    let mut shown = String::with_capacity(line.len());
+    for c in line.chars() {
+        let reorders = matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        if (c.is_control() && c != '\t') || reorders {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
 }
 
 /// Where the output new since `last` begins in `next`, two reads of one
@@ -1043,7 +1057,9 @@ fn serve_intercepts(
 /// an id of its own: `container_intercept` as it reaches the node, then
 /// `container_intercept_answered` with its answer's status, or
 /// `container_intercept_dropped` when the guest's request goes away before
-/// the binding answers (its connection closed). Its path, never its query.
+/// the binding answers (its connection closed). Its method and host only:
+/// a path or query may carry a credential (a bot API's token is in its
+/// path), and so may a failing binding's error, which goes to the guest.
 struct InterceptLog {
     id: u64,
     started_us: u64,
@@ -1060,7 +1076,6 @@ impl InterceptLog {
         route: &crate::container::ServiceRoute,
         method: &str,
         host: &str,
-        path: &str,
     ) -> InterceptLog {
         let id = INTERCEPT_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
@@ -1073,7 +1088,6 @@ impl InterceptLog {
             entrypoint = route.entrypoint.as_deref().unwrap_or("default"),
             method,
             host,
-            path,
             "a container's request reached its intercept"
         );
         InterceptLog {
@@ -1098,15 +1112,14 @@ impl InterceptLog {
         );
     }
 
-    fn failed(&mut self, error: &anyhow::Error) {
+    fn failed(&mut self) {
         self.ended = true;
         tracing::warn!(
             event = "container_intercept_answered",
             intercept = self.id,
             status = 502,
             ms = self.ms(),
-            error = %format!("{error:#}"),
-            "the intercept's binding failed"
+            "the intercept's binding failed: its error went to the container"
         );
     }
 }
@@ -1176,7 +1189,7 @@ async fn intercepted(
     // fork: the request's start and its end (its answer's head, or the
     // request going away before it) are logged under its cell, run and
     // binding: a guest's request the binding holds is otherwise invisible.
-    let mut log = InterceptLog::start(&cell, run, index, &route, &method, &host, req.uri().path());
+    let mut log = InterceptLog::start(&cell, run, index, &route, &method, &host);
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -1273,7 +1286,7 @@ async fn intercepted(
     let response = match runtime.fetch_service(call).await {
         Ok(r) => r,
         Err(e) => {
-            log.failed(&e);
+            log.failed();
             return plain(502, format!("the intercept's binding: {e:#}"));
         }
     };
@@ -1306,6 +1319,75 @@ async fn intercepted(
 mod tests {
     use super::*;
     use crate::container::OutputMode;
+
+    /// A writer the tests' log subscriber appends to.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `f` logs, as the node's text formatter writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Goal: an intercepted request's log names its method and host, never
+    /// a credential in its path or query, nor one a failing binding's error
+    /// quotes: a bot API's token is in its path, and a binding may throw
+    /// with a header in its message. Invalid: neither is in the log.
+    #[test]
+    fn intercept_log_holds_no_credential() {
+        crate::container::tests::rt();
+        let route = crate::container::ServiceRoute {
+            generation: 1,
+            script: "egress".into(),
+            entrypoint: None,
+            props: Vec::new(),
+        };
+        let log = logged(|| {
+            // The request was to /bot123456:PATH_SECRET/sendMessage, and its
+            // binding threw "authorization failed for Bearer HEADER_SECRET":
+            // the log is given neither.
+            let mut failed = InterceptLog::start("Box:1", 3, 0, &route, "POST", "api.telegram.org");
+            failed.failed();
+            let _dropped = InterceptLog::start("Box:1", 3, 0, &route, "GET", "api.telegram.org");
+        });
+        assert!(log.contains("container_intercept_answered") && log.contains("container_intercept_dropped"), "{log}");
+        assert!(log.contains("api.telegram.org") && log.contains("POST"), "{log}");
+        for secret in ["PATH_SECRET", "HEADER_SECRET"] {
+            assert!(!log.contains(secret), "{secret} is in the log: {log}");
+        }
+    }
+
+    /// Goal: a guest's output is logged as data. A carriage return, an
+    /// escape or a character that reorders text is shown escaped, so a line
+    /// can't overwrite or fake the log's own prefix on a terminal. Valid: a
+    /// tab and other text stay as written; a line's own `\r\n` end is cut.
+    #[test]
+    fn guest_output_cannot_forge_a_log_line() {
+        let forged = "innocent\r2099-01-01T00:00:00Z ERROR celld: FORGED\u{1b}[2K\u{202e}txt.exe\ttab é";
+        assert_eq!(
+            text(forged.as_bytes()),
+            "innocent\\r2099-01-01T00:00:00Z ERROR celld: FORGED\\u{1b}[2K\\u{202e}txt.exe\ttab é"
+        );
+        assert_eq!(text(b"a whole line\r"), "a whole line");
+        let log = logged(|| Output::new("Box:1", 3).advance(&format!("{forged}\n"), "", true, false));
+        assert!(log.contains("FORGED"), "{log}");
+        assert!(!log.contains('\r') && !log.contains('\u{202e}'), "{log:?}");
+    }
 
     #[test]
     fn frames_have_docker_headers() {

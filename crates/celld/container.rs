@@ -1730,7 +1730,7 @@ pub(crate) fn node_prefix(node: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
@@ -1880,7 +1880,7 @@ mod tests {
 
     /// The runtime the engine's tasks run on in these tests (asyncrt takes
     /// one process handle, once).
-    fn rt() -> &'static tokio::runtime::Runtime {
+    pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
         static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         RUNTIME.get_or_init(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();

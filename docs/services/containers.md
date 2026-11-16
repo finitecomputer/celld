@@ -130,8 +130,11 @@ Each intercepted request is logged as `container_intercept`, with an id, the
 cell, the run, the intercept's index, and the binding. Its end is logged as
 `container_intercept_answered` with the status, or as
 `container_intercept_dropped` when the container's request goes away before the
-binding answers. On the Docker engine, a container's output stays in Docker's
-own logs.
+binding answers. The log names a request's method and host, never its path,
+query, headers or body, or the binding's error, any of which may carry a
+credential. A container's output is logged as data: its control characters,
+other than a tab, and the characters that reorder text are escaped. On the
+Docker engine, a container's output stays in Docker's own logs.
 
 The Docker engine has no snapshots and no interception, and those calls reject
 with an error naming the engine. Its `exec()` inherits the container's whole
