@@ -195,6 +195,13 @@ pub enum Release {
     Destroy,
 }
 
+/// fork: how often the node asks an engine that reports memory in use, and
+/// how long a report counts. Past it a container counts its cap again, so
+/// an engine that stops answering cannot leave the node admitting on old
+/// numbers.
+const IN_USE_POLL: Duration = Duration::from_secs(2);
+const IN_USE_FRESH_MS: u64 = 10_000;
+
 /// The default inactivity window after an idle eviction when the object
 /// never set one. The `@cloudflare/containers` alarm wakes the object well
 /// inside this to enforce `sleepAfter`, so this is the backstop for an
@@ -313,7 +320,11 @@ struct RunInfo {
     labels: BTreeMap<String, String>,
     from_snapshot: bool,
     started: bool,
+    /// The instance type's memory: the container's cap.
     memory_bytes: u64,
+    /// fork: what the engine last reported the run holding that the machine
+    /// cannot take back, and when (`asyncrt::mono_ms`).
+    in_use: Option<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -454,6 +465,24 @@ impl CellContainer {
     /// immediately, so the run they both mean must exist before either
     /// effect runs, or the monitor would find the previous run's exit and
     /// report the new container dead on arrival.
+    /// fork: what the running container counts against the node at `now`
+    /// (`asyncrt::mono_ms`), `None` when it is not running.
+    fn counted_memory_bytes(&self, now: u64) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        state.running.then(|| {
+            let cap = match state.info.memory_bytes {
+                0 => instance_memory_bytes(self.spec.instance_type.as_deref()),
+                bytes => bytes,
+            };
+            let in_use = state
+                .info
+                .in_use
+                .filter(|(_, at)| now.saturating_sub(*at) <= IN_USE_FRESH_MS)
+                .map(|(bytes, _)| bytes);
+            celld_logic::pressure::container_counted_bytes(cap, in_use)
+        })
+    }
+
     pub fn begin_run(&self) -> u64 {
         let mut state = self.state.lock().unwrap();
         state.run += 1;
@@ -590,6 +619,19 @@ pub(crate) trait Backend: Send + Sync {
     /// fork: lets go of what the backend holds outside the engine (the krun
     /// backend's intercept socket), at the node's stop.
     fn close(&self) {}
+
+    /// fork: whether `memory_in_use` reports anything; the node polls it
+    /// only then.
+    fn reports_memory(&self) -> bool {
+        false
+    }
+
+    /// fork: what each running container holds that the machine cannot take
+    /// back, by container name. Empty for an engine that does not say
+    /// (Docker), whose containers then count their caps.
+    async fn memory_in_use(&self) -> anyhow::Result<Vec<(String, u64)>> {
+        Ok(Vec::new())
+    }
 
     /// fork: shows run `run`'s output as the container writes it, each line
     /// an event (`container_output`), as Cloudflare shows a container's
@@ -781,7 +823,19 @@ pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
                 ),
                 EngineChoice::None => anyhow::bail!("this node runs no computers"),
             };
-            Ok(Arc::new(ContainerEngine::connect(backend, node, bucket).await?))
+            let engine = Arc::new(ContainerEngine::connect(backend, node, bucket).await?);
+            if engine.backend.reports_memory() {
+                // Ends when the engine does (the node's stop drops it).
+                let weak = Arc::downgrade(&engine);
+                asyncrt::spawn(async move {
+                    loop {
+                        asyncrt::sleep(IN_USE_POLL).await;
+                        let Some(engine) = weak.upgrade() else { return };
+                        engine.refresh_in_use().await;
+                    }
+                });
+            }
+            Ok(engine)
         })
         .await
         .cloned()
@@ -1091,23 +1145,40 @@ impl ContainerEngine {
             .map(|i| (i.route.clone(), cell.scope.clone(), state.run))
     }
 
-    /// The memory the node's running containers reserve, summed over their
-    /// instance caps. A cell whose container is not running reserves
-    /// nothing: a stopped container holds no memory, and an idle eviction
-    /// stops it before the sample would count it.
+    /// The memory the node's running containers reserve: each its cap, or
+    /// what it uses plus room to grow once its engine has reported that
+    /// within `IN_USE_FRESH_MS` (`celld_logic::pressure::container_counted_bytes`).
+    /// A cell whose container is not running reserves nothing: a stopped
+    /// container holds no memory.
     pub fn reserved_memory_bytes(&self) -> u64 {
+        let now = asyncrt::mono_ms();
         self.cells
             .lock()
             .unwrap()
             .values()
-            .filter_map(|cell| {
-                let state = cell.state.lock().unwrap();
-                state.running.then(|| match state.info.memory_bytes {
-                    0 => instance_memory_bytes(cell.spec.instance_type.as_deref()),
-                    bytes => bytes,
-                })
-            })
+            .filter_map(|cell| cell.counted_memory_bytes(now))
             .sum()
+    }
+
+    /// fork: asks the engine what each running container holds and keeps
+    /// it on the container's current run, for `reserved_memory_bytes`.
+    async fn refresh_in_use(&self) {
+        let reports = match self.backend.memory_in_use().await {
+            Ok(reports) => reports,
+            Err(error) => {
+                tracing::debug!(error = %format!("{error:#}"), "container memory in use: no report");
+                return;
+            }
+        };
+        let now = asyncrt::mono_ms();
+        for (name, bytes) in reports {
+            if let Some(cell) = self.cell_named(&name) {
+                let mut state = cell.state.lock().unwrap();
+                if state.running {
+                    state.info.in_use = Some((bytes, now));
+                }
+            }
+        }
     }
 
     /// This node's running containers per class.
@@ -1343,6 +1414,7 @@ impl ContainerEngine {
                 from_snapshot: params.snapshot.is_some(),
                 started: false,
                 memory_bytes,
+                in_use: None,
             };
             state.intercepts.iter().map(|i| i.rule.clone()).collect::<Vec<_>>()
         };
@@ -1788,6 +1860,7 @@ pub(crate) mod tests {
         launched: Mutex<Vec<InterceptRule>>,
         installed: Mutex<Vec<InterceptRule>>,
         seen_by_exec: Mutex<Vec<Vec<String>>>,
+        in_use: Mutex<Vec<(String, u64)>>,
     }
 
     impl Fake {
@@ -1870,6 +1943,12 @@ pub(crate) mod tests {
             *self.installed.lock().unwrap() = intercepts.to_vec();
             Ok(())
         }
+        fn reports_memory(&self) -> bool {
+            true
+        }
+        async fn memory_in_use(&self) -> anyhow::Result<Vec<(String, u64)>> {
+            Ok(self.in_use.lock().unwrap().clone())
+        }
         fn restores_snapshots(&self) -> bool {
             false
         }
@@ -1937,6 +2016,42 @@ pub(crate) mod tests {
             asyncrt::sleep(Duration::from_millis(1)).await;
         }
         panic!("{n} intercepts were never recorded");
+    }
+
+    // Goal: a running container counts its cap until the engine reports
+    // what it uses, then that plus a quarter of its cap; a report older
+    // than IN_USE_FRESH_MS counts the cap again, a new run starts from its
+    // cap, and a container that is not running counts nothing.
+    #[test]
+    fn containers_count_what_they_use_once_reported() {
+        rt().block_on(async {
+            const MIB: u64 = 1 << 20;
+            let fake = Arc::new(Fake::default());
+            let engine = an_engine(&fake).await;
+            let cell = a_box();
+            engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+            let params = || StartParams {
+                instance: Some(Instance::Custom { vcpu: 2.0, memory_mib: 6144, disk_mb: 16_000 }),
+                ..start_img()
+            };
+            let run = cell.begin_run();
+            engine.start(&cell, run, params()).await.expect("started");
+            let cap = 6144 * MIB;
+            assert_eq!(engine.reserved_memory_bytes(), cap, "no report yet");
+            *fake.in_use.lock().unwrap() = vec![(cell.name.clone(), 300 * MIB), ("someone-else".into(), 1)];
+            engine.refresh_in_use().await;
+            assert_eq!(engine.reserved_memory_bytes(), 300 * MIB + cap / 4);
+            let at = cell.state.lock().unwrap().info.in_use.expect("reported").1;
+            assert_eq!(cell.counted_memory_bytes(at + IN_USE_FRESH_MS), Some(300 * MIB + cap / 4));
+            assert_eq!(cell.counted_memory_bytes(at + IN_USE_FRESH_MS + 1), Some(cap), "stale: the cap");
+            let run = cell.begin_run();
+            engine.start(&cell, run, params()).await.expect("started again");
+            assert_eq!(engine.reserved_memory_bytes(), cap, "a new run starts from its cap");
+            cell.state.lock().unwrap().running = false;
+            engine.refresh_in_use().await;
+            assert_eq!(engine.reserved_memory_bytes(), 0, "not running");
+            assert_eq!(cell.state.lock().unwrap().info.in_use, None, "a stopped container takes no report");
+        });
     }
 
     // Goal (review round 2, finding 1): a rule set while the start prepares

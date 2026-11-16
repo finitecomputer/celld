@@ -94,11 +94,12 @@ pub struct Load {
     ///
     /// A container runs in its own cgroup, a sibling of the node's, so its
     /// memory is in neither the process RSS nor the node's cgroup charge. It
-    /// is real memory on the machine all the same, and a container can grow
-    /// to its instance-type cap at any moment, so the node counts each
-    /// running container's cap as committed. Both measurements add it: the
-    /// ordinary ceiling so the node stops taking cells before the machine
-    /// fills, and the hard cap so the absolute limit sees the whole charge.
+    /// is real memory on the machine all the same. Each running container
+    /// counts as [`container_counted_bytes`] says: its instance-type cap
+    /// until its engine reports what it uses, then that plus room to grow.
+    /// Both measurements add it: the ordinary ceiling so the node stops
+    /// taking cells before the machine fills, and the hard cap so the
+    /// absolute limit sees the whole charge.
     pub container_reserved_bytes: u64,
 }
 
@@ -132,6 +133,35 @@ impl Load {
             Metric::InUse => self.memory_bytes(),
             Metric::Rss => self.hard_bytes(),
         }
+    }
+}
+
+/// The share of a container's cap counted on top of what it uses, as room to
+/// grow between samples: a quarter.
+pub const CONTAINER_HEADROOM_DIVISOR: u64 = 4;
+
+/// What one running container counts against the node's memory.
+///
+/// `cap` is its instance type's memory, which its engine enforces as the
+/// container's hard limit. `in_use` is what the engine last reported the
+/// container holding that the machine cannot take back (a krun VM's charge
+/// less the host's page cache of its disks), or `None` when there is no
+/// fresh report: an engine that reports none (Docker), a container still
+/// starting, or an engine that stopped answering.
+///
+/// Without a report the cap counts, as it always did: a container can grow
+/// to it at any moment. With one, an idle computer holding 300 MiB of a
+/// 6 GiB cap counts 300 MiB plus a quarter of its cap, so a node admits by
+/// what its containers use and not by what they may use; counting caps
+/// turned a 12 GiB box away from its second computer. The quarter is room
+/// to grow between reports. The count never passes the cap, which is all
+/// the container can ever hold.
+pub fn container_counted_bytes(cap: u64, in_use: Option<u64>) -> u64 {
+    match in_use {
+        None => cap,
+        Some(bytes) => bytes
+            .saturating_add(cap / CONTAINER_HEADROOM_DIVISOR)
+            .min(cap),
     }
 }
 
@@ -308,4 +338,51 @@ pub fn may_pin_outbound(pinned_cells: usize, ceiling: Option<usize>) -> bool {
         // node rather than merely budgeted.
         pinned_cells < (cap.saturating_mul(MAX_OUTBOUND_PIN_PERCENT) / 100).max(1)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+
+    // Goal: a container counts its cap until its engine reports, then what
+    // it uses plus a quarter of its cap, never past the cap.
+    #[test]
+    fn a_container_counts_what_it_uses_plus_room() {
+        let cap = 6 * GIB;
+        assert_eq!(container_counted_bytes(cap, None), cap, "no report: the cap");
+        assert_eq!(
+            container_counted_bytes(cap, Some(300 * MIB)),
+            300 * MIB + 1536 * MIB,
+            "an idle computer"
+        );
+        assert_eq!(container_counted_bytes(cap, Some(5 * GIB)), cap, "never past the cap");
+        assert_eq!(container_counted_bytes(cap, Some(u64::MAX)), cap);
+        assert_eq!(container_counted_bytes(cap, Some(0)), cap / 4);
+        assert_eq!(container_counted_bytes(256 * MIB, Some(10 * MIB)), 74 * MIB, "lite");
+    }
+
+    // Goal: on a 12 GiB machine, at the default ceiling, idle computers
+    // counted by use leave room where their caps did not.
+    #[test]
+    fn idle_computers_fit_where_caps_did_not() {
+        let config = PressureConfig::from_limits(Some(12 * GIB), None);
+        let node = |containers: u64| Load {
+            resident_cells: 1,
+            rss_bytes: 400 * MIB,
+            in_use_bytes: 400 * MIB,
+            cgroup_working_set_bytes: None,
+            cgroup_current_bytes: None,
+            container_reserved_bytes: containers,
+        };
+        let shed = |load| config.classify(load, Latches::default()).1;
+        let caps = |n: u64| n * container_counted_bytes(6 * GIB, None);
+        let used = |n: u64| n * container_counted_bytes(6 * GIB, Some(300 * MIB));
+        assert_eq!(shed(node(caps(1))), None);
+        assert!(shed(node(caps(2))).is_some(), "two caps: shedding, so no third");
+        assert_eq!(shed(node(used(5))), None, "five idle computers");
+        assert_eq!(shed(node(used(6))), Some(SHED_MEMORY));
+    }
 }

@@ -213,6 +213,21 @@ impl Backend for KrunBackend {
         Ok(())
     }
 
+    fn reports_memory(&self) -> bool {
+        true
+    }
+
+    /// sandcastle's `memoryInUseBytes`: a VM's charge less the host's page
+    /// cache of its disks. An engine too old to report it reports nothing.
+    async fn memory_in_use(&self) -> anyhow::Result<Vec<(String, u64)>> {
+        let list = self
+            .api
+            .expect("GET", "/v1/containers", None, "list containers")
+            .await?
+            .json()?;
+        Ok(in_use_of(&list))
+    }
+
     async fn prepare(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -691,6 +706,20 @@ pub(crate) async fn load_dev_images(socket: &Path, images: &[String]) -> anyhow:
         loaded.push(image.clone());
     }
     Ok(loaded)
+}
+
+/// The engine's list as (name, memory in use) for each container that
+/// reports it.
+fn in_use_of(list: &Value) -> Vec<(String, u64)> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?;
+            let bytes = entry.get("memoryInUseBytes")?.as_u64()?;
+            Some((name.to_string(), bytes))
+        })
+        .collect()
 }
 
 fn intercepts_json(intercepts: &[InterceptRule]) -> Value {
@@ -1387,6 +1416,18 @@ mod tests {
         let log = logged(|| Output::new("Box:1", 3).advance(&format!("{forged}\n"), "", true, false));
         assert!(log.contains("FORGED"), "{log}");
         assert!(!log.contains('\r') && !log.contains('\u{202e}'), "{log:?}");
+    }
+
+    #[test]
+    fn memory_in_use_from_the_list() {
+        let list = json!([
+            {"name": "a", "running": true, "memoryBytes": 4_000, "memoryInUseBytes": 3_000},
+            {"name": "b", "running": true, "memoryBytes": 4_000},
+            {"name": "c", "memoryInUseBytes": null},
+            {"memoryInUseBytes": 1},
+        ]);
+        assert_eq!(super::in_use_of(&list), vec![("a".to_string(), 3_000)]);
+        assert!(super::in_use_of(&json!({"error": "no"})).is_empty());
     }
 
     #[test]
