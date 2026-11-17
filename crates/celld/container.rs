@@ -186,6 +186,78 @@ pub fn owns_address(scope: &str, host: &str, port: u16) -> bool {
     state.running && state.address.serves(host, port)
 }
 
+/// fork: this node's running containers, by cell, for the walk down. Empty
+/// when no engine has connected.
+pub fn container_samples() -> Vec<celld_logic::pressure::ContainerSample> {
+    engine_if_ready().map_or_else(Vec::new, |engine| engine.samples())
+}
+
+/// fork: the containers that may be put to sleep now, the least recently
+/// active first, as the core last listed them (`State::sleepable_containers`,
+/// once a sample): what a start the engine refuses for want of memory puts
+/// to sleep to make room.
+pub fn set_sleepable(scopes: Vec<String>) {
+    if let Some(engine) = engine_if_ready() {
+        *engine.sleepable.lock().unwrap() = scopes;
+    }
+}
+
+/// fork: the engine refused a start for want of memory (krun: 429, "the
+/// node's memory for VMs is spent"). The engine admits a container by its
+/// instance type's whole memory, the node by what its containers use
+/// (`celld_logic::pressure::container_counted_bytes`), so the engine can be
+/// full while the node is not shedding.
+#[derive(Debug)]
+pub(crate) struct EngineFull(pub String);
+
+impl std::fmt::Display for EngineFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EngineFull {}
+
+/// fork: a start the engine refused for want of memory, with no idle
+/// container to put to sleep for it, or refused again after one slept.
+#[derive(Debug)]
+pub struct NoRoomForContainer {
+    pub engine: String,
+    pub slept: Option<String>,
+}
+
+impl std::fmt::Display for NoRoomForContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.slept {
+            None => write!(f, "no room for the container: the engine's memory is spent ({}), and no idle container could be put to sleep to make room", self.engine),
+            Some(slept) => write!(f, "no room for the container: the engine's memory is spent ({}), even after the idle container of {slept} was put to sleep", self.engine),
+        }
+    }
+}
+
+impl std::error::Error for NoRoomForContainer {}
+
+/// fork: why a container is swept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+    /// Its inactivity window ran out.
+    Inactivity,
+    /// A walk down short of memory put it to sleep early.
+    Memory,
+    /// A start the engine refused for want of memory put it to sleep.
+    Room,
+}
+
+impl Sweep {
+    fn as_str(self) -> &'static str {
+        match self {
+            Sweep::Inactivity => "inactivity",
+            Sweep::Memory => "memory",
+            Sweep::Room => "room",
+        }
+    }
+}
+
 /// How a cell stop treats its container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Release {
@@ -201,6 +273,17 @@ pub enum Release {
 /// numbers.
 const IN_USE_POLL: Duration = Duration::from_secs(2);
 const IN_USE_FRESH_MS: u64 = 10_000;
+
+/// fork: how long a sweep waits for the container to exit after its
+/// signal to stop (SIGTERM) before it kills it: ten seconds, Docker's own
+/// stop timeout. A guest is told to stop and given time to flush; an object
+/// that stops its own container waits less (Fragment's computer, five
+/// seconds). Cloudflare gives a container fifteen minutes at a host's
+/// shutdown, which a node short of memory cannot wait.
+pub(crate) const SWEEP_GRACE: Duration = Duration::from_secs(10);
+
+/// fork: the signal a sweep sends first.
+const SIGTERM: u32 = 15;
 
 /// The default inactivity window after an idle eviction when the object
 /// never set one. The `@cloudflare/containers` alarm wakes the object well
@@ -222,6 +305,7 @@ const DEFAULT_ENV: &[&str] = &[
 /// counts two (IPv4 and IPv6), an address or a range one.
 pub const INTERCEPT_ENTRIES_MAX: usize = 128;
 
+#[derive(Clone)]
 pub struct StartParams {
     /// One of the class's images; `None` takes the class's default.
     pub image: Option<String>,
@@ -333,9 +417,16 @@ struct CellState {
     /// Where the node dials the container.
     address: Address,
     inactivity: Option<Duration>,
-    /// The pending destroy after an idle eviction, aborted when the cell
+    /// The timer of the stop after an idle eviction, aborted when the cell
     /// returns (dropping a task handle only detaches it).
     sweeper: Option<asyncrt::TaskHandle<()>>,
+    /// fork: when its cell let it go (an eviction that keeps it, monotonic
+    /// ms): it runs on its inactivity timer alone. `None` while its cell
+    /// holds it.
+    released_mono_ms: Option<u64>,
+    /// fork: its sweep, once begun (`ContainerEngine::begin_sweep`): true
+    /// once that stop has ended. A cell that comes back waits for it.
+    sweeping: Option<watch::Receiver<bool>>,
     /// Bumped per start so a wait from a previous run cannot report for
     /// this one.
     run: u64,
@@ -657,6 +748,10 @@ pub struct ContainerEngine {
     /// load the tar once.
     images: Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>,
     cells: Mutex<HashMap<String, Arc<CellContainer>>>,
+    /// fork: `SWEEP_GRACE`, shorter in a test.
+    sweep_grace: Duration,
+    /// fork: `set_sleepable`'s list.
+    sleepable: Mutex<Vec<String>>,
 }
 
 /// Which engine `CELLD_CONTAINER_ENGINE` names.
@@ -1031,6 +1126,8 @@ impl ContainerEngine {
             bucket,
             images: Mutex::new(HashMap::new()),
             cells: Mutex::new(HashMap::new()),
+            sweep_grace: SWEEP_GRACE,
+            sleepable: Mutex::new(Vec::new()),
         })
     }
 
@@ -1073,26 +1170,60 @@ impl ContainerEngine {
     /// class with a spec; the object's `running` reads the answer.
     pub async fn attach(&self, scope: &str, class: &str) -> anyhow::Result<Arc<CellContainer>> {
         let spec = spec(class).ok_or_else(|| anyhow!("class {class} has no container"))?;
-        let cell = {
-            let mut cells = self.cells.lock().unwrap();
-            let cell = cells.entry(scope.to_string()).or_insert_with(|| {
-                Arc::new(CellContainer {
-                    scope: scope.to_string(),
-                    name: container_name(&self.node, scope),
-                    spec,
-                    state: Mutex::new(CellState::default()),
-                    processes: Mutex::new(Vec::new()),
-                    exit: watch::channel(None).0,
-                    outcomes: Mutex::new(BTreeMap::new()),
-                    up: watch::channel(0).0,
-                    intercepts_sent: tokio::sync::Mutex::new(()),
-                })
-            });
-            // A returning cell cancels the destroy its eviction armed.
-            if let Some(sweeper) = cell.state.lock().unwrap().sweeper.take() {
-                sweeper.abort();
+        let mut waited = false;
+        let cell = loop {
+            let (cell, sweeping) = {
+                let mut cells = self.cells.lock().unwrap();
+                let cell = cells
+                    .entry(scope.to_string())
+                    .or_insert_with(|| {
+                        Arc::new(CellContainer {
+                            scope: scope.to_string(),
+                            name: container_name(&self.node, scope),
+                            spec: spec.clone(),
+                            state: Mutex::new(CellState::default()),
+                            processes: Mutex::new(Vec::new()),
+                            exit: watch::channel(None).0,
+                            outcomes: Mutex::new(BTreeMap::new()),
+                            up: watch::channel(0).0,
+                            intercepts_sent: tokio::sync::Mutex::new(()),
+                        })
+                    })
+                    .clone();
+                let mut state = cell.state.lock().unwrap();
+                let sweeping = state
+                    .sweeping
+                    .clone()
+                    .filter(|done| !waited && !*done.borrow());
+                if sweeping.is_none() {
+                    // A returning cell cancels the stop its eviction armed.
+                    if let Some(sweeper) = state.sweeper.take() {
+                        sweeper.abort();
+                    }
+                    state.released_mono_ms = None;
+                }
+                drop(state);
+                (cell, sweeping)
+            };
+            let Some(mut done) = sweeping else { break cell };
+            // fork: its sweep is under way. The cell comes back once that stop
+            // has ended and taken its handle (its container gone): bounded by
+            // the sweep's grace and its kill. Past that, it takes the handle
+            // as it is.
+            waited = true;
+            let ended = asyncrt::timeout(self.sweep_grace + Duration::from_secs(30), async {
+                while !*done.borrow_and_update() {
+                    if done.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+            .await;
+            if ended.is_ok() {
+                waited = false;
+            } else {
+                tracing::warn!(scope, "container sweep still under way past its grace: the cell takes its container as it is");
             }
-            cell.clone()
         };
         let running = self.backend.running(&cell.name).await?;
         // A container this handle did not start, left running by an
@@ -1254,12 +1385,36 @@ impl ContainerEngine {
     /// object's `start()` returns before this completes, as on Cloudflare;
     /// a failure surfaces through `monitor()`.
     pub async fn start(
-        &self,
+        self: &Arc<Self>,
         cell: &Arc<CellContainer>,
         run: u64,
         params: StartParams,
     ) -> anyhow::Result<()> {
-        let started = self.create_and_start(cell, params).await;
+        let again = params.clone();
+        let mut started = self.create_and_start(cell, params).await;
+        // fork: refused for want of memory, the start makes room: the idlest
+        // container that may sleep sleeps, as a walk down puts it to sleep,
+        // and the start is tried once more. With none, or refused again, it
+        // fails as no room (`NoRoomForContainer`).
+        let full = started
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<EngineFull>())
+            .map(|full| full.0.clone());
+        if let Some(engine) = full {
+            let slept = self.make_room(cell).await;
+            let ours = {
+                let state = cell.state.lock().unwrap();
+                state.run == run && state.destroyed != Some(run)
+            };
+            started = match (slept, ours) {
+                (Some(slept), true) => match self.create_and_start(cell, again).await {
+                    Err(error) if error.downcast_ref::<EngineFull>().is_some() => Err(NoRoomForContainer { engine, slept: Some(slept) }.into()),
+                    other => other,
+                },
+                (slept, _) => Err(NoRoomForContainer { engine, slept }.into()),
+            };
+        }
         let (address, launched) = match started {
             Ok(started) => started,
             Err(error) => {
@@ -1614,17 +1769,19 @@ impl ContainerEngine {
         };
         match release {
             Release::Keep => {
-                let window = cell
-                    .state
-                    .lock()
-                    .unwrap()
-                    .inactivity
-                    .unwrap_or(DEFAULT_INACTIVITY);
+                let window = {
+                    let mut state = cell.state.lock().unwrap();
+                    if state.sweeping.is_some() {
+                        return;
+                    }
+                    state.released_mono_ms = Some(asyncrt::mono_ms());
+                    state.inactivity.unwrap_or(DEFAULT_INACTIVITY)
+                };
                 let engine = self.clone();
                 let cell_ = cell.clone();
                 let sweeper = asyncrt::spawn(async move {
                     asyncrt::sleep(window).await;
-                    engine.forget(&cell_).await;
+                    engine.begin_sweep(&cell_, Sweep::Inactivity);
                 });
                 if let Some(previous) = cell.state.lock().unwrap().sweeper.replace(sweeper) {
                     previous.abort();
@@ -1634,8 +1791,182 @@ impl ContainerEngine {
         }
     }
 
+    /// fork: makes room for `starting`, whose start the engine refused for
+    /// want of memory: puts the idlest container that may sleep to sleep
+    /// (`set_sleepable`; never `starting`'s own, never one its cell holds),
+    /// and waits for its stop to end, so its memory is the engine's again.
+    /// The cell whose container slept, or `None` when none could.
+    async fn make_room(self: &Arc<Self>, starting: &CellContainer) -> Option<String> {
+        let candidates = self.sleepable.lock().unwrap().clone();
+        for scope in candidates.into_iter().filter(|scope| *scope != starting.scope) {
+            let Some(cell) = self.cell(&scope) else { continue };
+            let waits = {
+                if !self.begin_sleep(&cell, Sweep::Room) {
+                    continue;
+                }
+                cell.state.lock().unwrap().sweeping.clone()
+            };
+            tracing::info!(
+                event = "container_slept_for_memory",
+                scope = %scope,
+                why = "a start the engine refused",
+                starting = %starting.scope,
+                "idle container put to sleep for memory"
+            );
+            if let Some(mut done) = waits {
+                let _ = asyncrt::timeout(self.sweep_grace + Duration::from_secs(30), async {
+                    while !*done.borrow_and_update() {
+                        if done.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                })
+                .await;
+            }
+            return Some(scope);
+        }
+        None
+    }
+
+    /// fork: puts the container of the cell `scope` to sleep now, for
+    /// memory, as the core chose it (its object at no work: no request, no
+    /// socket, idle past its window): the sweep its inactivity timer would
+    /// begin, early, when its cell let it go; else the same stop, its cell
+    /// keeping the handle, whose `monitor()` sees the run end. Once: false
+    /// when it is not running or already stopping.
+    pub fn sleep_for_memory(self: &Arc<Self>, scope: &str) -> bool {
+        self.cell(scope)
+            .is_some_and(|cell| self.begin_sleep(&cell, Sweep::Memory))
+    }
+
+    /// fork: `sleep_for_memory`'s stop, for `why`.
+    fn begin_sleep(self: &Arc<Self>, cell: &Arc<CellContainer>, why: Sweep) -> bool {
+        if cell.state.lock().unwrap().released_mono_ms.is_some() {
+            return self.begin_sweep(cell, why);
+        }
+        let (run, done) = {
+            let mut state = cell.state.lock().unwrap();
+            if !state.running || state.sweeping.is_some() || state.released_mono_ms.is_some() {
+                return false;
+            }
+            let (done, waits) = watch::channel(false);
+            state.sweeping = Some(waits);
+            (state.run, done)
+        };
+        let engine = self.clone();
+        let cell = cell.clone();
+        asyncrt::spawn(async move {
+            engine.stop_gracefully(&cell, run, why).await;
+            // its cell keeps the handle: a stop it can follow, then none
+            cell.state.lock().unwrap().sweeping = None;
+            done.send_replace(true);
+        })
+        .detach();
+        true
+    }
+
+    /// fork: begins the cell's sweep, once, if its cell let it go: the stop
+    /// `sleepAfter` makes (`stop_gracefully`), then its handle goes. A cell
+    /// that comes back meanwhile waits for it (`attach`). The timer that
+    /// armed it is spent: aborted when the sweep is early.
+    fn begin_sweep(self: &Arc<Self>, cell: &Arc<CellContainer>, why: Sweep) -> bool {
+        let (run, running, done) = {
+            let mut state = cell.state.lock().unwrap();
+            if state.released_mono_ms.is_none() || state.sweeping.is_some() {
+                return false;
+            }
+            let (done, waits) = watch::channel(false);
+            state.sweeping = Some(waits);
+            if let Some(timer) = state.sweeper.take() {
+                // the timer calls this at its end: never abort that call
+                if why != Sweep::Inactivity {
+                    timer.abort();
+                }
+            }
+            (state.run, state.running, done)
+        };
+        let engine = self.clone();
+        let cell = cell.clone();
+        asyncrt::spawn(async move {
+            if running {
+                // its stop ends with the kill (`destroy`)
+                engine.stop_gracefully(&cell, run, why).await;
+                engine.let_go(&cell);
+            } else {
+                engine.forget(&cell).await;
+            }
+            done.send_replace(true);
+        })
+        .detach();
+        true
+    }
+
+    /// fork: the stop of a sweep, as Cloudflare's `sleepAfter` makes it: the
+    /// signal to stop (SIGTERM), up to `sweep_grace` for run `run` to exit,
+    /// then the kill (`destroy`) unless a later run began. The object's
+    /// `monitor()` sees the run end as it ended: its own exit, or the kill's.
+    async fn stop_gracefully(&self, cell: &Arc<CellContainer>, run: u64, why: Sweep) {
+        let t0 = asyncrt::mono_ms();
+        let signalled = self.backend.signal(&cell.name, SIGTERM).await;
+        let mut ends = cell.exit.subscribe();
+        let ended = |ends: &watch::Receiver<Option<(u64, Result<RunExit, String>)>>| {
+            cell.current_run() != run
+                || cell.ended(run).is_some()
+                || matches!(&*ends.borrow(), Some((ended, _)) if *ended == run)
+        };
+        let exited = asyncrt::timeout(self.sweep_grace, async {
+            while !ended(&ends) {
+                if ends.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        let killed = !exited && cell.current_run() == run && cell.running();
+        if cell.current_run() == run {
+            let _ = self.destroy(cell).await;
+        }
+        tracing::info!(
+            event = "container_swept",
+            scope = %cell.scope,
+            run,
+            why = why.as_str(),
+            signalled = signalled.is_ok(),
+            exited,
+            killed,
+            ms = asyncrt::mono_ms().saturating_sub(t0),
+            "container stopped: signalled to stop, then removed"
+        );
+    }
+
+    /// fork: each running container, by its cell, for the walk down.
+    pub fn samples(&self) -> Vec<celld_logic::pressure::ContainerSample> {
+        let now = asyncrt::mono_ms();
+        self.cells
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|cell| {
+                let counted_bytes = cell.counted_memory_bytes(now)?;
+                let state = cell.state.lock().unwrap();
+                Some(celld_logic::pressure::ContainerSample {
+                    cell: cell.scope.clone(),
+                    counted_bytes,
+                    released_mono_ms: state.released_mono_ms,
+                    stopping: state.sweeping.is_some(),
+                })
+            })
+            .collect()
+    }
+
     async fn forget(&self, cell: &Arc<CellContainer>) {
         let _ = self.destroy(cell).await;
+        self.let_go(cell);
+    }
+
+    /// The handle goes, and the processes it ran with it.
+    fn let_go(&self, cell: &Arc<CellContainer>) {
         for id in cell.processes.lock().unwrap().drain(..) {
             drop_process(id);
         }
@@ -1889,6 +2220,39 @@ pub(crate) mod tests {
         in_use_meanwhile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// How long a sampled report takes to be answered.
         in_use_delay: Mutex<Option<std::time::Duration>>,
+        /// Whether a run ends at all: off, `wait` never answers, as before.
+        ends: AtomicBool,
+        /// Whether the guest exits on its own at SIGTERM (code 0); otherwise
+        /// only the removal ends it (137).
+        exits_at_term: AtomicBool,
+        /// Each start, refusal, signal and removal asked of a container:
+        /// what, its name, and when (`asyncrt::mono_ms`).
+        asked: Mutex<Vec<(String, String, u64)>>,
+        /// Each container's end, once it came: what `wait` answers.
+        exit: Mutex<HashMap<String, i64>>,
+        exited: tokio::sync::Notify,
+        /// How many starts from now on the engine refuses for want of
+        /// memory, as krun's 429 does.
+        full: AtomicU64,
+    }
+
+    impl Fake {
+        fn end(&self, name: &str, code: i64) {
+            let mut exit = self.exit.lock().unwrap();
+            if !exit.contains_key(name) {
+                exit.insert(name.to_string(), code);
+                self.exited.notify_waiters();
+            }
+        }
+
+        fn ask(&self, what: &str, name: &str) {
+            self.asked.lock().unwrap().push((what.to_string(), name.to_string(), asyncrt::mono_ms()));
+        }
+
+        /// What was asked of the container `name`, in order.
+        fn asked_of(&self, name: &str) -> Vec<String> {
+            self.asked.lock().unwrap().iter().filter(|(_, n, _)| n == name).map(|(what, ..)| what.clone()).collect()
+        }
     }
 
     impl Fake {
@@ -1938,7 +2302,14 @@ pub(crate) mod tests {
         async fn running(&self, _: &str) -> anyhow::Result<Option<Address>> {
             Ok(None)
         }
-        async fn create_and_start(&self, _: &str, launch: Launch) -> anyhow::Result<Address> {
+        async fn create_and_start(&self, name: &str, launch: Launch) -> anyhow::Result<Address> {
+            if self.full.load(Ordering::SeqCst) > 0 {
+                self.full.fetch_sub(1, Ordering::SeqCst);
+                self.ask("refused", name);
+                return Err(EngineFull("start container failed with [429] the node's memory for VMs is spent (30720 of 32768 MiB)".into()).into());
+            }
+            self.ask("start", name);
+            self.exit.lock().unwrap().remove(name);
             *self.launched.lock().unwrap() = launch.intercepts.clone();
             self.launch.pass().await;
             if let Some(refused) = self.refuses(&launch.intercepts) {
@@ -1947,13 +2318,29 @@ pub(crate) mod tests {
             *self.installed.lock().unwrap() = launch.intercepts;
             Ok(Address::None)
         }
-        async fn wait(&self, _: &str) -> anyhow::Result<RunExit> {
-            std::future::pending().await
+        async fn wait(&self, name: &str) -> anyhow::Result<RunExit> {
+            if !self.ends.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            loop {
+                let notified = self.exited.notified();
+                if let Some(code) = self.exit.lock().unwrap().get(name) {
+                    return Ok(RunExit { code: *code, destroyed: false });
+                }
+                notified.await;
+            }
         }
-        async fn signal(&self, _: &str, _: u32) -> anyhow::Result<()> {
+        async fn signal(&self, name: &str, signal: u32) -> anyhow::Result<()> {
+            self.ask(&format!("signal {signal}"), name);
+            if signal == SIGTERM && self.exits_at_term.load(Ordering::SeqCst) {
+                self.end(name, 0);
+            }
             Ok(())
         }
-        async fn remove(&self, _: &str) {}
+        async fn remove(&self, name: &str) {
+            self.ask("remove", name);
+            self.end(name, 137);
+        }
         async fn exec(&self, _: &str, _: &ExecParams) -> anyhow::Result<ExecStarted> {
             let seen = self.installed.lock().unwrap().iter().map(|r| r.target.clone()).collect();
             self.seen_by_exec.lock().unwrap().push(seen);
@@ -2087,6 +2474,164 @@ pub(crate) mod tests {
             engine.refresh_in_use().await;
             assert_eq!(engine.reserved_memory_bytes(), 0, "not running");
             assert_eq!(cell.state.lock().unwrap().info.in_use, None, "a stopped container takes no report");
+        });
+    }
+
+    // Goal (fork): a container is put to sleep for memory exactly as its
+    // inactivity timer puts it to sleep, and that stop is the signal to
+    // stop (SIGTERM), then the kill only after the grace: a guest that
+    // exits at the signal is never killed (removed once it has exited), one
+    // that does not is killed once the grace is out and never before. Its
+    // object's monitor() sees the run end as it ended. A container its cell
+    // let go of goes with its handle (a sweep); one whose loaded but idle
+    // object still holds it stops the same way, its handle kept, not
+    // running. Replay: a sleep is asked once (the second ask is refused).
+    // Method: the fake engine records each signal and removal with when it
+    // came; the grace is 400 ms here; inactivity windows of 50 ms and 60 s.
+    #[test]
+    fn a_sleep_for_memory_is_the_inactivity_stop_early() {
+        rt().block_on(async {
+            for (why, obeys, held) in [
+                (Sweep::Memory, true, false),
+                (Sweep::Memory, false, false),
+                (Sweep::Inactivity, true, false),
+                (Sweep::Inactivity, false, false),
+                (Sweep::Memory, true, true),
+                (Sweep::Memory, false, true),
+            ] {
+                let case = format!("{why:?} obeys {obeys} held {held}");
+                let fake = Arc::new(Fake::default());
+                fake.ends.store(true, Ordering::SeqCst);
+                fake.exits_at_term.store(obeys, Ordering::SeqCst);
+                let mut engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap();
+                engine.sweep_grace = Duration::from_millis(400);
+                let engine = Arc::new(engine);
+                let cell = a_box();
+                engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+                let run = cell.begin_run();
+                engine.start(&cell, run, start_img()).await.expect("started");
+                if !held {
+                    cell.set_inactivity(Duration::from_millis(if why == Sweep::Memory { 60_000 } else { 50 }));
+                    engine.release(&cell.scope, Release::Keep).await;
+                }
+                let sample = engine.samples();
+                assert_eq!(sample.len(), 1);
+                assert_eq!((sample[0].released_mono_ms.is_some(), sample[0].stopping), (!held, false), "{case}: {sample:?}");
+                if why == Sweep::Memory {
+                    assert!(engine.sleep_for_memory(&cell.scope), "{case}: it sleeps");
+                    assert!(!engine.sleep_for_memory(&cell.scope), "{case}: once");
+                }
+                for _ in 0..500 {
+                    let stopped = if held { cell.ended(run).is_some() && cell.state.lock().unwrap().sweeping.is_none() } else { engine.cell(&cell.scope).is_none() };
+                    if stopped {
+                        break;
+                    }
+                    asyncrt::sleep(Duration::from_millis(10)).await;
+                }
+                if held {
+                    assert!(engine.cell(&cell.scope).is_some() && !cell.running(), "{case}: its cell keeps the handle, not running");
+                } else {
+                    assert!(engine.cell(&cell.scope).is_none(), "{case}: its handle goes once it stopped");
+                }
+                let asked = fake.asked.lock().unwrap().clone();
+                let names: Vec<&str> = asked.iter().map(|(what, ..)| what.as_str()).collect();
+                assert_eq!(names, ["start", "signal 15", "remove"], "{case}: the signal to stop, then the kill");
+                let waited = asked[2].2 - asked[1].2;
+                let ended = cell.ended(run).expect("the run's end is kept for its monitor()").expect("an exit");
+                if obeys {
+                    assert!(waited < 400, "{case}: exited at the signal, removed at once ({waited} ms)");
+                    assert_eq!(ended, RunExit { code: 0, destroyed: false }, "{case}: its own exit");
+                } else {
+                    assert!(waited >= 400, "{case}: never killed inside the grace ({waited} ms)");
+                    assert_eq!(ended, RunExit { code: 137, destroyed: true }, "{case}: the kill");
+                }
+            }
+        });
+    }
+
+    /// A cell of class `Box` named `scope`.
+    fn a_box_named(scope: &str) -> Arc<CellContainer> {
+        Arc::new(CellContainer { scope: scope.into(), name: container_name("node-a", scope), ..Arc::into_inner(a_box()).unwrap() })
+    }
+
+    // Goal (fork): the engine admits a container by its whole memory, the
+    // node by what its containers use, so a start can meet a full engine
+    // (krun's 429) on a node that sheds nothing. Such a start makes room:
+    // the idlest container that may sleep (the core's list) is put to sleep
+    // as a walk down puts one (its cell's handle gone, or kept by a loaded
+    // idle object), its stop ended before the start is tried once more,
+    // which then runs. Invalid: with none that may sleep (the list empty,
+    // or naming only the starting cell itself), the start fails as no
+    // room, a typed error, and puts nothing to sleep; refused again after one slept, it fails so too,
+    // having slept only that one. Each refused start reads `running` from
+    // its start() (as workerd's does) until it fails, then never again,
+    // and its monitor() answers the error. Method: the fake engine refuses
+    // the next starts, as krun's 429; the grace is 400 ms.
+    #[test]
+    fn a_start_refused_for_memory_makes_room_once() {
+        rt().block_on(async {
+            for (case, refusals, sleepable) in [
+                ("room made", 1, vec!["Box:idle"]),
+                ("room made from one its idle cell holds", 1, vec!["Box:held"]),
+                ("nothing may sleep", 1, vec![]),
+                ("only itself", 1, vec!["Box:new"]),
+                ("refused again", 2, vec!["Box:idle"]),
+            ] {
+                let fake = Arc::new(Fake::default());
+                fake.ends.store(true, Ordering::SeqCst);
+                fake.exits_at_term.store(true, Ordering::SeqCst);
+                let mut engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap();
+                engine.sweep_grace = Duration::from_millis(400);
+                let engine = Arc::new(engine);
+                let [idle, held, new] = ["Box:idle", "Box:held", "Box:new"].map(a_box_named);
+                for cell in [&idle, &held, &new] {
+                    engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+                }
+                for cell in [&idle, &held] {
+                    let run = cell.begin_run();
+                    engine.start(cell, run, start_img()).await.expect("started");
+                }
+                idle.set_inactivity(Duration::from_secs(60));
+                engine.release(&idle.scope, Release::Keep).await;
+                *engine.sleepable.lock().unwrap() = sleepable.into_iter().map(String::from).collect();
+                fake.full.store(refusals, Ordering::SeqCst);
+                let run = new.begin_run();
+                assert!(new.running(), "{case}: running from its start(), as workerd's");
+                let started = engine.start(&new, run, start_img()).await;
+                let slept = fake.asked_of(&idle.name);
+                match case {
+                    "room made from one its idle cell holds" => {
+                        assert!(started.is_ok(), "{case}: {started:?}");
+                        assert_eq!(fake.asked_of(&held.name), ["start", "signal 15", "remove"], "{case}: the held one slept, the signal to stop first");
+                        assert_eq!(slept, ["start"], "{case}: only the one the core named");
+                        assert!(engine.cell(&held.scope).is_some() && !held.running(), "{case}: its cell keeps the handle");
+                        assert!(new.running(), "{case}: it runs");
+                    }
+                    "room made" => {
+                        assert!(started.is_ok(), "{case}: {started:?}");
+                        assert_eq!(slept, ["start", "signal 15", "remove"], "{case}: the idle one slept, the signal to stop first");
+                        assert_eq!(fake.asked_of(&new.name), ["refused", "start"], "{case}: tried once more, after the sleep");
+                        let order: Vec<String> = fake.asked.lock().unwrap().iter().map(|(what, name, _)| format!("{what} {name}")).collect();
+                        let at = |x: &str| order.iter().position(|o| o == x).unwrap();
+                        assert!(at(&format!("remove {}", idle.name)) < at(&format!("start {}", new.name)), "{case}: its stop ended first: {order:?}");
+                        assert!(new.running() && new.ended(run).is_none(), "{case}: it runs");
+                        assert_eq!(idle.ended(1), Some(Ok(RunExit { code: 0, destroyed: false })), "{case}: the slept one's monitor() sees its own exit");
+                    }
+                    _ => {
+                        let error = started.expect_err(case);
+                        let no_room = error.downcast_ref::<NoRoomForContainer>().unwrap_or_else(|| panic!("{case}: typed: {error:#}"));
+                        assert_eq!(no_room.slept.is_some(), case == "refused again", "{case}: {no_room}");
+                        assert!(no_room.to_string().contains("[429] the node's memory for VMs is spent"), "{case}: names the engine's error: {no_room}");
+                        let tried = fake.asked_of(&new.name);
+                        assert_eq!(tried, if case == "refused again" { vec!["refused", "refused"] } else { vec!["refused"] }, "{case}");
+                        assert_eq!(slept, if case == "refused again" { vec!["start", "signal 15", "remove"] } else { vec!["start"] }, "{case}: at most one slept");
+                        assert_eq!(fake.asked_of(&held.name), ["start"], "{case}: one the core did not name never sleeps");
+                        assert!(!new.running() && new.inspect().is_none(), "{case}: refused, it never reads running again");
+                        let ended = new.ended(run).expect("its monitor() is answered");
+                        assert!(ended.as_ref().is_err_and(|e| e.contains("no room for the container")), "{case}: {ended:?}");
+                    }
+                }
+            }
         });
     }
 

@@ -2673,7 +2673,17 @@ impl Actor {
             container_reserved_bytes: crate::container::reserved_memory_bytes(),
         };
         let now_mono_ms = crate::asyncrt::mono_ms();
-        self.drive(Event::LoadSampled { load, now_mono_ms }, out);
+        let containers = crate::container::container_samples();
+        self.drive(
+            Event::LoadSampled {
+                load,
+                now_mono_ms,
+                containers,
+            },
+            out,
+        );
+        // what a start the engine refuses for want of memory may put to sleep
+        crate::container::set_sleepable(self.state.sleepable_containers(now_mono_ms));
         // Report a change of shed reason once. `rss-hard` retains its
         // established name, but in a Linux cgroup it says
         // `memory.current` crossed the absolute cap.
@@ -3283,6 +3293,26 @@ impl Actor {
                         authority_expires_ms,
                     },
                     &self.ownership,
+                );
+            }
+            Effect::SleepContainer {
+                cell,
+                counted_bytes,
+                idle_ms,
+            } => {
+                // fork: the walk down could not get the node down by
+                // evictions: this idle container sleeps, as its inactivity
+                // timer would put it to sleep, early. Its object sees the
+                // same end. Logged in the node's own log, never the owner's.
+                let slept = crate::container::engine_if_ready()
+                    .is_some_and(|engine| engine.sleep_for_memory(&cell));
+                tracing::info!(
+                    event = "container_slept_for_memory",
+                    scope = %cell,
+                    counted_bytes,
+                    idle_ms,
+                    slept,
+                    "idle container put to sleep for memory"
                 );
             }
             Effect::ReadLocalCells => {

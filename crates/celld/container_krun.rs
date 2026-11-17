@@ -294,12 +294,24 @@ impl Backend for KrunBackend {
         if let Some(entrypoint) = &launch.entrypoint {
             body["entrypoint"] = json!(entrypoint);
         }
-        self.post(
-            &format!("/v1/containers/{name}/start?wait=ready"),
-            body,
-            "start container",
-        )
-        .await?;
+        let path = format!("/v1/containers/{name}/start?wait=ready");
+        let reply = self.api.call("POST", &path, Some(body)).await?;
+        // fork: the engine admits a VM by its whole memory: refused for want
+        // of it, the start may make room (`EngineFull`)
+        if reply.status.as_u16() == 429 {
+            return Err(crate::container::EngineFull(format!(
+                "start container failed with [429] {}",
+                reply.message_or_error()
+            ))
+            .into());
+        }
+        if !reply.status.is_success() {
+            return Err(anyhow!(
+                "start container failed with [{}] {}",
+                reply.status.as_u16(),
+                reply.message_or_error()
+            ));
+        }
         Ok(Address::Forwarded(Arc::new(Forwarder::new(name, &self.ports))))
     }
 

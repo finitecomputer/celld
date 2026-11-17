@@ -165,6 +165,105 @@ pub fn container_counted_bytes(cap: u64, in_use: Option<u64>) -> u64 {
     }
 }
 
+/// One running container, as the shell samples it for the walk down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerSample {
+    /// The cell (the Durable Object) the container belongs to.
+    pub cell: String,
+    /// What it counts against the node now: [`container_counted_bytes`].
+    pub counted_bytes: u64,
+    /// When its cell left this node's runtime and its container stayed on
+    /// its inactivity timer (monotonic ms), or `None` while the cell holds
+    /// it. Only a container its cell has let go of is ever put to sleep.
+    pub released_mono_ms: Option<u64>,
+    /// A stop of it is under way: what it counts is already on its way
+    /// back.
+    pub stopping: bool,
+}
+
+/// A container the walk down may put to sleep, weighed with what the core
+/// knows of its cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SleepCandidate<'a> {
+    pub cell: &'a str,
+    pub counted_bytes: u64,
+    /// Its object is resident, or about to be: an open socket, a request
+    /// in flight or waiting for it, an alarm firing, or a container its
+    /// cell still holds. Such a container is never put to sleep.
+    pub resident: bool,
+    /// The cell's last activity (monotonic ms).
+    pub last_active_mono_ms: u64,
+    pub stopping: bool,
+}
+
+/// How long a container's cell must have done nothing before a walk down
+/// may put the container to sleep: two minutes.
+///
+/// An object may still save what its container did after its last activity:
+/// Fragment's computer saves `/data` 30 s after its guest's last turn or its
+/// owner's last port tab ends, then holds the guest and copies. A stop
+/// inside that delay cuts the save short and loses that work, so the window
+/// exceeds it, with the save's own time on top.
+pub const CONTAINER_QUIET_MS: u64 = 2 * 60_000;
+
+/// The containers a latched walk down puts to sleep, in the order it puts
+/// them: none while the evictions are projected to bring `sample_bytes` to
+/// `resume_line` (`evictions_return_bytes`); otherwise the least recently
+/// active first, and only as many as the rest needs, counting a stop
+/// already under way as memory on its way back. Never one whose object is
+/// resident, nor one whose cell did anything in the last
+/// [`CONTAINER_QUIET_MS`]: what can't be put to sleep stays, and the latch
+/// holds.
+///
+/// A sleep is the stop the container's inactivity timer makes, early: its
+/// object sees the same end, and its next activation starts it again.
+pub fn containers_to_sleep<'a>(
+    sample_bytes: u64,
+    resume_line: u64,
+    evictions_return_bytes: u64,
+    candidates: &[SleepCandidate<'a>],
+    now_mono_ms: u64,
+) -> Vec<&'a str> {
+    let stopping: u64 = candidates
+        .iter()
+        .filter(|c| c.stopping)
+        .map(|c| c.counted_bytes)
+        .fold(0, u64::saturating_add);
+    let mut need = sample_bytes
+        .saturating_sub(resume_line)
+        .saturating_sub(evictions_return_bytes)
+        .saturating_sub(stopping);
+    let mut chosen = Vec::new();
+    for candidate in sleepable(candidates, now_mono_ms) {
+        if need == 0 {
+            break;
+        }
+        chosen.push(candidate.cell);
+        need = need.saturating_sub(candidate.counted_bytes);
+    }
+    chosen
+}
+
+/// The containers that may be put to sleep now, the least recently active
+/// first: none whose object is resident, none already stopping, none whose
+/// cell did anything in the last [`CONTAINER_QUIET_MS`]. The walk down takes
+/// as many of them as it needs ([`containers_to_sleep`]); a start the
+/// engine refuses for want of memory takes the first.
+pub fn sleepable<'a, 'b>(candidates: &'b [SleepCandidate<'a>], now_mono_ms: u64) -> Vec<&'b SleepCandidate<'a>> {
+    let mut idle: Vec<&SleepCandidate<'a>> = candidates
+        .iter()
+        .filter(|c| {
+            !c.resident
+                && !c.stopping
+                && now_mono_ms.saturating_sub(c.last_active_mono_ms) >= CONTAINER_QUIET_MS
+        })
+        .collect();
+    // Least recently active first; the cell breaks a tie, so the choice is
+    // a function of the sample and not of its order.
+    idle.sort_by_key(|c| (c.last_active_mono_ms, c.cell));
+    idle
+}
+
 /// The latch engaged because the memory the cells hold crossed the ceiling.
 /// This is the ordinary case, and shedding relieves it.
 pub const SHED_MEMORY: &str = "memory";
@@ -362,6 +461,82 @@ mod tests {
         assert_eq!(container_counted_bytes(cap, Some(u64::MAX)), cap);
         assert_eq!(container_counted_bytes(cap, Some(0)), cap / 4);
         assert_eq!(container_counted_bytes(256 * MIB, Some(10 * MIB)), 74 * MIB, "lite");
+    }
+
+    // The containers of a 12 GiB node's walk down: three idle computers
+    // released at different times, and one whose object is resident.
+    fn computers(now: u64) -> Vec<SleepCandidate<'static>> {
+        let idle = |cell, quiet_for: u64| SleepCandidate {
+            cell,
+            counted_bytes: 2 * GIB,
+            resident: false,
+            last_active_mono_ms: now - quiet_for,
+            stopping: false,
+        };
+        vec![
+            idle("Computer:b", 10 * 60_000),
+            idle("Computer:a", 30 * 60_000),
+            SleepCandidate { resident: true, ..idle("Computer:busy", 60 * 60_000) },
+            idle("Computer:c", 5 * 60_000),
+        ]
+    }
+
+    // Goal: the least recently active idle container sleeps first, and
+    // only as many as the walk down needs: one when one is enough, two
+    // when the first does not cover it, and every idle one, no more, when
+    // even that falls short.
+    #[test]
+    fn the_idlest_container_sleeps_first_and_only_as_many_as_needed() {
+        let now = 100 * 60_000;
+        let line = 8 * GIB;
+        let sleep = |over: u64| containers_to_sleep(line + over, line, 0, &computers(now), now);
+        assert_eq!(sleep(GIB), vec!["Computer:a"], "one covers a GiB over");
+        assert_eq!(sleep(2 * GIB), vec!["Computer:a"], "exactly one's worth");
+        assert_eq!(sleep(2 * GIB + 1), vec!["Computer:a", "Computer:b"], "a byte past one");
+        assert_eq!(sleep(100 * GIB), vec!["Computer:a", "Computer:b", "Computer:c"], "all the idle ones, never the resident");
+        assert_eq!(sleep(0), Vec::<&str>::new(), "at the line: none");
+        let all = computers(now);
+        let order: Vec<&str> = sleepable(&all, now).iter().map(|c| c.cell).collect();
+        assert_eq!(order, ["Computer:a", "Computer:b", "Computer:c"], "what a refused start takes first: the idlest");
+        assert_eq!(containers_to_sleep(line - 1, line, 0, &computers(now), now), Vec::<&str>::new(), "below it: none");
+    }
+
+    // Goal: a container whose object is resident (a socket, a request in
+    // flight or waiting, a person watching) is never put to sleep, however
+    // idle its cell looks and however far over the node is; nor one whose
+    // cell did anything within CONTAINER_QUIET_MS, which is longer than an
+    // object's save after its last activity (Fragment's 30 s).
+    #[test]
+    fn a_resident_or_recently_active_container_never_sleeps() {
+        const { assert!(CONTAINER_QUIET_MS > 30_000) };
+        let now = 100 * 60_000;
+        let line = 8 * GIB;
+        let resident: Vec<_> = computers(now).into_iter().map(|c| SleepCandidate { resident: true, ..c }).collect();
+        assert_eq!(containers_to_sleep(line + 100 * GIB, line, 0, &resident, now), Vec::<&str>::new());
+        let recent = |quiet_for| SleepCandidate { cell: "Computer:new", counted_bytes: 2 * GIB, resident: false, last_active_mono_ms: now - quiet_for, stopping: false };
+        assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(CONTAINER_QUIET_MS - 1)], now), Vec::<&str>::new(), "a millisecond inside the window");
+        assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(CONTAINER_QUIET_MS)], now), vec!["Computer:new"], "at its end");
+        assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(0)], 0), Vec::<&str>::new(), "a clock at its start");
+    }
+
+    // Goal: nothing sleeps while the evictions alone are projected to
+    // reach the line; what they fall short by is what sleeps; and a stop
+    // already under way counts as memory on its way back, so a sample
+    // that still holds it asks for no second sleep. Replay: the same
+    // sample asks the same.
+    #[test]
+    fn nothing_sleeps_when_evictions_reach_the_line() {
+        let now = 100 * 60_000;
+        let line = 8 * GIB;
+        let all = computers(now);
+        assert_eq!(containers_to_sleep(line + 3 * GIB, line, 3 * GIB, &all, now), Vec::<&str>::new(), "evictions cover it");
+        assert_eq!(containers_to_sleep(line + 3 * GIB, line, u64::MAX, &all, now), Vec::<&str>::new());
+        assert_eq!(containers_to_sleep(line + 3 * GIB, line, 2 * GIB, &all, now), vec!["Computer:a"], "a GiB short");
+        let mut stopping = all.clone();
+        stopping[1].stopping = true;
+        assert_eq!(containers_to_sleep(line + 2 * GIB, line, 0, &stopping, now), Vec::<&str>::new(), "its sleep under way covers it");
+        assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now), vec!["Computer:b"], "the next idlest for the rest");
+        assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now), containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now));
     }
 
     // Goal: on a 12 GiB machine, at the default ceiling, idle computers

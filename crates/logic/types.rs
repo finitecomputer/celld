@@ -868,6 +868,11 @@ pub enum Event {
     LoadSampled {
         load: pressure::Load,
         now_mono_ms: u64,
+        /// The node's running containers, each by its cell: which cells
+        /// hold one (an eviction made for room keeps such a cell, and its
+        /// container, on this node), and what a latched walk down may put
+        /// to sleep when evictions alone cannot get it down.
+        containers: Vec<pressure::ContainerSample>,
     },
     /// Retire an exact cached remote route after a dispatch failure which is
     /// known not to have executed the request. Newer route generations are
@@ -1023,6 +1028,17 @@ pub enum EvictionAdmission {
 /// completion events with an obsolete `op` are ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// Put the cell's container to sleep now for memory: the stop its
+    /// inactivity timer would make (a signal to stop, then the kill after
+    /// the grace), early. Its cell is not resident. The shell logs it as
+    /// `container_slept_for_memory`.
+    SleepContainer {
+        cell: CellId,
+        /// What it counted against the node when the walk down chose it.
+        counted_bytes: u64,
+        /// How long its cell had done nothing.
+        idle_ms: u64,
+    },
     EvictionAdmission {
         request: RequestId,
         result: Result<EvictionAdmission, EvictError>,

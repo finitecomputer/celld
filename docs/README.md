@@ -397,7 +397,9 @@ The node that receives a request activates a new cell, so a load balancer
 must include a new node in its rotation. A node at its residency cap or
 under memory pressure hands the activation to the least-loaded peer. A
 pressure eviction releases the ownership record
-(`CELLD_PRESSURE_OWNERSHIP=release`, the default), so the cell can move.
+(`CELLD_PRESSURE_OWNERSHIP=release`, the default), so the cell can move,
+unless the cell's container runs on this node: such a cell stays
+([containers](services/containers.md)).
 An idle eviction keeps the record, so the cell wakes on its own node. An
 idle eviction must stop the runtime within `CELLD_OPERATION_DEADLINE_MS`,
 or the cell stays resident until the next idle period.
