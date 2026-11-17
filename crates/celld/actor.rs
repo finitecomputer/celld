@@ -467,6 +467,20 @@ pub enum Message {
     /// A periodic resource sample. The measuring is the shell's job; every
     /// decision that follows belongs to the core.
     SampleLoad(crate::host_services::HostMetricsSample),
+    /// fork: a cell's container started or stopped running
+    /// (`crate::container`), told as it happens.
+    ContainerRunning {
+        cell: String,
+        running: bool,
+    },
+    /// fork: a start of `starting`'s container that the engine refused for
+    /// want of memory asks for room: the idlest container that may sleep now
+    /// (`State::sleepable_containers`, as of this step) is put to sleep, and
+    /// the answer names its cell, or none.
+    MakeRoom {
+        starting: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
     /// The log tier changed the folded log object the next lease write
     /// must carry (lease-fold): renew now so the change becomes durable.
     NudgeNodeLease,
@@ -2682,8 +2696,6 @@ impl Actor {
             },
             out,
         );
-        // what a start the engine refuses for want of memory may put to sleep
-        crate::container::set_sleepable(self.state.sleepable_containers(now_mono_ms));
         // Report a change of shed reason once. `rss-hard` retains its
         // established name, but in a Linux cgroup it says
         // `memory.current` crossed the absolute cap.
@@ -2891,6 +2903,23 @@ impl Actor {
                     _ => None,
                 };
                 let _ = reply.send(epoch);
+            }
+            Message::ContainerRunning { cell, running } => {
+                self.drive(Event::ContainerRunning { cell, running }, out)
+            }
+            Message::MakeRoom { starting, reply } => {
+                let candidates: Vec<String> = self
+                    .state
+                    .sleepable_containers(crate::asyncrt::mono_ms())
+                    .into_iter()
+                    .filter(|cell| *cell != starting)
+                    .collect();
+                let slept = crate::container::engine_if_ready()
+                    .and_then(|engine| engine.sleep_one_for_room(&candidates));
+                if let Some(cell) = &slept {
+                    self.state.note_container_sleep(cell);
+                }
+                let _ = reply.send(slept);
             }
             Message::SampleLoad(metrics) if self.preserving => self.live_load.store_sample(metrics),
             Message::SampleLoad(metrics) => self.sample_load(metrics, out),

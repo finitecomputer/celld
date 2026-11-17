@@ -192,13 +192,21 @@ pub fn container_samples() -> Vec<celld_logic::pressure::ContainerSample> {
     engine_if_ready().map_or_else(Vec::new, |engine| engine.samples())
 }
 
-/// fork: the containers that may be put to sleep now, the least recently
-/// active first, as the core last listed them (`State::sleepable_containers`,
-/// once a sample): what a start the engine refuses for want of memory puts
-/// to sleep to make room.
-pub fn set_sleepable(scopes: Vec<String>) {
-    if let Some(engine) = engine_if_ready() {
-        *engine.sleepable.lock().unwrap() = scopes;
+/// fork: the node's actor, which the engine tells each container's start
+/// and end, and asks for room (`ContainerEngine::make_room`).
+static ACTOR: OnceLock<mpsc::UnboundedSender<crate::actor::Message>> = OnceLock::new();
+
+/// fork: links the engine to the node's actor, once, at the node's start.
+pub fn set_actor(tx: mpsc::UnboundedSender<crate::actor::Message>) {
+    let _ = ACTOR.set(tx);
+}
+
+/// fork: tells the core the cell's container started or stopped running,
+/// as it happens: a cell that holds one stays on this node through an
+/// eviction made for room (`State::holds_container`).
+fn tell_running(scope: &str, running: bool) {
+    if let Some(actor) = ACTOR.get() {
+        let _ = actor.send(crate::actor::Message::ContainerRunning { cell: scope.to_string(), running });
     }
 }
 
@@ -575,6 +583,7 @@ impl CellContainer {
     }
 
     pub fn begin_run(&self) -> u64 {
+        tell_running(&self.scope, true);
         let mut state = self.state.lock().unwrap();
         state.run += 1;
         state.running = true;
@@ -750,8 +759,12 @@ pub struct ContainerEngine {
     cells: Mutex<HashMap<String, Arc<CellContainer>>>,
     /// fork: `SWEEP_GRACE`, shorter in a test.
     sweep_grace: Duration,
-    /// fork: `set_sleepable`'s list.
-    sleepable: Mutex<Vec<String>>,
+    /// fork: how long past its grace a sweep may take before what waits on
+    /// it goes on (`sweep_bound`): 30 s, its signal and removal included.
+    sweep_slack: Duration,
+    /// fork: the actor `make_room` asks, when not the node's (`ACTOR`): a
+    /// test's.
+    actor: Option<mpsc::UnboundedSender<crate::actor::Message>>,
 }
 
 /// Which engine `CELLD_CONTAINER_ENGINE` names.
@@ -1127,7 +1140,8 @@ impl ContainerEngine {
             images: Mutex::new(HashMap::new()),
             cells: Mutex::new(HashMap::new()),
             sweep_grace: SWEEP_GRACE,
-            sleepable: Mutex::new(Vec::new()),
+            sweep_slack: Duration::from_secs(30),
+            actor: None,
         })
     }
 
@@ -1211,7 +1225,7 @@ impl ContainerEngine {
             // the sweep's grace and its kill. Past that, it takes the handle
             // as it is.
             waited = true;
-            let ended = asyncrt::timeout(self.sweep_grace + Duration::from_secs(30), async {
+            let ended = asyncrt::timeout(self.sweep_bound(), async {
                 while !*done.borrow_and_update() {
                     if done.changed().await.is_err() {
                         return;
@@ -1245,7 +1259,9 @@ impl ContainerEngine {
         let mut state = cell.state.lock().unwrap();
         state.running = running.is_some();
         state.address = running.unwrap_or_default();
+        let runs = state.running;
         drop(state);
+        tell_running(&cell.scope, runs);
         Ok(cell)
     }
 
@@ -1390,6 +1406,20 @@ impl ContainerEngine {
         run: u64,
         params: StartParams,
     ) -> anyhow::Result<()> {
+        // fork: a sweep of this cell under way (its container stopping, its
+        // removal by name to come) ends before this start makes one under
+        // that name: bounded by the sweep's grace and its kill
+        let sweeping = cell.state.lock().unwrap().sweeping.clone();
+        if let Some(mut done) = sweeping {
+            let _ = asyncrt::timeout(self.sweep_bound(), async {
+                while !*done.borrow_and_update() {
+                    if done.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+            .await;
+        }
         let again = params.clone();
         let mut started = self.create_and_start(cell, params).await;
         // fork: refused for want of memory, the start makes room: the idlest
@@ -1435,6 +1465,7 @@ impl ContainerEngine {
                     state.start_failed = Some((run, format!("{error:#}")));
                 }
                 drop(state);
+                tell_running(&cell.scope, false);
                 cell.record(run, Err(format!("{error:#}")));
                 cell.up.send_replace(run);
                 return Err(error);
@@ -1508,17 +1539,21 @@ impl ContainerEngine {
                 let latest = cell_.state.lock().unwrap().run == run;
                 end(latest).await;
             }
-            let destroyed = {
+            let (destroyed, ended) = {
                 let mut state = cell_.state.lock().unwrap();
                 let destroyed = state.destroyed == Some(run);
-                if state.run == run {
+                let ended = state.run == run;
+                if ended {
                     state.running = false;
                     if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
                         forwarder.close();
                     }
                 }
-                destroyed
+                (destroyed, ended)
             };
+            if ended {
+                tell_running(&cell_.scope, false);
+            }
             let result = result.map(|exit| RunExit {
                 code: exit.code,
                 destroyed: exit.destroyed || destroyed,
@@ -1647,6 +1682,8 @@ impl ContainerEngine {
         if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
             forwarder.close();
         }
+        drop(state);
+        tell_running(&cell.scope, false);
         Ok(())
     }
 
@@ -1791,41 +1828,52 @@ impl ContainerEngine {
         }
     }
 
+    /// fork: how long what waits on a sweep waits: its grace, then its slack.
+    fn sweep_bound(&self) -> Duration {
+        self.sweep_grace + self.sweep_slack
+    }
+
     /// fork: makes room for `starting`, whose start the engine refused for
-    /// want of memory: puts the idlest container that may sleep to sleep
-    /// (`set_sleepable`; never `starting`'s own, never one its cell holds),
-    /// and waits for its stop to end, so its memory is the engine's again.
-    /// The cell whose container slept, or `None` when none could.
+    /// want of memory: the actor puts the idlest container that may sleep now
+    /// to sleep (`Message::MakeRoom`; never `starting`'s own), and this waits
+    /// for its stop to end, so its memory is the engine's again. The cell
+    /// whose container slept, or `None` when none could.
     async fn make_room(self: &Arc<Self>, starting: &CellContainer) -> Option<String> {
-        let candidates = self.sleepable.lock().unwrap().clone();
-        for scope in candidates.into_iter().filter(|scope| *scope != starting.scope) {
-            let Some(cell) = self.cell(&scope) else { continue };
-            let waits = {
-                if !self.begin_sleep(&cell, Sweep::Room) {
-                    continue;
-                }
-                cell.state.lock().unwrap().sweeping.clone()
-            };
-            tracing::info!(
-                event = "container_slept_for_memory",
-                scope = %scope,
-                why = "a start the engine refused",
-                starting = %starting.scope,
-                "idle container put to sleep for memory"
-            );
-            if let Some(mut done) = waits {
-                let _ = asyncrt::timeout(self.sweep_grace + Duration::from_secs(30), async {
-                    while !*done.borrow_and_update() {
-                        if done.changed().await.is_err() {
-                            return;
-                        }
+        // the actor chooses, as of its step: which cells are at work, and
+        // which did anything lately, are the core's to know as they are now
+        let actor = self.actor.clone().or_else(|| ACTOR.get().cloned())?;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        actor.send(crate::actor::Message::MakeRoom { starting: starting.scope.clone(), reply }).ok()?;
+        let scope = answer.await.ok().flatten()?;
+        tracing::info!(
+            event = "container_slept_for_memory",
+            scope = %scope,
+            why = "a start the engine refused",
+            starting = %starting.scope,
+            "idle container put to sleep for memory"
+        );
+        let waits = self.cell(&scope).and_then(|cell| cell.state.lock().unwrap().sweeping.clone());
+        if let Some(mut done) = waits {
+            let _ = asyncrt::timeout(self.sweep_bound(), async {
+                while !*done.borrow_and_update() {
+                    if done.changed().await.is_err() {
+                        return;
                     }
-                })
-                .await;
-            }
-            return Some(scope);
+                }
+            })
+            .await;
         }
-        None
+        Some(scope)
+    }
+
+    /// fork: the actor's answer to `make_room`: the first of `candidates`
+    /// (the core's sleepable containers, the idlest first) that this engine
+    /// puts to sleep now, if any.
+    pub fn sleep_one_for_room(self: &Arc<Self>, candidates: &[String]) -> Option<String> {
+        candidates
+            .iter()
+            .find(|scope| self.cell(scope).is_some_and(|cell| self.begin_sleep(&cell, Sweep::Room)))
+            .cloned()
     }
 
     /// fork: puts the container of the cell `scope` to sleep now, for
@@ -1889,11 +1937,18 @@ impl ContainerEngine {
         let cell = cell.clone();
         asyncrt::spawn(async move {
             if running {
-                // its stop ends with the kill (`destroy`)
+                // its stop ends with its removal
                 engine.stop_gracefully(&cell, run, why).await;
-                engine.let_go(&cell);
-            } else {
-                engine.forget(&cell).await;
+            }
+            // the handle goes, unless its cell took it back meanwhile (an
+            // `attach` that waited past the sweep's bound)
+            let released = cell.state.lock().unwrap().released_mono_ms.is_some();
+            if released {
+                if running {
+                    engine.let_go(&cell);
+                } else {
+                    engine.forget(&cell).await;
+                }
             }
             done.send_replace(true);
         })
@@ -1924,8 +1979,29 @@ impl ContainerEngine {
         .await
         .is_ok();
         let killed = !exited && cell.current_run() == run && cell.running();
-        if cell.current_run() == run {
-            let _ = self.destroy(cell).await;
+        // the kill, or the removal of what exited: of run `run` alone. A
+        // start after it waits for this sweep (`start`), so the removal by
+        // name never meets a later run's container; and what it sets after
+        // is that run's only.
+        let ours = {
+            let mut state = cell.state.lock().unwrap();
+            let ours = state.run == run;
+            if ours {
+                state.destroyed = Some(run);
+            }
+            ours
+        };
+        if ours {
+            self.backend.remove(&cell.name).await;
+            let mut state = cell.state.lock().unwrap();
+            if state.run == run {
+                state.running = false;
+                if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
+                    forwarder.close();
+                }
+                drop(state);
+                tell_running(&cell.scope, false);
+            }
         }
         tracing::info!(
             event = "container_swept",
@@ -2234,6 +2310,8 @@ pub(crate) mod tests {
         /// How many starts from now on the engine refuses for want of
         /// memory, as krun's 429 does.
         full: AtomicU64,
+        /// A removal, held when told to.
+        removal: Gate,
     }
 
     impl Fake {
@@ -2338,6 +2416,7 @@ pub(crate) mod tests {
             Ok(())
         }
         async fn remove(&self, name: &str) {
+            self.removal.pass().await;
             self.ask("remove", name);
             self.end(name, 137);
         }
@@ -2582,7 +2661,22 @@ pub(crate) mod tests {
                 fake.exits_at_term.store(true, Ordering::SeqCst);
                 let mut engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap();
                 engine.sweep_grace = Duration::from_millis(400);
+                // the actor, as the node's answers `MakeRoom`: the core's
+                // sleepable list, never the starting cell's own
+                let (actor, mut asked) = mpsc::unbounded_channel();
+                engine.actor = Some(actor);
                 let engine = Arc::new(engine);
+                let listed: Vec<String> = sleepable.iter().map(|s| s.to_string()).collect();
+                let answering = engine.clone();
+                asyncrt::spawn(async move {
+                    while let Some(message) = asked.recv().await {
+                        if let crate::actor::Message::MakeRoom { starting, reply } = message {
+                            let candidates: Vec<String> = listed.iter().filter(|c| **c != starting).cloned().collect();
+                            let _ = reply.send(answering.sleep_one_for_room(&candidates));
+                        }
+                    }
+                })
+                .detach();
                 let [idle, held, new] = ["Box:idle", "Box:held", "Box:new"].map(a_box_named);
                 for cell in [&idle, &held, &new] {
                     engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
@@ -2593,7 +2687,6 @@ pub(crate) mod tests {
                 }
                 idle.set_inactivity(Duration::from_secs(60));
                 engine.release(&idle.scope, Release::Keep).await;
-                *engine.sleepable.lock().unwrap() = sleepable.into_iter().map(String::from).collect();
                 fake.full.store(refusals, Ordering::SeqCst);
                 let run = new.begin_run();
                 assert!(new.running(), "{case}: running from its start(), as workerd's");
@@ -2632,6 +2725,82 @@ pub(crate) mod tests {
                     }
                 }
             }
+        });
+    }
+
+    // Goal (fork; Codex on this PR): a container whose loaded, idle object
+    // holds it, put to sleep, exits at the signal; its object starts a new
+    // run at once (a crash's restart) while the sleep's removal by name is
+    // still under way. The new start waits for that sweep to end, so the
+    // removal never reaches the new run's container, and what the sweep
+    // sets after its removal is its own run's only: the new run is running.
+    // Method: the fake engine holds the removal until the new start has
+    // begun and is seen waiting (no second launch asked).
+    #[test]
+    fn a_new_run_never_meets_a_sleeps_removal() {
+        rt().block_on(async {
+            let fake = Arc::new(Fake::default());
+            fake.ends.store(true, Ordering::SeqCst);
+            fake.exits_at_term.store(true, Ordering::SeqCst);
+            let mut engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap();
+            engine.sweep_grace = Duration::from_millis(400);
+            let engine = Arc::new(engine);
+            let cell = a_box();
+            engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+            let first = cell.begin_run();
+            engine.start(&cell, first, start_img()).await.expect("started");
+            fake.removal.hold();
+            assert!(engine.sleep_for_memory(&cell.scope), "an idle object's container sleeps");
+            fake.removal.reached().await;
+            assert_eq!(cell.ended(first), Some(Ok(RunExit { code: 0, destroyed: false })), "it exited at the signal");
+            // its object starts again while the removal is held
+            let second = cell.begin_run();
+            let starting = {
+                let engine = engine.clone();
+                let cell = cell.clone();
+                asyncrt::spawn(async move { engine.start(&cell, second, start_img()).await })
+            };
+            asyncrt::sleep(Duration::from_millis(200)).await;
+            assert_eq!(fake.asked_of(&cell.name), ["start", "signal 15"], "the new start waits for the sweep");
+            fake.removal.open();
+            starting.await.expect("the start ran").expect("started");
+            assert_eq!(fake.asked_of(&cell.name), ["start", "signal 15", "remove", "start"], "removed before the new run's launch");
+            assert!(cell.running() && cell.current_run() == second && cell.ended(second).is_none(), "the new run runs");
+        });
+    }
+
+    // Goal (fork; Codex on this PR): a sweep whose cell took its handle back
+    // before the sweep ended (an `attach` that waited past the sweep's
+    // bound) leaves that handle where it is: the cell's, in the engine.
+    // Method: the removal held; the handle taken back as `attach` does on
+    // its timeout (released no more); then the removal let go.
+    #[test]
+    fn a_sweep_leaves_a_handle_its_cell_took_back() {
+        rt().block_on(async {
+            let fake = Arc::new(Fake::default());
+            fake.ends.store(true, Ordering::SeqCst);
+            fake.exits_at_term.store(true, Ordering::SeqCst);
+            let mut engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap();
+            engine.sweep_grace = Duration::from_millis(400);
+            let engine = Arc::new(engine);
+            let cell = a_box();
+            engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+            let run = cell.begin_run();
+            engine.start(&cell, run, start_img()).await.expect("started");
+            cell.set_inactivity(Duration::from_secs(60));
+            engine.release(&cell.scope, Release::Keep).await;
+            fake.removal.hold();
+            assert!(engine.sleep_for_memory(&cell.scope));
+            fake.removal.reached().await;
+            cell.state.lock().unwrap().released_mono_ms = None;
+            fake.removal.open();
+            for _ in 0..200 {
+                if cell.state.lock().unwrap().sweeping.as_ref().is_some_and(|done| *done.borrow()) {
+                    break;
+                }
+                asyncrt::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(engine.cell(&cell.scope).is_some_and(|kept| Arc::ptr_eq(&kept, &cell)), "the handle is its cell's still");
         });
     }
 

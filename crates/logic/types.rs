@@ -859,6 +859,15 @@ pub enum Event {
         cell: CellId,
         now_mono_ms: u64,
     },
+    /// The cell's container started running (a start opened its run, or a
+    /// node adopted one left running) or stopped (its run ended, or was
+    /// removed). Sent as it happens, ahead of anything the cell does after:
+    /// an eviction made for room keeps a cell that holds one
+    /// (`State::holds_container`), so this cannot wait for the next sample.
+    ContainerRunning {
+        cell: CellId,
+        running: bool,
+    },
     /// A periodic resource sample from the edge.
     ///
     /// The core never reads a clock or a proc file; the shell measures and

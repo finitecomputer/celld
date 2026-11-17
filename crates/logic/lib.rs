@@ -804,6 +804,10 @@ pub struct State {
     /// The containers this walk down asked to sleep that the samples still
     /// list: what they count is on its way back, so none is asked twice.
     container_sleeps: BTreeSet<CellId>,
+    /// The cells whose container runs, as `Event::ContainerRunning` says
+    /// each start and end: what keeps a cell here through an eviction made
+    /// for room, between samples.
+    running_containers: BTreeSet<CellId>,
     /// Which ceilings are latched. Held apart from `shed_reason`, which names
     /// only the more serious crossing.
     latches: pressure::Latches,
@@ -901,6 +905,7 @@ impl State {
             shed_cut: None,
             containers: Vec::new(),
             container_sleeps: BTreeSet::new(),
+            running_containers: BTreeSet::new(),
             latches: pressure::Latches::default(),
             shedding: false,
             memory_headroom: false,
@@ -6228,10 +6233,18 @@ impl State {
         }
     }
 
-    /// Whether the cell holds a running container on this node, as the last
-    /// sample said.
+    /// Whether the cell holds a running container on this node: as its
+    /// start and end were told (`Event::ContainerRunning`), or the last
+    /// sample listed it.
     fn holds_container(&self, id: &str) -> bool {
-        self.containers.iter().any(|c| c.cell == id)
+        self.running_containers.contains(id) || self.containers.iter().any(|c| c.cell == id)
+    }
+
+    /// A container put to sleep outside the walk down (a start the engine
+    /// refused for want of memory made room with it): what it counts is on
+    /// its way back, as for one the walk down put to sleep.
+    pub fn note_container_sleep(&mut self, cell: &str) {
+        self.container_sleeps.insert(cell.to_string());
     }
 
     /// Put idle containers to sleep while the evictions alone cannot get the
@@ -6275,7 +6288,7 @@ impl State {
 
     /// The containers that may be put to sleep now, the least recently
     /// active first (`pressure::sleepable`): what a start the engine refuses
-    /// for want of memory takes, the shell asking between samples.
+    /// for want of memory takes, the actor asking as it happens.
     pub fn sleepable_containers(&self, now_mono_ms: u64) -> Vec<CellId> {
         let candidates = self.sleep_candidates(now_mono_ms);
         pressure::sleepable(&candidates, now_mono_ms)
@@ -7053,6 +7066,13 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             now_mono_ms,
             containers,
         } => state.load_sampled(load, now_mono_ms, containers, &mut effects),
+        Event::ContainerRunning { cell, running } => {
+            if running {
+                state.running_containers.insert(cell);
+            } else {
+                state.running_containers.remove(&cell);
+            }
+        }
         Event::InvalidateRemote { cell, node, epoch } => {
             state.invalidate_remote(&cell, &node, epoch)
         }

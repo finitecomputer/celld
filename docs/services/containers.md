@@ -182,7 +182,8 @@ window, and the next activation on the same node reconnects to it. When the
 window runs out, the node stops the container as `sleepAfter` does: the signal
 to stop (SIGTERM), up to 10 seconds for it to exit, then the kill. The object's
 `monitor()` sees the run end as it ended. An activation of the cell during that
-stop waits for it to end, then starts from no container. A move to another
+stop, or a start of a new run, waits for it to end, then starts from no
+container. A move to another
 node, a node restart, a reset, and a node stop destroy the container.
 Ctrl-C on `celld dev` destroys the containers and keeps the local state.
 
@@ -231,8 +232,9 @@ idle stops the same way, and that object's `monitor()` sees the run end.
 The engine admits a container by its instance type's whole memory, the node
 by what its containers use, so the engine can be full while the node sheds
 nothing. A start the krun engine refuses for want of memory (429) puts the
-idlest container that may sleep to sleep, by the same rules, waits for its
-stop to end, and tries the start once more. With none to put to sleep, or
+idlest container that may sleep at that moment to sleep, by the same rules
+(the node's core chooses, as of its current state), waits for its stop to
+end, and tries the start once more. With none to put to sleep, or
 refused again, the start fails, and its `monitor()` rejects, with
 `no room for the container: …` and the engine's own words. As on Cloudflare,
 `running` reads true from `start()` until the start fails.

@@ -187,9 +187,10 @@ pub struct ContainerSample {
 pub struct SleepCandidate<'a> {
     pub cell: &'a str,
     pub counted_bytes: u64,
-    /// Its object is resident, or about to be: an open socket, a request
-    /// in flight or waiting for it, an alarm firing, or a container its
-    /// cell still holds. Such a container is never put to sleep.
+    /// Its object is at work, or about to be: an open socket (a hibernated
+    /// one too), a request in flight or waiting for it, an alarm firing, or
+    /// its cell between phases. Such a container is never put to sleep. An
+    /// object loaded but doing none of that is not resident here.
     pub resident: bool,
     /// The cell's last activity (monotonic ms).
     pub last_active_mono_ms: u64,
