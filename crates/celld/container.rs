@@ -1162,21 +1162,44 @@ impl ContainerEngine {
 
     /// fork: asks the engine what each running container holds and keeps
     /// it on the container's current run, for `reserved_memory_bytes`.
+    ///
+    /// A reply answers only for the runs that were running when it was
+    /// asked, and only as of when it was asked: a run that ended or was
+    /// replaced (a new run under the same name) while the reply was on its
+    /// way takes none of it, so an old run's measure never discounts its
+    /// replacement; and the report is stamped with the time it was asked,
+    /// not the time it came back, so a late reply is never fresher than it
+    /// is. A reply later than `IN_USE_FRESH_MS` would be stale on arrival:
+    /// the request is cut there, and a stuck one can't hold up the next.
     async fn refresh_in_use(&self) {
-        let reports = match self.backend.memory_in_use().await {
-            Ok(reports) => reports,
-            Err(error) => {
+        let asked_at = asyncrt::mono_ms();
+        let asked: HashMap<String, (Arc<CellContainer>, u64)> = self
+            .cells
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|cell| {
+                let state = cell.state.lock().unwrap();
+                state.running.then(|| (cell.name.clone(), (cell.clone(), state.run)))
+            })
+            .collect();
+        let reply = asyncrt::timeout(Duration::from_millis(IN_USE_FRESH_MS), self.backend.memory_in_use()).await;
+        let reports = match reply {
+            Ok(Ok(reports)) => reports,
+            Ok(Err(error)) => {
                 tracing::debug!(error = %format!("{error:#}"), "container memory in use: no report");
                 return;
             }
+            Err(_) => {
+                tracing::debug!("container memory in use: no report within {IN_USE_FRESH_MS} ms");
+                return;
+            }
         };
-        let now = asyncrt::mono_ms();
         for (name, bytes) in reports {
-            if let Some(cell) = self.cell_named(&name) {
-                let mut state = cell.state.lock().unwrap();
-                if state.running {
-                    state.info.in_use = Some((bytes, now));
-                }
+            let Some((cell, run)) = asked.get(&name) else { continue };
+            let mut state = cell.state.lock().unwrap();
+            if state.running && state.run == *run {
+                state.info.in_use = Some((bytes, asked_at));
             }
         }
     }
@@ -1861,6 +1884,11 @@ pub(crate) mod tests {
         installed: Mutex<Vec<InterceptRule>>,
         seen_by_exec: Mutex<Vec<Vec<String>>>,
         in_use: Mutex<Vec<(String, u64)>>,
+        /// Runs once a report is sampled, before it is answered: what
+        /// happens to a container while the report is on its way.
+        in_use_meanwhile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// How long a sampled report takes to be answered.
+        in_use_delay: Mutex<Option<std::time::Duration>>,
     }
 
     impl Fake {
@@ -1947,7 +1975,15 @@ pub(crate) mod tests {
             true
         }
         async fn memory_in_use(&self) -> anyhow::Result<Vec<(String, u64)>> {
-            Ok(self.in_use.lock().unwrap().clone())
+            let report = self.in_use.lock().unwrap().clone();
+            if let Some(meanwhile) = self.in_use_meanwhile.lock().unwrap().take() {
+                meanwhile();
+            }
+            let delay = *self.in_use_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                asyncrt::sleep(delay).await;
+            }
+            Ok(report)
         }
         fn restores_snapshots(&self) -> bool {
             false
@@ -2051,6 +2087,52 @@ pub(crate) mod tests {
             engine.refresh_in_use().await;
             assert_eq!(engine.reserved_memory_bytes(), 0, "not running");
             assert_eq!(cell.state.lock().unwrap().info.in_use, None, "a stopped container takes no report");
+        });
+    }
+
+    // Goal: a report answers only for the run it was asked about. Invalid
+    // (a review found it): the engine samples run A, A ends and run B
+    // starts under the same name before the reply lands; B takes none of
+    // A's measure and counts its cap until B itself is reported.
+    #[test]
+    fn an_old_runs_report_never_discounts_its_replacement() {
+        rt().block_on(async {
+            const MIB: u64 = 1 << 20;
+            let fake = Arc::new(Fake::default());
+            let engine = an_engine(&fake).await;
+            let cell = a_box();
+            engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+            let run = cell.begin_run();
+            engine.start(&cell, run, start_img()).await.expect("started");
+            *fake.in_use.lock().unwrap() = vec![(cell.name.clone(), 300 * MIB)];
+            let replaced = cell.clone();
+            *fake.in_use_meanwhile.lock().unwrap() = Some(Box::new(move || {
+                replaced.begin_run();
+            }));
+            engine.refresh_in_use().await;
+            assert_eq!(cell.state.lock().unwrap().info.in_use, None, "run B took run A's report");
+        });
+    }
+
+    // Goal: a reply that comes back after IN_USE_FRESH_MS is never counted
+    // as fresh. Invalid (a review found it): the engine samples 300 MiB,
+    // the reply is delayed past the freshness window; it must not be
+    // stamped at its arrival and count as new.
+    #[test]
+    fn a_late_report_is_never_fresh() {
+        rt().block_on(async {
+            const MIB: u64 = 1 << 20;
+            let fake = Arc::new(Fake::default());
+            let engine = an_engine(&fake).await;
+            let cell = a_box();
+            engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+            let run = cell.begin_run();
+            engine.start(&cell, run, start_img()).await.expect("started");
+            *fake.in_use.lock().unwrap() = vec![(cell.name.clone(), 300 * MIB)];
+            *fake.in_use_delay.lock().unwrap() = Some(Duration::from_millis(IN_USE_FRESH_MS + 100));
+            engine.refresh_in_use().await;
+            let fresh = cell.state.lock().unwrap().info.in_use.filter(|(_, at)| asyncrt::mono_ms().saturating_sub(*at) <= IN_USE_FRESH_MS);
+            assert_eq!(fresh, None, "a report older than the window counted as fresh");
         });
     }
 

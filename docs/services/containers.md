@@ -197,15 +197,20 @@ it has room. Its engine caps every container at its instance type's memory.
   take back: its charge less the host's page cache of its disks
   (`memoryInUseBytes`). A container counts that plus a quarter of its instance
   type's memory, as room to grow, and never more than the whole. The node asks
-  every 2 seconds. A report older than 10 seconds, or none yet (a container
-  still starting), counts the whole instance type's memory.
+  every 2 seconds. A report counts only for the run it was asked about, and as
+  of when it was asked: a run that started since takes none of an older run's
+  report, and a reply that takes longer than 10 seconds is dropped. A report
+  older than 10 seconds, or none yet (a container still starting), counts the
+  whole instance type's memory.
 - **On Docker,** a container always counts its instance type's memory.
 
 Set the node memory ceiling at or above the largest instance type in use, plus
 headroom. When containers fill the node, it sheds cells as under any memory
-pressure: it refuses new cells and evicts idle ones. An evicted cell's container
-keeps running for its inactivity window, so shedding returns little of a
-container's memory.
+pressure: it refuses new cells and evicts idle ones. What that does to an
+evicted cell's container depends on `CELLD_OWNERSHIP_ON_EVICT`: with `release`
+(the default with a bucket) the eviction stops the container at once, with no
+grace period; with `sticky` the container keeps running for its inactivity
+window, so shedding returns little of its memory.
 
 Each node publishes its running container count per class in the shared
 capacity sample. Before a start, a node sums the fleet count and its own live
