@@ -10,17 +10,26 @@
 #                                         checkout (celld's build refuses that)
 #   tools/v8/rusty-v8.sh verify-local     build and test celld against the local archive (the pin unchanged)
 #   tools/v8/rusty-v8.sh publish          upload the build as a release on $CELLD_V8_REPO, download it, compare
-#   tools/v8/rusty-v8.sh pin              check that the public URL serves the build, then write .cargo/config.toml
+#   tools/v8/rusty-v8.sh pin              check that the public URL serves the build, then write the target's pin
 #   tools/v8/rusty-v8.sh verify           build and test celld against the pin
 #   tools/v8/rusty-v8.sh update [V8]      all of the above, in that order
 #
+# Each target has its own archive and pin: x86_64-unknown-linux-gnu's in
+# .cargo/config.toml (a plain `cargo build`), another's in .cargo/<target>.toml
+# (`cargo --config .cargo/<target>.toml build`). CELLD_V8_TARGET names the
+# target (default this machine's): build makes this machine's archive, or
+# aarch64-unknown-linux-gnu's on x86_64 Linux, cross-built as upstream builds
+# it; verify runs on the target's own machine (docs/v8.md, "A second target").
+#
 # Environment: CELLD_V8_WORK (default ~/.cache/celld-v8), CELLD_V8_JOBS
 # (default 16; other work shares the box), CELLD_V8_REPO (default
-# futurepaul/celld), CELLD_TARGET_DIR (celld's target dir for verify).
+# futurepaul/celld), CELLD_TARGET_DIR (celld's target dir for verify),
+# CELLD_V8_TARGET (above), CELLD_V8_DENO_COMMIT (build: the
+# denoland/v8 commit whose tree the patched V8 must equal, default the head of
+# its lkgr branch; a second target names the first's, as the branch moves on).
 set -euo pipefail
 
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-CONFIG="$ROOT/.cargo/config.toml"
 REPO=${CELLD_V8_REPO:-futurepaul/celld}
 WORK=${CELLD_V8_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/celld-v8}
 JOBS=${CELLD_V8_JOBS:-16}
@@ -28,7 +37,16 @@ CHROMIUM_V8=https://chromium.googlesource.com/v8/v8
 DENO_V8=https://github.com/denoland/v8
 RUSTY_V8=https://github.com/denoland/rusty_v8
 CHROMIUMDASH=https://chromiumdash.appspot.com/fetch_releases
-TARGET=$(rustc -vV | sed -n 's/^host: //p')
+HOST=$(rustc -vV | sed -n 's/^host: //p')
+TARGET=${CELLD_V8_TARGET:-$HOST}
+# The target a plain `cargo build` links (.cargo/config.toml); every other
+# target's pin is a file of its own that cargo is given with --config.
+DEFAULT_TARGET=x86_64-unknown-linux-gnu
+if [[ $TARGET == "$DEFAULT_TARGET" ]]; then
+  CONFIG="$ROOT/.cargo/config.toml"
+else
+  CONFIG="$ROOT/.cargo/$TARGET.toml"
+fi
 ARCHIVE="librusty_v8_release_${TARGET}.a.gz"
 BINDING="src_binding_release_${TARGET}.rs"
 
@@ -175,6 +193,14 @@ for path, dep in scope["deps"].items():
 
 cmd_build() {
   local crate commit want src v8 pin base base_version patches branch build
+  # This machine's archive, or aarch64 Linux's cross-built on x86_64 Linux:
+  # upstream's own way (Chromium ships its clang and Rust for x86_64 hosts
+  # alone), with Chromium's arm64 sysroot.
+  local cross=()
+  if [[ $TARGET != "$HOST" ]]; then
+    [[ $HOST == x86_64-unknown-linux-gnu && $TARGET == aarch64-unknown-linux-gnu ]] ||
+      die "build makes $HOST's archive, or aarch64-unknown-linux-gnu's on x86_64 Linux; not $TARGET's here (docs/v8.md)"
+  fi
   crate=$(crate_version)
   [[ -n $crate ]] || die "no v8 crate in Cargo.lock"
   commit=$(crate_rev)
@@ -248,7 +274,13 @@ cmd_build() {
   # build tree.
   local deno_tree="" deno_head="" ours_tree
   ours_tree=$(git -C "$v8" rev-parse "$patched^{tree}")
-  deno_head=$(git ls-remote "$DENO_V8" "refs/heads/$branch-lkgr-denoland" | cut -f1)
+  if [[ -n ${CELLD_V8_DENO_COMMIT:-} ]]; then
+    # fetched by its SHA from denoland/v8 below, so it is denoland's own
+    [[ $CELLD_V8_DENO_COMMIT =~ ^[0-9a-f]{40}$ ]] || die "CELLD_V8_DENO_COMMIT is a full commit, not '$CELLD_V8_DENO_COMMIT'"
+    deno_head=$CELLD_V8_DENO_COMMIT
+  else
+    deno_head=$(git ls-remote "$DENO_V8" "refs/heads/$branch-lkgr-denoland" | cut -f1)
+  fi
   if [[ -n $deno_head ]]; then
     git -C "$v8" fetch -q --depth 1 "$DENO_V8" "$deno_head" &&
       deno_tree=$(git -C "$v8" rev-parse "$deno_head^{tree}")
@@ -288,13 +320,21 @@ cmd_build() {
   # it generates is checked against the crate's below.
   local libclang=${CELLD_V8_LIBCLANG:-$(llvm-config --libdir 2>/dev/null || true)}
   [[ -e $libclang/libclang.so ]] || die "no libclang.so in '$libclang'; set CELLD_V8_LIBCLANG to a directory with libclang 21.1 or later"
+  if [[ $TARGET != "$HOST" ]]; then
+    # bindgen reads the target's C library: the sysroot the v8 build script
+    # installs, named absolutely (gn's flags name it relative to gn_out)
+    local sysroot
+    sysroot=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["bullseye_arm64"]["SysrootDir"])' "$src/build/linux/sysroot_scripts/sysroots.json")
+    [[ $sysroot =~ ^[A-Za-z0-9_.-]+$ ]] || die "an odd arm64 sysroot name: $sysroot"
+    cross=("BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=$src/build/linux/$sysroot")
+  fi
   say "building with $JOBS jobs (load: $(cut -d' ' -f1-3 /proc/loadavg))"
   (cd "$src" && env -u CARGO_TARGET_DIR -u RUSTFLAGS -u RUSTY_V8_ARCHIVE -u RUSTY_V8_ARCHIVE_SHA256 \
       -u RUSTY_V8_MIRROR -u RUSTY_V8_SRC_BINDING_URL -u RUSTY_V8_SRC_BINDING_PATH -u DENO_TRYBUILD \
-      -u RUSTY_V8_SKIP_DOWNLOAD V8_FROM_SOURCE=1 LIBCLANG_PATH="$libclang" \
+      -u RUSTY_V8_SKIP_DOWNLOAD V8_FROM_SOURCE=1 LIBCLANG_PATH="$libclang" "${cross[@]}" \
       cargo build --release --locked --lib -j "$JOBS" --target "$TARGET")
 
-  local out="$src/target/$TARGET/release/gn_out" dist="$WORK/dist/v$crate-$want"
+  local out="$src/target/$TARGET/release/gn_out" dist="$WORK/dist/v$crate-$want-$TARGET"
   rm -rf "$dist" && mkdir -p "$dist"
   gzip -9 -n -c "$out/obj/librusty_v8.a" > "$dist/$ARCHIVE"
   cp "$out/src_binding.rs" "$dist/$BINDING"
@@ -324,9 +364,9 @@ cmd_build() {
     echo "V8 with Deno's patches: $(git -C "$v8" rev-parse HEAD) (tree $ours_tree)"
     echo "Deno patches, carried from the release's V8 $pin on $base_version:"
     git -C "$v8" log --format='  %h %s' "$want..HEAD"
-    echo "denoland/v8 $branch-lkgr-denoland: $deno_head (same tree)"
+    echo "denoland/v8 $branch-lkgr-denoland: $deno_head (same tree${CELLD_V8_DENO_COMMIT:+; named by CELLD_V8_DENO_COMMIT})"
     echo "Dependencies moved to V8's DEPS: ${moved[*]:-none}"
-    echo "Target: $TARGET; profile: release; features: default (use_custom_libcxx)"
+    echo "Target: $TARGET${cross:+ (cross-built on $HOST with the arm64 sysroot)}; profile: release; features: default (use_custom_libcxx)"
     echo "Clang: $(sed -n "s/^CLANG_REVISION = '\(.*\)'/\1/p" "$src/tools/clang/scripts/update.py") (Chromium's); bindgen's libclang: $(basename "$(readlink -f "$libclang/libclang.so")")"
     echo "Rust (rusty_v8's toolchain): $(sed -n 's/^channel = "\(.*\)"/\1/p' "$src/rust-toolchain.toml")"
     echo "gn args:"
@@ -334,13 +374,13 @@ cmd_build() {
     echo "Built: $(date -u +%FT%TZ) on $(uname -srm) by tools/v8/rusty-v8.sh at celld $(git -C "$ROOT" rev-parse HEAD)"
   } > "$dist/BUILDINFO"
   (cd "$dist" && sha256sum "$ARCHIVE" "$BINDING" > SHA256SUMS)
-  ln -sfn "$dist" "$WORK/dist/latest"
+  ln -sfn "$dist" "$WORK/dist/latest-$TARGET"
   say "built $dist"
   cat "$dist/SHA256SUMS" >&2
 }
 
 dist_dir() {
-  local d="$WORK/dist/latest"
+  local d="$WORK/dist/latest-$TARGET"
   [[ -f $d/BUILDINFO ]] || die "no build in $d; run build first"
   readlink -f "$d"
 }
@@ -377,9 +417,12 @@ cmd_pin() {
   rm -rf "$check"
   mv "$(dirname "$CONFIG")/v8/$BINDING.part" "$(dirname "$CONFIG")/v8/$BINDING"
   binding_sha=$(sha256sum "$(dirname "$CONFIG")/v8/$BINDING" | cut -d' ' -f1)
+  local use="This is $TARGET's pin, which a plain \`cargo build\` applies."
+  [[ $TARGET == "$DEFAULT_TARGET" ]] || use="This is $TARGET's pin: build with \`cargo --config .cargo/$TARGET.toml\`."
   cat > "$CONFIG" <<EOF
 # celld links V8 from our own rusty_v8 build, not denoland's prebuilt
 # archive. tools/v8/rusty-v8.sh pin writes this file; docs/v8.md says why.
+# $use
 #
 # The v8 build script fetches RUSTY_V8_ARCHIVE and checks it against
 # RUSTY_V8_ARCHIVE_SHA256 before use. It compiles the binding at
@@ -389,7 +432,7 @@ cmd_pin() {
 # crates/celld/build.rs checks that file against CELLD_V8_BINDING_SHA256,
 # refuses the variables that would bring other V8 code in (a binding mirror
 # or URL; trybuild; a source or debug build), and any target but $TARGET,
-# the only one with an archive. Every value is forced over the environment.
+# which this archive is for. Every value is forced over the environment.
 [env]
 CELLD_V8_VERSION = { value = "$v8", force = true }
 RUSTY_V8_ARCHIVE = { value = "$url", force = true }
@@ -408,8 +451,11 @@ EOF
 celld_test() {
   local target_dir=${CELLD_TARGET_DIR:-$ROOT/target} over=() version v
   version=$(pinned CELLD_V8_VERSION)
+  # another target's pin, then the overrides, which outrank it
+  [[ $TARGET == "$DEFAULT_TARGET" ]] || over=(--config "$CONFIG")
+  [[ $TARGET == "$HOST" ]] || die "verify builds and tests $HOST's celld; verify $TARGET's on a $TARGET machine"
   if (( $# == 4 )); then
-    over=(--config "env.RUSTY_V8_ARCHIVE.value=\"$1\"" \
+    over+=(--config "env.RUSTY_V8_ARCHIVE.value=\"$1\"" \
       --config "env.RUSTY_V8_ARCHIVE_SHA256.value=\"$2\"" \
       --config "env.CELLD_V8_VERSION.value=\"$3\"" \
       --config "env.RUSTY_V8_SRC_BINDING_PATH.value=\"$4\"" \
@@ -436,27 +482,40 @@ cmd_verify_local() {
 }
 
 cmd_publish() {
-  local dist crate v8 tag head check
+  local dist crate v8 tag head check stage sums info
   dist=$(dist_dir)
   crate=$(dist_crate "$dist")
   v8=$(dist_v8 "$dist")
   tag=$(tag_for "$crate" "$v8")
   head=$(git -C "$ROOT" rev-parse HEAD)
-  git -C "$ROOT" fetch -q origin
-  [[ -n $(git -C "$ROOT" branch -r --contains "$head") ]] || die "push $head first: the release tag points at it"
+  # each target's checksums and build record, named for it, beside the
+  # others' in the one release of this V8
+  sums="SHA256SUMS-$TARGET"
+  info="BUILDINFO-$TARGET"
+  stage=$(mktemp -d)
+  cp "$dist/SHA256SUMS" "$stage/$sums"
+  cp "$dist/BUILDINFO" "$stage/$info"
   if gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
-    die "release $tag exists; a published archive is never replaced (bump the V8 patch or delete it deliberately)"
+    # another target's archive is published: add this one's beside it
+    if gh release view "$tag" -R "$REPO" --json assets -q '.assets[].name' | grep -qxF -e "$ARCHIVE" -e "$sums"; then
+      die "release $tag has $TARGET's archive; a published archive is never replaced (bump the V8 patch or delete it deliberately)"
+    fi
+    gh release upload "$tag" -R "$REPO" "$dist/$ARCHIVE" "$dist/$BINDING" "$stage/$sums" "$stage/$info"
+  else
+    git -C "$ROOT" fetch -q origin
+    [[ -n $(git -C "$ROOT" branch -r --contains "$head") ]] || die "push $head first: the release tag points at it"
+    gh release create "$tag" -R "$REPO" --target "$head" --latest=false \
+      --title "rusty_v8 $crate on V8 $v8" --notes-file "$dist/BUILDINFO" \
+      "$dist/$ARCHIVE" "$dist/$BINDING" "$stage/$sums" "$stage/$info"
   fi
-  gh release create "$tag" -R "$REPO" --target "$head" --latest=false \
-    --title "rusty_v8 $crate on V8 $v8 ($TARGET)" --notes-file "$dist/BUILDINFO" \
-    "$dist/$ARCHIVE" "$dist/$BINDING" "$dist/SHA256SUMS" "$dist/BUILDINFO"
+  rm -rf "$stage"
   # Round trip: what GitHub serves is what we built.
   check=$(mktemp -d)
-  gh release download "$tag" -R "$REPO" -D "$check" -p "$ARCHIVE" -p SHA256SUMS
-  (cd "$check" && grep " $ARCHIVE\$" SHA256SUMS | sha256sum -c -) || die "the published archive does not match"
+  gh release download "$tag" -R "$REPO" -D "$check" -p "$ARCHIVE" -p "$sums"
+  (cd "$check" && grep " $ARCHIVE\$" "$sums" | sha256sum -c -) || die "the published archive does not match"
   cmp -s "$check/$ARCHIVE" "$dist/$ARCHIVE" || die "the published archive differs from the build"
   rm -rf "$check"
-  say "published $tag"
+  say "published $TARGET's archive in $tag"
 }
 
 cmd_verify() {

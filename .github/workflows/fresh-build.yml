@@ -24,8 +24,27 @@ env:
 
 jobs:
   fresh-build:
-    runs-on: ubuntu-24.04
+    # Each target with an archive, on its own machine, against its own pin
+    # (docs/v8.md): x86_64's is .cargo/config.toml, a plain `cargo build`;
+    # another's is .cargo/<target>.toml, given to every cargo with --config.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            pin: .cargo/config.toml
+            cargo: cargo
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            pin: .cargo/aarch64-unknown-linux-gnu.toml
+            cargo: cargo --config .cargo/aarch64-unknown-linux-gnu.toml
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      CARGO_PINNED: ${{ matrix.cargo }}
+      PIN: ${{ matrix.pin }}
+      BINDING: src_binding_release_${{ matrix.target }}.rs
     steps:
       - uses: actions/checkout@v6
 
@@ -39,12 +58,12 @@ jobs:
           echo "CARGO_HOME_DIR=$home" >> "$GITHUB_ENV"
 
       - name: Build celld
-        run: cargo build --locked -p celld
+        run: $CARGO_PINNED build --locked -p celld
 
       - name: celld links the pinned V8
         run: |
           set -euo pipefail
-          v8=$(sed -n 's/^CELLD_V8_VERSION = { value = "\([^"]*\)".*/\1/p' .cargo/config.toml)
+          v8=$(sed -n 's/^CELLD_V8_VERSION = { value = "\([^"]*\)".*/\1/p' "$PIN")
           target/debug/celld --version | tee /dev/stderr | grep -F "(V8 $v8-rusty)"
 
       - name: A poisoned extracted crate is never compiled
@@ -53,29 +72,29 @@ jobs:
           # The v8 crate's extracted source: its registry source, or its git
           # checkout when Cargo.toml patches v8 from git (which ships no
           # binding, so one is planted).
-          manifest=$(cargo metadata --locked --format-version 1 |
+          manifest=$($CARGO_PINNED metadata --locked --format-version 1 |
             python3 -I -c 'import json, sys; print(next(p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"] == "v8"))')
-          extracted=$(dirname "$manifest")/gen/src_binding_release_x86_64-unknown-linux-gnu.rs
+          extracted=$(dirname "$manifest")/gen/$BINDING
           case $extracted in "$CARGO_HOME_DIR"/*) ;; *) echo "::error::v8 is not extracted under $CARGO_HOME_DIR: $extracted"; exit 1 ;; esac
           if [ ! -f "$extracted" ]; then
             mkdir -p "$(dirname "$extracted")"
-            cp .cargo/v8/src_binding_release_x86_64-unknown-linux-gnu.rs "$extracted"
+            cp ".cargo/v8/$BINDING" "$extracted"
           fi
           echo "// fresh-build: tampered" >> "$extracted"
-          cargo build --locked -p celld
+          $CARGO_PINNED build --locked -p celld
           grep -h '^cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH=' target/debug/build/v8-*/output |
-            tee /dev/stderr | grep -F "=$PWD/.cargo/v8/src_binding_release_x86_64-unknown-linux-gnu.rs"
+            tee /dev/stderr | grep -F "=$PWD/.cargo/v8/$BINDING"
 
       - name: A changed pinned binding fails the build, naming it
         run: |
           set -euo pipefail
-          pinned=$PWD/.cargo/v8/src_binding_release_x86_64-unknown-linux-gnu.rs
+          pinned=$PWD/.cargo/v8/$BINDING
           echo "// fresh-build: tampered" >> "$pinned"
-          if cargo build --locked -p celld > build.log 2>&1; then
+          if $CARGO_PINNED build --locked -p celld > build.log 2>&1; then
             echo "::error::celld built with a changed v8 binding"
             exit 1
           fi
           grep -F "the v8 binding $pinned is not the pinned one" build.log
           git checkout -- "$pinned"
-          cargo build --locked -p celld
+          $CARGO_PINNED build --locked -p celld
           target/debug/celld --version
