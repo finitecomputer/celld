@@ -804,6 +804,9 @@ pub struct State {
     /// The containers this walk down asked to sleep that the samples still
     /// list: what they count is on its way back, so none is asked twice.
     container_sleeps: BTreeSet<CellId>,
+    /// When the shedding latch last engaged (monotonic ms): how long its
+    /// evictions have had (`pressure::evictions_may_return`).
+    shed_since_mono_ms: Option<u64>,
     /// The cells whose container runs, as `Event::ContainerRunning` says
     /// each start and end: what keeps a cell here through an eviction made
     /// for room, between samples.
@@ -906,6 +909,7 @@ impl State {
             containers: Vec::new(),
             container_sleeps: BTreeSet::new(),
             running_containers: BTreeMap::new(),
+            shed_since_mono_ms: None,
             latches: pressure::Latches::default(),
             shedding: false,
             memory_headroom: false,
@@ -6181,6 +6185,11 @@ impl State {
         self.latches = latches;
         self.shed_reason = reason;
         self.shedding = reason.is_some();
+        self.shed_since_mono_ms = match (self.shedding, self.shed_since_mono_ms) {
+            (false, _) => None,
+            (true, None) => Some(now_mono_ms),
+            (true, since) => since,
+        };
         if !self.shedding {
             // Relieved. Whatever was queued for capacity may proceed.
             self.shed_cut = None;
@@ -6199,14 +6208,18 @@ impl State {
         // coincidence.
         let metric = pressure::PressureConfig::walk_metric(latches);
         let sample_bytes = load.metric_bytes(metric);
-        // No eviction returns memory a container holds: the most every
-        // eviction together can return is the node's own share of the
-        // sample. What the line needs beyond that, idle containers give now,
-        // while the evictions take the rest; waiting for the walk down to
-        // find them futile kept a node with many cells shut to new ones for
-        // minutes (a real Fragment node on celld).
-        let evictions_at_most = sample_bytes.saturating_sub(load.container_reserved_bytes);
-        self.sleep_containers(metric, sample_bytes, evictions_at_most, now_mono_ms, effects);
+        // No eviction returns memory a container holds: what the line needs
+        // beyond the node's own share, idle containers give now; the rest
+        // too once the evictions have had their window and the node is still
+        // over (`pressure::evictions_may_return`). Waiting for the walk down
+        // to find them futile kept a node with many cells shut to new ones
+        // for minutes (a real Fragment node on celld).
+        let latched_ms = self
+            .shed_since_mono_ms
+            .map_or(0, |since| now_mono_ms.saturating_sub(since));
+        let evictions_may_return =
+            pressure::evictions_may_return(sample_bytes, load.container_reserved_bytes, latched_ms);
+        self.sleep_containers(metric, sample_bytes, evictions_may_return, now_mono_ms, effects);
         if self.shed_cut.is_some_and(|cut| cut.metric != metric) {
             self.shed_cut = None;
         }

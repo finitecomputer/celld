@@ -219,10 +219,10 @@ does fleet balancing move such a cell.
 
 When the evictions alone cannot bring the node below its resume line (80% of
 the ceiling), the node puts idle containers to sleep: the stop their
-inactivity window would make, early. No eviction returns memory a container
-holds, so on every sample over the line the node sleeps at once for what
-the line needs beyond the node's own memory, and for the rest once the
-evictions are found not to get there. It chooses the least recently active
+inactivity window would make, early. No eviction returns memory a container holds, so on every sample over the
+line the node sleeps at once for what the line needs beyond the node's own
+memory, and for the rest once the evictions have had 10 seconds and the node
+is still over its line. It chooses the least recently active
 first, and only as many as the rest of the way down needs, counting a stop
 already under way as memory on its way back. It waits while a container just
 started still counts its whole instance type's memory for want of its

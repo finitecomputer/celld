@@ -214,6 +214,28 @@ pub struct SleepCandidate<'a> {
 /// exceeds it, with the save's own time on top.
 pub const CONTAINER_QUIET_MS: u64 = 2 * 60_000;
 
+/// How long a latched walk down lets its evictions work before it puts idle
+/// containers to sleep for all its resume line still needs: 10 s, many
+/// samples at eviction speed. A real Fragment node on celld showed why it is
+/// measured and not projected: its many cells kept the walk down evicting,
+/// so the walk down never found the evictions futile, while what they
+/// returned stayed far short of the line, and the node took no new cell for
+/// minutes.
+pub const EVICTIONS_FIRST_MS: u64 = 10_000;
+
+/// The most a latched walk down's evictions may still return toward its
+/// line, `latched_ms` after it latched: no eviction returns memory a
+/// container holds, so at most the node's own share of the sample
+/// (`sample_bytes` less what its containers count); and nothing once they
+/// have had `EVICTIONS_FIRST_MS` and the node is still over its line.
+pub fn evictions_may_return(sample_bytes: u64, container_bytes: u64, latched_ms: u64) -> u64 {
+    if latched_ms >= EVICTIONS_FIRST_MS {
+        0
+    } else {
+        sample_bytes.saturating_sub(container_bytes)
+    }
+}
+
 /// The containers a latched walk down puts to sleep, in the order it puts
 /// them: none while the evictions are projected to bring `sample_bytes` to
 /// `resume_line` (`evictions_return_bytes`); otherwise the least recently
@@ -554,6 +576,28 @@ mod tests {
         assert_eq!(containers_to_sleep(line + 2 * GIB, line, 0, &stopping, now), Vec::<&str>::new(), "its sleep under way covers it");
         assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now), vec!["Computer:b"], "the next idlest for the rest");
         assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now), containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now));
+    }
+
+    // Goal (a real Fragment node on celld): the evictions are given what
+    // they could return, the node's own share, for EVICTIONS_FIRST_MS; past
+    // that, latched still, nothing more is expected of them, so the idle
+    // containers sleep for all the line needs. Never more than the sample.
+    #[test]
+    fn evictions_get_their_window_then_containers_sleep() {
+        const { assert!(EVICTIONS_FIRST_MS >= 5_000 && EVICTIONS_FIRST_MS < CONTAINER_QUIET_MS) };
+        let (sample, containers) = (6 * GIB, 5 * GIB);
+        assert_eq!(evictions_may_return(sample, containers, 0), GIB, "at the latch: the node's own share");
+        assert_eq!(evictions_may_return(sample, containers, EVICTIONS_FIRST_MS - 1), GIB);
+        assert_eq!(evictions_may_return(sample, containers, EVICTIONS_FIRST_MS), 0, "their window spent");
+        assert_eq!(evictions_may_return(GIB, 2 * GIB, 0), 0, "never below nothing");
+        let now = 100 * 60_000;
+        let line = 4 * GIB;
+        let all = computers(now);
+        let over = line + GIB / 2;
+        let early = containers_to_sleep(over, line, evictions_may_return(over, 3 * GIB, 0), &all, now);
+        assert_eq!(early, Vec::<&str>::new(), "half a GiB over, a GiB the evictions might return: none yet");
+        let late = containers_to_sleep(over, line, evictions_may_return(over, 3 * GIB, EVICTIONS_FIRST_MS), &all, now);
+        assert_eq!(late, vec!["Computer:a"], "their window spent: the idlest, as many as needed");
     }
 
     // Goal (a real run on krun): a container just started counts its cap
