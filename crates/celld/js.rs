@@ -7110,6 +7110,7 @@ ops! { OP_NAMES, install_op_functions,
         "__structured_clone" => storage_ops::op_structured_clone,
         "__op_fetch" => op_fetch,
         "__secret_get" => op_secret_get,
+        "__ai_run" => op_ai_run,
         "__r2_head" => r2_ops::op_r2_head,
         "__r2_get" => r2_ops::op_r2_get,
         "__r2_put" => r2_ops::op_r2_put,
@@ -7259,6 +7260,27 @@ fn op_secret_get(
     let id = asyncrt::enqueue(async move {
         Ok::<_, String>(match crate::secrets::read(&name).await {
             Ok(value) => serde_json::json!({ "value": value }).to_string(),
+            Err(failure) => serde_json::json!({ "code": failure.code, "message": failure.message }).to_string(),
+        })
+    });
+    rv.set(promise_for(scope, id));
+}
+
+/// fork: `__ai_run(model, inputsJson)`, the `ai` binding's `run()`
+/// (ai.rs). Resolves to `{"status", "body"}`, Workers AI's answer, or to
+/// `{"code", "message"}` saying why the node has none; the harness throws
+/// the latter. The model's server is the node's: its address stays in this
+/// process.
+fn op_ai_run(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let model = args.get(0).to_rust_string_lossy(scope);
+    let inputs = args.get(1).to_rust_string_lossy(scope);
+    let id = asyncrt::enqueue(async move {
+        Ok::<_, String>(match crate::ai::run(&model, &inputs).await {
+            Ok(answer) => serde_json::json!({ "status": answer.status, "body": answer.body }).to_string(),
             Err(failure) => serde_json::json!({ "code": failure.code, "message": failure.message }).to_string(),
         })
     });
