@@ -1930,14 +1930,16 @@ impl ContainerEngine {
             .is_some_and(|cell| self.begin_sleep(&cell, Sweep::Memory, run))
     }
 
-    /// fork: `sleep_for_memory`'s stop of run `chosen`, for `why`.
+    /// fork: `sleep_for_memory`'s stop of run `chosen` (its node-wide id,
+    /// `run_id`: a handle's own count starts again with the handle), for
+    /// `why`.
     fn begin_sleep(self: &Arc<Self>, cell: &Arc<CellContainer>, why: Sweep, chosen: u64) -> bool {
         if cell.state.lock().unwrap().released_mono_ms.is_some() {
             return self.begin_sweep(cell, why, Some(chosen));
         }
         let (run, done) = {
             let mut state = cell.state.lock().unwrap();
-            if !state.running || state.sweeping.is_some() || state.released_mono_ms.is_some() || state.run != chosen {
+            if !state.running || state.sweeping.is_some() || state.released_mono_ms.is_some() || state.run_id != chosen {
                 return false;
             }
             let (done, waits) = watch::channel(false);
@@ -1965,7 +1967,7 @@ impl ContainerEngine {
     fn begin_sweep(self: &Arc<Self>, cell: &Arc<CellContainer>, why: Sweep, chosen: Option<u64>) -> bool {
         let (run, running, done) = {
             let mut state = cell.state.lock().unwrap();
-            if state.released_mono_ms.is_none() || state.sweeping.is_some() || chosen.is_some_and(|run| run != state.run) {
+            if state.released_mono_ms.is_none() || state.sweeping.is_some() || chosen.is_some_and(|run| run != state.run_id) {
                 return false;
             }
             let (done, waits) = watch::channel(false);
@@ -2093,7 +2095,7 @@ impl ContainerEngine {
                 let readings: Vec<_> = state.info.cpu.iter().copied().collect();
                 Some(celld_logic::pressure::ContainerSample {
                     cell: cell.scope.clone(),
-                    run: state.run,
+                    run: state.run_id,
                     counted_bytes,
                     released_mono_ms: state.released_mono_ms,
                     stopping: state.sweeping.is_some(),
@@ -2679,8 +2681,8 @@ pub(crate) mod tests {
                 assert_eq!(sample.len(), 1);
                 assert_eq!((sample[0].released_mono_ms.is_some(), sample[0].stopping), (!held, false), "{case}: {sample:?}");
                 if why == Sweep::Memory {
-                    assert!(engine.sleep_for_memory(&cell.scope, cell.current_run()), "{case}: it sleeps");
-                    assert!(!engine.sleep_for_memory(&cell.scope, cell.current_run()), "{case}: once");
+                    assert!(engine.sleep_for_memory(&cell.scope, run_id_of(&cell)), "{case}: it sleeps");
+                    assert!(!engine.sleep_for_memory(&cell.scope, run_id_of(&cell)), "{case}: once");
                 }
                 for _ in 0..500 {
                     let stopped = if held { cell.ended(run).is_some() && cell.state.lock().unwrap().sweeping.is_none() } else { engine.cell(&cell.scope).is_none() };
@@ -2753,7 +2755,7 @@ pub(crate) mod tests {
                 asyncrt::spawn(async move {
                     while let Some(message) = asked.recv().await {
                         if let crate::actor::Message::MakeRoom { starting, reply } = message {
-                            let run_of = |c: &String| answering.cell(c).map(|cell| cell.current_run());
+                            let run_of = |c: &String| answering.cell(c).map(|cell| run_id_of(&cell));
                             let candidates: Vec<(String, u64)> = listed.iter().filter(|c| **c != starting).filter_map(|c| Some((c.clone(), run_of(c)?))).collect();
                             let _ = reply.send(answering.sleep_one_for_room(&candidates));
                         }
@@ -2833,7 +2835,7 @@ pub(crate) mod tests {
             let first = cell.begin_run();
             engine.start(&cell, first, start_img()).await.expect("started");
             fake.removal.hold();
-            assert!(engine.sleep_for_memory(&cell.scope, cell.current_run()), "an idle object's container sleeps");
+            assert!(engine.sleep_for_memory(&cell.scope, run_id_of(&cell)), "an idle object's container sleeps");
             fake.removal.reached().await;
             assert_eq!(cell.ended(first), Some(Ok(RunExit { code: 0, destroyed: false })), "it exited at the signal");
             // its object starts again while the removal is held
@@ -2852,49 +2854,71 @@ pub(crate) mod tests {
         });
     }
 
-    // Goal (fork; Codex's round on the CPU rule): a stop is chosen for a
+    /// A cell's current run, by its node-wide id (what a sample names).
+    fn run_id_of(cell: &CellContainer) -> u64 {
+        cell.state.lock().unwrap().run_id
+    }
+
+    // Goal (fork; Codex's rounds on the CPU rule): a stop is chosen for a
     // run, on that run's own sample and readings, and stops that run only.
     // Invalid: run A is chosen; A ends and its cell starts run B before the
     // next sample; the choice made for A then stops nothing, whether B's
-    // object holds it or let it go, and B runs on. Valid: a choice made for
-    // B stops B.
+    // object holds it or let it go, or B runs under a new handle (its own
+    // count of runs starts again, so only the node-wide id tells them
+    // apart), and B runs on. Valid: a choice made for B stops B.
     #[test]
     fn a_choice_stops_only_the_run_it_was_made_for() {
         rt().block_on(async {
-            for released in [false, true] {
-                let case = format!("released {released}");
+            for (released, recreated) in [(false, false), (true, false), (false, true)] {
+                let case = format!("released {released} recreated {recreated}");
                 let fake = Arc::new(Fake::default());
                 fake.ends.store(true, Ordering::SeqCst);
                 fake.exits_at_term.store(true, Ordering::SeqCst);
                 let mut engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap();
                 engine.sweep_grace = Duration::from_millis(400);
                 let engine = Arc::new(engine);
-                let cell = a_box();
-                engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
-                let first = cell.begin_run();
-                engine.start(&cell, first, start_img()).await.expect("started");
-                let sample = engine.samples();
-                assert_eq!(sample[0].run, first, "{case}: the sample names its run");
-                // A ends (here by its own sleep), then its cell starts B
-                assert!(engine.sleep_for_memory(&cell.scope, first), "{case}");
+                let first = a_box();
+                engine.cells.lock().unwrap().insert(first.scope.clone(), first.clone());
+                let run = first.begin_run();
+                engine.start(&first, run, start_img()).await.expect("started");
+                if recreated {
+                    first.set_inactivity(Duration::from_secs(60));
+                    engine.release(&first.scope, Release::Keep).await;
+                }
+                let chosen = engine.samples()[0].run;
+                // A ends (here by its own sleep), then its cell starts B: on
+                // the same handle, or on a new one once A's sweep let it go
+                assert!(engine.sleep_for_memory(&first.scope, chosen), "{case}");
                 for _ in 0..500 {
-                    if cell.ended(first).is_some() && cell.state.lock().unwrap().sweeping.is_none() {
+                    let over = if recreated { engine.cell(&first.scope).is_none() } else { first.ended(run).is_some() && first.state.lock().unwrap().sweeping.is_none() };
+                    if over {
                         break;
                     }
                     asyncrt::sleep(Duration::from_millis(10)).await;
                 }
+                let cell = if recreated {
+                    let again = a_box();
+                    engine.cells.lock().unwrap().insert(again.scope.clone(), again.clone());
+                    again
+                } else {
+                    first.clone()
+                };
                 let second = cell.begin_run();
+                if recreated {
+                    assert_eq!(second, run, "{case}: a new handle counts its runs from the start again");
+                }
                 engine.start(&cell, second, start_img()).await.expect("B started");
                 if released {
                     cell.set_inactivity(Duration::from_secs(60));
                     engine.release(&cell.scope, Release::Keep).await;
                 }
-                assert!(!engine.sleep_for_memory(&cell.scope, first), "{case}: the choice made for A stops nothing");
-                assert!(engine.sleep_one_for_room(&[(cell.scope.clone(), first)]).is_none(), "{case}: nor makes room");
+                assert!(!engine.sleep_for_memory(&cell.scope, chosen), "{case}: the choice made for A stops nothing");
+                assert!(engine.sleep_one_for_room(&[(cell.scope.clone(), chosen)]).is_none(), "{case}: nor makes room");
                 asyncrt::sleep(Duration::from_millis(100)).await;
                 assert_eq!(fake.asked_of(&cell.name), ["start", "signal 15", "remove", "start"], "{case}: B was not signalled");
                 assert!(cell.running() && cell.current_run() == second, "{case}: B runs on");
-                assert!(engine.sleep_for_memory(&cell.scope, second), "{case}: a choice made for B stops B");
+                let for_b = engine.samples()[0].run;
+                assert!(engine.sleep_for_memory(&cell.scope, for_b), "{case}: a choice made for B, on its own sample, stops B");
             }
         });
     }
@@ -2919,7 +2943,7 @@ pub(crate) mod tests {
             let first = cell.begin_run();
             engine.start(&cell, first, start_img()).await.expect("started");
             fake.removal.hold();
-            assert!(engine.sleep_for_memory(&cell.scope, cell.current_run()));
+            assert!(engine.sleep_for_memory(&cell.scope, run_id_of(&cell)));
             fake.removal.reached().await;
             let second = cell.begin_run();
             let error = engine.start(&cell, second, start_img()).await.expect_err("past the bound, no launch");
@@ -2958,7 +2982,7 @@ pub(crate) mod tests {
             cell.set_inactivity(Duration::from_secs(60));
             engine.release(&cell.scope, Release::Keep).await;
             fake.removal.hold();
-            assert!(engine.sleep_for_memory(&cell.scope, cell.current_run()));
+            assert!(engine.sleep_for_memory(&cell.scope, run_id_of(&cell)));
             fake.removal.reached().await;
             let done = cell.state.lock().unwrap().sweeping.clone().expect("its sweep");
             cell.state.lock().unwrap().released_mono_ms = None;

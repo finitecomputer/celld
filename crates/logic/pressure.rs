@@ -170,8 +170,9 @@ pub fn container_counted_bytes(cap: u64, in_use: Option<u64>) -> u64 {
 pub struct ContainerSample {
     /// The cell (the Durable Object) the container belongs to.
     pub cell: String,
-    /// The run sampled (its id rises across the node). A stop chosen on this
-    /// sample stops this run only: a newer run of the cell has none of its
+    /// The run sampled, by its node-wide id (it rises across the node and
+    /// never repeats, whatever handle runs it). A stop chosen on this sample
+    /// stops this run only: a newer run of the cell has none of its
     /// readings, and is never stopped on them.
     pub run: u64,
     /// What it counts against the node now: [`container_counted_bytes`].
