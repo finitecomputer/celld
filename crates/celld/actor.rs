@@ -2909,11 +2909,11 @@ impl Actor {
                 self.drive(Event::ContainerRunning { cell, run, running }, out)
             }
             Message::MakeRoom { starting, reply } => {
-                let candidates: Vec<String> = self
+                let candidates: Vec<(String, u64)> = self
                     .state
                     .sleepable_containers(crate::asyncrt::mono_ms())
                     .into_iter()
-                    .filter(|cell| *cell != starting)
+                    .filter(|(cell, _)| *cell != starting)
                     .collect();
                 let slept = crate::container::engine_if_ready()
                     .and_then(|engine| engine.sleep_one_for_room(&candidates));
@@ -3327,6 +3327,7 @@ impl Actor {
             }
             Effect::SleepContainer {
                 cell,
+                run,
                 counted_bytes,
                 idle_ms,
                 cpu_permille,
@@ -3336,10 +3337,11 @@ impl Actor {
                 // timer would put it to sleep, early. Its object sees the
                 // same end. Logged in the node's own log, never the owner's.
                 let slept = crate::container::engine_if_ready()
-                    .is_some_and(|engine| engine.sleep_for_memory(&cell));
+                    .is_some_and(|engine| engine.sleep_for_memory(&cell, run));
                 tracing::info!(
                     event = "container_slept_for_memory",
                     scope = %cell,
+                    run,
                     counted_bytes,
                     idle_ms,
                     cpu_permille,

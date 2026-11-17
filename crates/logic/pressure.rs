@@ -170,6 +170,10 @@ pub fn container_counted_bytes(cap: u64, in_use: Option<u64>) -> u64 {
 pub struct ContainerSample {
     /// The cell (the Durable Object) the container belongs to.
     pub cell: String,
+    /// The run sampled (its id rises across the node). A stop chosen on this
+    /// sample stops this run only: a newer run of the cell has none of its
+    /// readings, and is never stopped on them.
+    pub run: u64,
     /// What it counts against the node now: [`container_counted_bytes`].
     pub counted_bytes: u64,
     /// When its cell left this node's runtime and its container stayed on
@@ -194,6 +198,8 @@ pub struct ContainerSample {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SleepCandidate<'a> {
     pub cell: &'a str,
+    /// `ContainerSample::run`.
+    pub run: u64,
     pub counted_bytes: u64,
     /// Its object is at work, or about to be: an open socket (a hibernated
     /// one too), a request in flight or waiting for it, an alarm firing, or
@@ -609,6 +615,7 @@ mod tests {
     fn computers(now: u64) -> Vec<SleepCandidate<'static>> {
         let idle = |cell, quiet_for: u64| SleepCandidate {
             cell,
+            run: 1,
             counted_bytes: 2 * GIB,
             resident: false,
             last_active_mono_ms: now - quiet_for,
@@ -656,7 +663,7 @@ mod tests {
         let line = 8 * GIB;
         let resident: Vec<_> = computers(now).into_iter().map(|c| SleepCandidate { resident: true, ..c }).collect();
         assert_eq!(containers_to_sleep(line + 100 * GIB, line, 0, &resident, now), Vec::<&str>::new());
-        let recent = |quiet_for| SleepCandidate { cell: "Computer:new", counted_bytes: 2 * GIB, resident: false, last_active_mono_ms: now - quiet_for, stopping: false, provisional: false, cpu_permille: Some(3) };
+        let recent = |quiet_for| SleepCandidate { cell: "Computer:new", run: 1, counted_bytes: 2 * GIB, resident: false, last_active_mono_ms: now - quiet_for, stopping: false, provisional: false, cpu_permille: Some(3) };
         assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(CONTAINER_QUIET_MS - 1)], now), Vec::<&str>::new(), "a millisecond inside the window");
         assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(CONTAINER_QUIET_MS)], now), vec!["Computer:new"], "at its end");
         assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(0)], 0), Vec::<&str>::new(), "a clock at its start");
@@ -715,7 +722,7 @@ mod tests {
         let now = 100 * 60_000;
         let line = 8 * GIB;
         let mut all = computers(now);
-        all.push(SleepCandidate { cell: "Computer:new", counted_bytes: 6 * GIB, resident: true, last_active_mono_ms: now, stopping: false, provisional: true, cpu_permille: None });
+        all.push(SleepCandidate { cell: "Computer:new", run: 1, counted_bytes: 6 * GIB, resident: true, last_active_mono_ms: now, stopping: false, provisional: true, cpu_permille: None });
         assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &all, now), Vec::<&str>::new(), "its cap stands in for now");
         all.last_mut().unwrap().provisional = false;
         assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &all, now), vec!["Computer:a", "Computer:b"], "reported, what is needed sleeps");

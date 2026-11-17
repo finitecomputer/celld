@@ -1859,7 +1859,7 @@ impl ContainerEngine {
                 let cell_ = cell.clone();
                 let sweeper = asyncrt::spawn(async move {
                     asyncrt::sleep(window).await;
-                    engine.begin_sweep(&cell_, Sweep::Inactivity);
+                    engine.begin_sweep(&cell_, Sweep::Inactivity, None);
                 });
                 if let Some(previous) = cell.state.lock().unwrap().sweeper.replace(sweeper) {
                     previous.abort();
@@ -1910,11 +1910,11 @@ impl ContainerEngine {
     /// fork: the actor's answer to `make_room`: the first of `candidates`
     /// (the core's sleepable containers, the idlest first) that this engine
     /// puts to sleep now, if any.
-    pub fn sleep_one_for_room(self: &Arc<Self>, candidates: &[String]) -> Option<String> {
+    pub fn sleep_one_for_room(self: &Arc<Self>, candidates: &[(String, u64)]) -> Option<String> {
         candidates
             .iter()
-            .find(|scope| self.cell(scope).is_some_and(|cell| self.begin_sleep(&cell, Sweep::Room)))
-            .cloned()
+            .find(|(scope, run)| self.cell(scope).is_some_and(|cell| self.begin_sleep(&cell, Sweep::Room, *run)))
+            .map(|(scope, _)| scope.clone())
     }
 
     /// fork: puts the container of the cell `scope` to sleep now, for
@@ -1922,20 +1922,22 @@ impl ContainerEngine {
     /// socket, idle past its window): the sweep its inactivity timer would
     /// begin, early, when its cell let it go; else the same stop, its cell
     /// keeping the handle, whose `monitor()` sees the run end. Once: false
-    /// when it is not running or already stopping.
-    pub fn sleep_for_memory(self: &Arc<Self>, scope: &str) -> bool {
+    /// when it is not running or already stopping, and when `run`, the run
+    /// the core chose, is no longer the cell's: a newer run was judged on
+    /// none of its own readings.
+    pub fn sleep_for_memory(self: &Arc<Self>, scope: &str, run: u64) -> bool {
         self.cell(scope)
-            .is_some_and(|cell| self.begin_sleep(&cell, Sweep::Memory))
+            .is_some_and(|cell| self.begin_sleep(&cell, Sweep::Memory, run))
     }
 
-    /// fork: `sleep_for_memory`'s stop, for `why`.
-    fn begin_sleep(self: &Arc<Self>, cell: &Arc<CellContainer>, why: Sweep) -> bool {
+    /// fork: `sleep_for_memory`'s stop of run `chosen`, for `why`.
+    fn begin_sleep(self: &Arc<Self>, cell: &Arc<CellContainer>, why: Sweep, chosen: u64) -> bool {
         if cell.state.lock().unwrap().released_mono_ms.is_some() {
-            return self.begin_sweep(cell, why);
+            return self.begin_sweep(cell, why, Some(chosen));
         }
         let (run, done) = {
             let mut state = cell.state.lock().unwrap();
-            if !state.running || state.sweeping.is_some() || state.released_mono_ms.is_some() {
+            if !state.running || state.sweeping.is_some() || state.released_mono_ms.is_some() || state.run != chosen {
                 return false;
             }
             let (done, waits) = watch::channel(false);
@@ -1958,10 +1960,12 @@ impl ContainerEngine {
     /// `sleepAfter` makes (`stop_gracefully`), then its handle goes. A cell
     /// that comes back meanwhile waits for it (`attach`). The timer that
     /// armed it is spent: aborted when the sweep is early.
-    fn begin_sweep(self: &Arc<Self>, cell: &Arc<CellContainer>, why: Sweep) -> bool {
+    /// A pressure sleep names the run it chose (`chosen`), and none other
+    /// is swept for it; the inactivity timer's sweep names none.
+    fn begin_sweep(self: &Arc<Self>, cell: &Arc<CellContainer>, why: Sweep, chosen: Option<u64>) -> bool {
         let (run, running, done) = {
             let mut state = cell.state.lock().unwrap();
-            if state.released_mono_ms.is_none() || state.sweeping.is_some() {
+            if state.released_mono_ms.is_none() || state.sweeping.is_some() || chosen.is_some_and(|run| run != state.run) {
                 return false;
             }
             let (done, waits) = watch::channel(false);
@@ -2089,6 +2093,7 @@ impl ContainerEngine {
                 let readings: Vec<_> = state.info.cpu.iter().copied().collect();
                 Some(celld_logic::pressure::ContainerSample {
                     cell: cell.scope.clone(),
+                    run: state.run,
                     counted_bytes,
                     released_mono_ms: state.released_mono_ms,
                     stopping: state.sweeping.is_some(),
@@ -2674,8 +2679,8 @@ pub(crate) mod tests {
                 assert_eq!(sample.len(), 1);
                 assert_eq!((sample[0].released_mono_ms.is_some(), sample[0].stopping), (!held, false), "{case}: {sample:?}");
                 if why == Sweep::Memory {
-                    assert!(engine.sleep_for_memory(&cell.scope), "{case}: it sleeps");
-                    assert!(!engine.sleep_for_memory(&cell.scope), "{case}: once");
+                    assert!(engine.sleep_for_memory(&cell.scope, cell.current_run()), "{case}: it sleeps");
+                    assert!(!engine.sleep_for_memory(&cell.scope, cell.current_run()), "{case}: once");
                 }
                 for _ in 0..500 {
                     let stopped = if held { cell.ended(run).is_some() && cell.state.lock().unwrap().sweeping.is_none() } else { engine.cell(&cell.scope).is_none() };
@@ -2748,7 +2753,8 @@ pub(crate) mod tests {
                 asyncrt::spawn(async move {
                     while let Some(message) = asked.recv().await {
                         if let crate::actor::Message::MakeRoom { starting, reply } = message {
-                            let candidates: Vec<String> = listed.iter().filter(|c| **c != starting).cloned().collect();
+                            let run_of = |c: &String| answering.cell(c).map(|cell| cell.current_run());
+                            let candidates: Vec<(String, u64)> = listed.iter().filter(|c| **c != starting).filter_map(|c| Some((c.clone(), run_of(c)?))).collect();
                             let _ = reply.send(answering.sleep_one_for_room(&candidates));
                         }
                     }
@@ -2827,7 +2833,7 @@ pub(crate) mod tests {
             let first = cell.begin_run();
             engine.start(&cell, first, start_img()).await.expect("started");
             fake.removal.hold();
-            assert!(engine.sleep_for_memory(&cell.scope), "an idle object's container sleeps");
+            assert!(engine.sleep_for_memory(&cell.scope, cell.current_run()), "an idle object's container sleeps");
             fake.removal.reached().await;
             assert_eq!(cell.ended(first), Some(Ok(RunExit { code: 0, destroyed: false })), "it exited at the signal");
             // its object starts again while the removal is held
@@ -2843,6 +2849,53 @@ pub(crate) mod tests {
             starting.await.expect("the start ran").expect("started");
             assert_eq!(fake.asked_of(&cell.name), ["start", "signal 15", "remove", "start"], "removed before the new run's launch");
             assert!(cell.running() && cell.current_run() == second && cell.ended(second).is_none(), "the new run runs");
+        });
+    }
+
+    // Goal (fork; Codex's round on the CPU rule): a stop is chosen for a
+    // run, on that run's own sample and readings, and stops that run only.
+    // Invalid: run A is chosen; A ends and its cell starts run B before the
+    // next sample; the choice made for A then stops nothing, whether B's
+    // object holds it or let it go, and B runs on. Valid: a choice made for
+    // B stops B.
+    #[test]
+    fn a_choice_stops_only_the_run_it_was_made_for() {
+        rt().block_on(async {
+            for released in [false, true] {
+                let case = format!("released {released}");
+                let fake = Arc::new(Fake::default());
+                fake.ends.store(true, Ordering::SeqCst);
+                fake.exits_at_term.store(true, Ordering::SeqCst);
+                let mut engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap();
+                engine.sweep_grace = Duration::from_millis(400);
+                let engine = Arc::new(engine);
+                let cell = a_box();
+                engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+                let first = cell.begin_run();
+                engine.start(&cell, first, start_img()).await.expect("started");
+                let sample = engine.samples();
+                assert_eq!(sample[0].run, first, "{case}: the sample names its run");
+                // A ends (here by its own sleep), then its cell starts B
+                assert!(engine.sleep_for_memory(&cell.scope, first), "{case}");
+                for _ in 0..500 {
+                    if cell.ended(first).is_some() && cell.state.lock().unwrap().sweeping.is_none() {
+                        break;
+                    }
+                    asyncrt::sleep(Duration::from_millis(10)).await;
+                }
+                let second = cell.begin_run();
+                engine.start(&cell, second, start_img()).await.expect("B started");
+                if released {
+                    cell.set_inactivity(Duration::from_secs(60));
+                    engine.release(&cell.scope, Release::Keep).await;
+                }
+                assert!(!engine.sleep_for_memory(&cell.scope, first), "{case}: the choice made for A stops nothing");
+                assert!(engine.sleep_one_for_room(&[(cell.scope.clone(), first)]).is_none(), "{case}: nor makes room");
+                asyncrt::sleep(Duration::from_millis(100)).await;
+                assert_eq!(fake.asked_of(&cell.name), ["start", "signal 15", "remove", "start"], "{case}: B was not signalled");
+                assert!(cell.running() && cell.current_run() == second, "{case}: B runs on");
+                assert!(engine.sleep_for_memory(&cell.scope, second), "{case}: a choice made for B stops B");
+            }
         });
     }
 
@@ -2866,7 +2919,7 @@ pub(crate) mod tests {
             let first = cell.begin_run();
             engine.start(&cell, first, start_img()).await.expect("started");
             fake.removal.hold();
-            assert!(engine.sleep_for_memory(&cell.scope));
+            assert!(engine.sleep_for_memory(&cell.scope, cell.current_run()));
             fake.removal.reached().await;
             let second = cell.begin_run();
             let error = engine.start(&cell, second, start_img()).await.expect_err("past the bound, no launch");
@@ -2905,7 +2958,7 @@ pub(crate) mod tests {
             cell.set_inactivity(Duration::from_secs(60));
             engine.release(&cell.scope, Release::Keep).await;
             fake.removal.hold();
-            assert!(engine.sleep_for_memory(&cell.scope));
+            assert!(engine.sleep_for_memory(&cell.scope, cell.current_run()));
             fake.removal.reached().await;
             let done = cell.state.lock().unwrap().sweeping.clone().expect("its sweep");
             cell.state.lock().unwrap().released_mono_ms = None;

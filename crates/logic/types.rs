@@ -1046,6 +1046,9 @@ pub enum Effect {
     /// `container_slept_for_memory`.
     SleepContainer {
         cell: CellId,
+        /// The run the walk down chose: stopped only if it is still the
+        /// cell's run (`pressure::ContainerSample::run`).
+        run: u64,
         /// What it counted against the node when the walk down chose it.
         counted_bytes: u64,
         /// How long since its cell last wrote.

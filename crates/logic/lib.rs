@@ -6297,23 +6297,25 @@ impl State {
             return;
         };
         let candidates = self.sleep_candidates(now_mono_ms);
-        let chosen: Vec<(CellId, u64, u64, u32)> =
+        let chosen: Vec<(CellId, u64, u64, u64, u32)> =
             pressure::containers_to_sleep(sample_bytes, resume_line, evictions_return_bytes, &candidates, now_mono_ms)
                 .into_iter()
                 .filter_map(|cell| candidates.iter().find(|c| c.cell == cell))
                 .map(|c| {
                     (
                         c.cell.to_string(),
+                        c.run,
                         c.counted_bytes,
                         now_mono_ms.saturating_sub(c.last_active_mono_ms),
                         c.cpu_permille.expect("only a container known CPU quiet sleeps"),
                     )
                 })
                 .collect();
-        for (cell, counted_bytes, idle_ms, cpu_permille) in chosen {
+        for (cell, run, counted_bytes, idle_ms, cpu_permille) in chosen {
             self.container_sleeps.insert(cell.clone());
             effects.push(Effect::SleepContainer {
                 cell,
+                run,
                 counted_bytes,
                 idle_ms,
                 cpu_permille,
@@ -6324,11 +6326,11 @@ impl State {
     /// The containers that may be put to sleep now, the least recently
     /// active first (`pressure::sleepable`): what a start the engine refuses
     /// for want of memory takes, the actor asking as it happens.
-    pub fn sleepable_containers(&self, now_mono_ms: u64) -> Vec<CellId> {
+    pub fn sleepable_containers(&self, now_mono_ms: u64) -> Vec<(CellId, u64)> {
         let candidates = self.sleep_candidates(now_mono_ms);
         pressure::sleepable(&candidates, now_mono_ms)
             .into_iter()
-            .map(|c| c.cell.to_string())
+            .map(|c| (c.cell.to_string(), c.run))
             .collect()
     }
 
@@ -6343,13 +6345,16 @@ impl State {
                 // it, a socket open (a hibernated one too: a computer's
                 // guest holds its keepalive through one), an alarm firing, or
                 // the cell between phases. A cell loaded but doing none of
-                // that is not; nor is one dormant, its container on its
-                // inactivity timer. A container whose cell the core does not
-                // know is taken only once its cell let it go.
+                // that is not; nor is one out of memory, its container on its
+                // inactivity timer: dormant, or inactive (a request refused
+                // while the node was full leaves an evicted cell so, to
+                // re-read its owner when it next comes). A container whose
+                // cell the core does not know is taken only once its cell
+                // let it go.
                 let resident = match cell {
                     None => c.released_mono_ms.is_none(),
                     Some(cell) => {
-                        !matches!(cell.phase, Phase::Dormant { .. } | Phase::Resident { .. })
+                        !matches!(cell.phase, Phase::Inactive | Phase::Dormant { .. } | Phase::Resident { .. })
                             || self.is_active(&c.cell)
                             || !cell.requests.is_empty()
                             || !cell.websockets.is_empty()
@@ -6364,6 +6369,7 @@ impl State {
                 };
                 pressure::SleepCandidate {
                     cell: &c.cell,
+                    run: c.run,
                     counted_bytes: c.counted_bytes,
                     resident,
                     last_active_mono_ms,
@@ -7350,6 +7356,7 @@ mod pressure_sleep_tests {
         state.cells.insert("Computer:a".into(), cell);
         state.containers = vec![pressure::ContainerSample {
             cell: "Computer:a".into(),
+            run: 4,
             counted_bytes: 1 << 30,
             released_mono_ms: None,
             stopping: false,
@@ -7362,12 +7369,40 @@ mod pressure_sleep_tests {
             request(&mut state, 10 + i as u64, minute * MIN, None);
         }
         assert_eq!(state.cells["Computer:a"].last_written_mono_ms, 10 * MIN, "reads are not activity");
-        assert_eq!(state.sleepable_containers(12 * MIN - 1), Vec::<CellId>::new(), "inside its two minutes");
-        assert_eq!(state.sleepable_containers(12 * MIN), vec!["Computer:a".to_string()], "read every minute, quiet two");
+        assert_eq!(state.sleepable_containers(12 * MIN - 1), Vec::<(CellId, u64)>::new(), "inside its two minutes");
+        assert_eq!(state.sleepable_containers(12 * MIN), vec![("Computer:a".to_string(), 4)], "read every minute, quiet two");
         request(&mut state, 20, 13 * MIN, Some(9));
-        assert_eq!(state.sleepable_containers(14 * MIN), Vec::<CellId>::new(), "a write starts its two minutes again");
-        assert_eq!(state.sleepable_containers(15 * MIN), vec!["Computer:a".to_string()]);
+        assert_eq!(state.sleepable_containers(14 * MIN), Vec::<(CellId, u64)>::new(), "a write starts its two minutes again");
+        assert_eq!(state.sleepable_containers(15 * MIN), vec![("Computer:a".to_string(), 4)]);
         state.note_written(&"Computer:a".to_string(), 11 * MIN);
         assert_eq!(state.cells["Computer:a"].last_written_mono_ms, 13 * MIN, "never back");
+    }
+
+    // Goal (the real run on krun): a container whose cell is out of memory
+    // sleeps whether the cell is dormant (evicted) or inactive (a request
+    // refused while the node was full left it to re-read its owner), its
+    // container let go; one whose cell waits for room to come back never.
+    #[test]
+    fn a_cell_out_of_memory_lets_its_container_sleep() {
+        for (phase, sleeps) in [
+            (Phase::Dormant { epoch: 1 }, true),
+            (Phase::Inactive, true),
+            (Phase::WaitingCapacity, false),
+        ] {
+            let mut state = node();
+            let cell = Cell { phase: phase.clone(), last_written_mono_ms: MIN, ..Cell::default() };
+            state.cells.insert("Computer:a".into(), cell);
+            state.containers = vec![pressure::ContainerSample {
+                cell: "Computer:a".into(),
+                run: 2,
+                counted_bytes: 1 << 30,
+                released_mono_ms: Some(2 * MIN),
+                stopping: false,
+                provisional: false,
+                cpu_permille: Some(0),
+            }];
+            let expect = if sleeps { vec![("Computer:a".to_string(), 2)] } else { vec![] };
+            assert_eq!(state.sleepable_containers(10 * MIN), expect, "{phase:?}");
+        }
     }
 }
