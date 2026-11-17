@@ -6199,6 +6199,14 @@ impl State {
         // coincidence.
         let metric = pressure::PressureConfig::walk_metric(latches);
         let sample_bytes = load.metric_bytes(metric);
+        // No eviction returns memory a container holds: the most every
+        // eviction together can return is the node's own share of the
+        // sample. What the line needs beyond that, idle containers give now,
+        // while the evictions take the rest; waiting for the walk down to
+        // find them futile kept a node with many cells shut to new ones for
+        // minutes (a real Fragment node on celld).
+        let evictions_at_most = sample_bytes.saturating_sub(load.container_reserved_bytes);
+        self.sleep_containers(metric, sample_bytes, evictions_at_most, now_mono_ms, effects);
         if self.shed_cut.is_some_and(|cut| cut.metric != metric) {
             self.shed_cut = None;
         }
@@ -6212,7 +6220,7 @@ impl State {
             if cut_landed && !rose && !self.shedding_can_reach_resume_line(cut, sample_bytes) {
                 // The evictions cannot get the node down: its idle
                 // containers may.
-                self.sleep_containers(metric, sample_bytes, now_mono_ms, effects);
+                self.sleep_containers(metric, sample_bytes, 0, now_mono_ms, effects);
                 return;
             }
         }
@@ -6229,7 +6237,7 @@ impl State {
         // Nothing left to evict and nothing leaving: the evictions are done
         // with what they can return, so the idle containers may give the rest.
         if self.eviction_permits.is_empty() && self.shed_candidate().is_none() {
-            self.sleep_containers(metric, sample_bytes, now_mono_ms, effects);
+            self.sleep_containers(metric, sample_bytes, 0, now_mono_ms, effects);
         }
     }
 
@@ -6247,16 +6255,19 @@ impl State {
         self.container_sleeps.insert(cell.to_string());
     }
 
-    /// Put idle containers to sleep while the evictions alone cannot get the
-    /// node to its resume line (`pressure::containers_to_sleep`): the least
-    /// recently active first, as many as that needs, never one whose object
-    /// is resident or whose cell did anything in the last
-    /// `pressure::CONTAINER_QUIET_MS` (`sleep_candidates` says what
-    /// resident is).
+    /// Put idle containers to sleep for what the evictions cannot return on
+    /// the way to the node's resume line (`pressure::containers_to_sleep`):
+    /// `evictions_return_bytes` is the most they may still return (the
+    /// node's own share of the sample, on any latched sample; none once the
+    /// walk down finds them futile). The least recently active first, as
+    /// many as that needs, never one whose object is resident or whose cell
+    /// did anything in the last `pressure::CONTAINER_QUIET_MS`
+    /// (`sleep_candidates` says what resident is).
     fn sleep_containers(
         &mut self,
         metric: pressure::Metric,
         sample_bytes: u64,
+        evictions_return_bytes: u64,
         now_mono_ms: u64,
         effects: &mut Vec<Effect>,
     ) {
@@ -6265,7 +6276,7 @@ impl State {
         };
         let candidates = self.sleep_candidates(now_mono_ms);
         let chosen: Vec<(CellId, u64, u64)> =
-            pressure::containers_to_sleep(sample_bytes, resume_line, 0, &candidates, now_mono_ms)
+            pressure::containers_to_sleep(sample_bytes, resume_line, evictions_return_bytes, &candidates, now_mono_ms)
                 .into_iter()
                 .filter_map(|cell| candidates.iter().find(|c| c.cell == cell))
                 .map(|c| {
