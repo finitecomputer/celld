@@ -114,7 +114,7 @@ pub struct Answer {
 #[derive(Debug)]
 pub enum Body {
     Bytes(Vec<u8>),
-    Stream(reqwest::Response),
+    Stream(Box<reqwest::Response>),
 }
 
 impl Answer {
@@ -598,7 +598,7 @@ async fn passed(origin: &str, model: &str, inputs: &str) -> Result<Answer, Failu
             kept.push((name.to_string(), v.to_string()));
         }
     }
-    Ok(Answer { status: response.status().as_u16(), headers: kept, body: Body::Stream(response) })
+    Ok(Answer { status: response.status().as_u16(), headers: kept, body: Body::Stream(Box::new(response)) })
 }
 
 /// An answer, or why there is none, as the op hands it to the isolate: the
@@ -608,7 +608,7 @@ async fn passed(origin: &str, model: &str, inputs: &str) -> Result<Answer, Failu
 pub fn frame(answer: Result<Answer, Failure>, register: impl FnOnce(reqwest::Response) -> Option<u64>) -> Vec<u8> {
     let (meta, body) = match answer {
         Ok(Answer { status, headers, body: Body::Bytes(body) }) => (json!({ "status": status, "headers": headers }), body),
-        Ok(Answer { status, headers, body: Body::Stream(response) }) => match register(response) {
+        Ok(Answer { status, headers, body: Body::Stream(response) }) => match register(*response) {
             Some(id) => (json!({ "status": status, "headers": headers, "streamId": id }), Vec::new()),
             None => (json!({ "code": "failed", "message": "the node is closing: the answer's stream was not opened" }), Vec::new()),
         },
