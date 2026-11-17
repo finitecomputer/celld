@@ -6334,6 +6334,7 @@ impl State {
                     resident,
                     last_active_mono_ms,
                     stopping: c.stopping || self.container_sleeps.contains(&c.cell),
+                    provisional: c.provisional,
                 }
             })
             .collect()

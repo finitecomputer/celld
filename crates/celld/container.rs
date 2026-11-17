@@ -2055,6 +2055,9 @@ impl ContainerEngine {
     /// fork: each running container, by its cell, for the walk down.
     pub fn samples(&self) -> Vec<celld_logic::pressure::ContainerSample> {
         let now = asyncrt::mono_ms();
+        // an engine that reports what containers use: one it has not
+        // reported yet counts its cap provisionally
+        let reports = self.backend.reports_memory();
         self.cells
             .lock()
             .unwrap()
@@ -2062,11 +2065,13 @@ impl ContainerEngine {
             .filter_map(|cell| {
                 let counted_bytes = cell.counted_memory_bytes(now)?;
                 let state = cell.state.lock().unwrap();
+                let reported = state.info.in_use.is_some_and(|(_, at)| now.saturating_sub(at) <= IN_USE_FRESH_MS);
                 Some(celld_logic::pressure::ContainerSample {
                     cell: cell.scope.clone(),
                     counted_bytes,
                     released_mono_ms: state.released_mono_ms,
                     stopping: state.sweeping.is_some(),
+                    provisional: reports && !reported,
                 })
             })
             .collect()

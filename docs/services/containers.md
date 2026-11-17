@@ -221,7 +221,10 @@ When the evictions alone cannot bring the node below its resume line (80% of
 the ceiling), the node puts idle containers to sleep: the stop their
 inactivity window would make, early. It chooses the least recently active
 first, and only as many as the rest of the way down needs, counting a stop
-already under way as memory on its way back. It never stops a container whose
+already under way as memory on its way back. It waits while a container just
+started still counts its whole instance type's memory for want of its
+engine's first report (about 2 seconds): that count stands in for what it
+will use, and sleeping on it would stop what its real use does not need. It never stops a container whose
 object is at work (an open socket, a hibernated one included, a request in
 flight or waiting for it, an alarm running), nor one whose cell did anything
 in the last 2 minutes: an object may still be saving what its container did

@@ -179,6 +179,10 @@ pub struct ContainerSample {
     /// A stop of it is under way: what it counts is already on its way
     /// back.
     pub stopping: bool,
+    /// It counts its cap for want of a fresh report from an engine that
+    /// reports (a container just started, about 2 s): what it uses is not
+    /// known yet.
+    pub provisional: bool,
 }
 
 /// A container the walk down may put to sleep, weighed with what the core
@@ -195,6 +199,9 @@ pub struct SleepCandidate<'a> {
     /// The cell's last activity (monotonic ms).
     pub last_active_mono_ms: u64,
     pub stopping: bool,
+    /// Its count is its cap until its engine's first report
+    /// (`ContainerSample::provisional`).
+    pub provisional: bool,
 }
 
 /// How long a container's cell must have done nothing before a walk down
@@ -216,6 +223,11 @@ pub const CONTAINER_QUIET_MS: u64 = 2 * 60_000;
 /// [`CONTAINER_QUIET_MS`]: what can't be put to sleep stays, and the latch
 /// holds.
 ///
+/// None either while any container still counts its cap for want of its
+/// first report (a start, about 2 s): the cap stands in for what it will
+/// use, and a projection on it puts to sleep what its real use does not
+/// need. The walk down asks again at the next sample.
+///
 /// A sleep is the stop the container's inactivity timer makes, early: its
 /// object sees the same end, and its next activation starts it again.
 pub fn containers_to_sleep<'a>(
@@ -225,6 +237,9 @@ pub fn containers_to_sleep<'a>(
     candidates: &[SleepCandidate<'a>],
     now_mono_ms: u64,
 ) -> Vec<&'a str> {
+    if candidates.iter().any(|c| c.provisional && !c.stopping) {
+        return Vec::new();
+    }
     let stopping: u64 = candidates
         .iter()
         .filter(|c| c.stopping)
@@ -473,6 +488,7 @@ mod tests {
             resident: false,
             last_active_mono_ms: now - quiet_for,
             stopping: false,
+            provisional: false,
         };
         vec![
             idle("Computer:b", 10 * 60_000),
@@ -514,7 +530,7 @@ mod tests {
         let line = 8 * GIB;
         let resident: Vec<_> = computers(now).into_iter().map(|c| SleepCandidate { resident: true, ..c }).collect();
         assert_eq!(containers_to_sleep(line + 100 * GIB, line, 0, &resident, now), Vec::<&str>::new());
-        let recent = |quiet_for| SleepCandidate { cell: "Computer:new", counted_bytes: 2 * GIB, resident: false, last_active_mono_ms: now - quiet_for, stopping: false };
+        let recent = |quiet_for| SleepCandidate { cell: "Computer:new", counted_bytes: 2 * GIB, resident: false, last_active_mono_ms: now - quiet_for, stopping: false, provisional: false };
         assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(CONTAINER_QUIET_MS - 1)], now), Vec::<&str>::new(), "a millisecond inside the window");
         assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(CONTAINER_QUIET_MS)], now), vec!["Computer:new"], "at its end");
         assert_eq!(containers_to_sleep(line + GIB, line, 0, &[recent(0)], 0), Vec::<&str>::new(), "a clock at its start");
@@ -538,6 +554,27 @@ mod tests {
         assert_eq!(containers_to_sleep(line + 2 * GIB, line, 0, &stopping, now), Vec::<&str>::new(), "its sleep under way covers it");
         assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now), vec!["Computer:b"], "the next idlest for the rest");
         assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now), containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now));
+    }
+
+    // Goal (a real run on krun): a container just started counts its cap
+    // until its engine's first report (about 2 s), which can put the node
+    // over its line for those seconds alone; no idle container sleeps for
+    // that. Nothing sleeps while one counts so; once it reports, what is
+    // still needed does. A stopping one's cap is on its way back and holds
+    // nothing.
+    #[test]
+    fn nothing_sleeps_on_a_new_containers_cap() {
+        let now = 100 * 60_000;
+        let line = 8 * GIB;
+        let mut all = computers(now);
+        all.push(SleepCandidate { cell: "Computer:new", counted_bytes: 6 * GIB, resident: true, last_active_mono_ms: now, stopping: false, provisional: true });
+        assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &all, now), Vec::<&str>::new(), "its cap stands in for now");
+        all.last_mut().unwrap().provisional = false;
+        assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &all, now), vec!["Computer:a", "Computer:b"], "reported, what is needed sleeps");
+        let mut stopping = computers(now);
+        stopping[0].provisional = true;
+        stopping[0].stopping = true;
+        assert_eq!(containers_to_sleep(line + 3 * GIB, line, 0, &stopping, now), vec!["Computer:a"], "a stopping one holds nothing");
     }
 
     // Goal: on a 12 GiB machine, at the default ceiling, idle computers
