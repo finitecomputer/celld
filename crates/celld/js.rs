@@ -7280,7 +7280,8 @@ fn op_ai_run(
     // the model's id and the input's size, then a slot on its endpoint,
     // before the input is copied out of the isolate: a call refused (too
     // large, no endpoint, no capacity) copies none of it
-    let length = |scope: &mut v8::PinScope, v: v8::Local<v8::Value>| v.to_string(scope).map_or(0, |s| s.length());
+    // UTF-8 bytes, as the host would hold them, counted without a copy
+    let length = |scope: &mut v8::PinScope, v: v8::Local<v8::Value>| v.to_string(scope).map_or(0, |s| s.utf8_length(scope));
     let model_arg = args.get(0);
     let model = match length(scope, model_arg) {
         n if n > 256 => String::new(),
@@ -7299,7 +7300,7 @@ fn op_ai_run(
             asyncrt::enqueue(async move {
                 let answer = reservation.run(&model, &inputs).await;
                 // a `workers-ai` endpoint's body, streamed as a fetch's is
-                let framed = crate::ai::frame(answer, |response| streams.register_source(HttpStreamSource::Response(response)));
+                let framed = crate::ai::frame(answer, |stream| streams.register_source(HttpStreamSource::Stream(stream)));
                 Ok::<_, String>(asyncrt::OpOut::Bytes(framed))
             })
         }

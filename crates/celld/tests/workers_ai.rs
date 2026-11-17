@@ -67,6 +67,26 @@ export default {
           up: await settle(() => env.AI.run("@cf/../../admin", { prompt: "x" })),
           dots: await settle(() => env.AI.run("@cf/./x", { prompt: "x" })),
         });
+      case "/slow-refusal": {
+        const t0 = Date.now();
+        const r = await settle(() => env.AI.run("@cf/x/refuses-slowly", { prompt: "x" }));
+        return Response.json({ ...r, ms: Date.now() - t0 });
+      }
+      case "/huge":
+        return Response.json(await settle(async () => (await (await env.AI.run("@cf/x/huge", {}, { returnRawResponse: true })).arrayBuffer()).byteLength));
+      case "/held": {
+        // one stream held open, then a second call to the same endpoint
+        const first = await env.AI.run("@cf/x/stream", { stream: true }, { returnRawResponse: true });
+        const second = await settle(async () => (await env.AI.run("@cf/x/stream", { stream: true }, { returnRawResponse: true })).status);
+        await first.body.cancel();
+        await new Promise((r) => setTimeout(r, 300));
+        const third = await settle(async () => {
+          const r = await env.AI.run("@cf/x/stream", { stream: true }, { returnRawResponse: true });
+          await r.body.cancel();
+          return r.status;
+        });
+        return Response.json({ first: first.status, second, third });
+      }
       case "/stream":
         return Response.json(await settle(async () => {
           const t0 = Date.now();
@@ -160,6 +180,24 @@ fn answer(mut stream: std::net::TcpStream, kept: &Heard) {
         let _ = stream.flush();
         std::thread::sleep(std::time::Duration::from_secs(4));
         let _ = write!(stream, "data: [DONE]\n\n");
+        return;
+    }
+    if line.starts_with("post /run/@cf/x/refuses-slowly ") {
+        // a refusal whose body stalls
+        let _ = write!(stream, "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{{\"errors\":");
+        let _ = stream.flush();
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        return;
+    }
+    if line.starts_with("post /run/@cf/x/huge ") {
+        // past the answer's bound, quickly
+        let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\n");
+        let chunk = vec![b'a'; 1 << 20];
+        for _ in 0..17 {
+            if stream.write_all(&chunk).is_err() {
+                return;
+            }
+        }
         return;
     }
     if line.starts_with("post /inference ") && body.contains("SAY 429") {
@@ -257,7 +295,7 @@ fn whisper_is_the_nodes_and_the_rest_pass_on() {
         assert_eq!(got["value"]["status"], 429, "{got}");
         assert!(got["ms"].as_u64().unwrap() < 4000, "answered before the body's stall ends: {got}");
         let (got, _) = dev.json("/as?say=401");
-        assert_eq!((got["value"]["status"].clone(), got["value"]["body"]["errors"][0]["message"].clone()), (serde_json::json!(401), serde_json::json!("this node's Whisper refused the call: no key")), "{got}");
+        assert_eq!((got["value"]["status"].clone(), got["value"]["body"]["errors"][0]["message"].clone()), (serde_json::json!(401), serde_json::json!("this node's Whisper refused the call (401)")), "{got}");
 
         // a chat's stream reaches the Worker event by event, not once whole
         let (got, took) = dev.json("/stream");
@@ -271,6 +309,23 @@ fn whisper_is_the_nodes_and_the_rest_pass_on() {
     let (got, _) = dev.json("/object");
     assert_eq!(got["value"]["text"], "Hello from a voice memo. Second line.", "{got}");
     assert!(!dev.output().contains("Hello from a voice memo"), "no words in the node's log");
+}
+
+// A "*" endpoint's refusal is answered at once though its body stalls; its
+// answer past 16 MiB is cut there; and a stream holds its endpoint's slot
+// until it ends, so with one slot a second call is 429 meanwhile.
+#[test]
+fn a_passed_answer_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (origin, _seen) = fake_endpoint();
+    let dev = start(dir.path(), serde_json::json!({ "*": { "engine": "workers-ai", "origin": origin, "concurrency": 1 } }));
+    let (got, _) = dev.json("/slow-refusal");
+    assert_eq!(got["name"], "InferenceUpstreamError", "{got}");
+    assert!(got["ms"].as_u64().unwrap() < 4000, "the refusal came at once: {got}");
+    let (got, _) = dev.json("/huge");
+    assert!(got["message"].as_str().is_some_and(|m| m.contains("over 16777216 bytes")), "{got}");
+    let (got, _) = dev.json("/held");
+    assert_eq!(got, serde_json::json!({ "first": 200, "second": { "value": 429 }, "third": { "value": 200 } }), "{got}");
 }
 
 // Valid: Whisper on an OpenAI-compatible server is its

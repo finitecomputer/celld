@@ -110,11 +110,20 @@ pub struct Answer {
 
 /// An answer's body: bytes celld made or read whole, or a `workers-ai`
 /// endpoint's own, streamed to the isolate as it comes (a chat's events
-/// reach its caller one by one, as on Cloudflare).
-#[derive(Debug)]
+/// reach its caller one by one, as on Cloudflare), at most
+/// `ANSWER_MAX_BYTES`, its endpoint's slot held until it ends.
 pub enum Body {
     Bytes(Vec<u8>),
-    Stream(Box<reqwest::Response>),
+    Stream(crate::engine_api::HttpChunkStream),
+}
+
+impl std::fmt::Debug for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Body::Bytes(b) => write!(f, "Bytes({} bytes)", b.len()),
+            Body::Stream(_) => write!(f, "Stream"),
+        }
+    }
 }
 
 impl Answer {
@@ -267,15 +276,15 @@ impl Models {
         let Ok(slot) = server.slots.clone().try_acquire_owned() else {
             return Err(Ok(refused(429, 3040, "Capacity temporarily exceeded, please try again.")));
         };
-        Ok(Reservation { server, _slot: slot })
+        Ok(Reservation { server, slot })
     }
 }
 
 /// A call's slot on its endpoint (`Models::reserve`), held until its answer
-/// starts (or the call is dropped).
+/// ends (a stream's last byte) or the call is dropped.
 pub struct Reservation<'a> {
     server: &'a Server,
-    _slot: tokio::sync::OwnedSemaphorePermit,
+    slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Reservation<'_> {
@@ -287,7 +296,7 @@ impl Reservation<'_> {
         }
         let engine = &self.server.engine;
         if let Engine::WorkersAi { origin } = engine {
-            return passed(origin, model, inputs).await;
+            return passed(origin, model, inputs, self.slot).await;
         }
         let request = match whisper_request(inputs).and_then(|r| r.for_engine(engine)) {
             Ok(request) => request,
@@ -568,6 +577,9 @@ fn form(request: &WhisperRequest) -> Option<(String, Vec<u8>)> {
 /// refusal is answered at once, so its caller tries again in time.
 const REFUSAL_READ: Duration = Duration::from_secs(2);
 const REFUSAL_MAX_BYTES: usize = 4096;
+/// How long a transcription's answer is read once its headers came: a
+/// server sends it whole, after the inference, so a stall is a fault.
+const ANSWER_READ: Duration = Duration::from_secs(30);
 
 /// Why an endpoint gave no answer, for the Worker: the endpoint's address
 /// stays in the node's log, never in what a Worker sees.
@@ -611,10 +623,11 @@ async fn transcribed(dialect: Dialect, endpoint: &str, url: String, request: Whi
     let mut response = sent.map_err(|e| unanswered(TRANSCRIBE, endpoint, &e))?;
     let status = response.status().as_u16();
     let bytes = match status {
-        200 => match body_of(&mut response, ANSWER_MAX_BYTES + 1).await {
-            Ok(b) if b.len() > ANSWER_MAX_BYTES => return Err(failure("failed", format!("this node's Whisper answered over {ANSWER_MAX_BYTES} bytes"))),
-            Ok(b) => b,
-            Err(e) => return Err(unanswered(TRANSCRIBE, endpoint, &e)),
+        200 => match crate::asyncrt::timeout(ANSWER_READ, body_of(&mut response, ANSWER_MAX_BYTES + 1)).await {
+            Ok(Ok(b)) if b.len() > ANSWER_MAX_BYTES => return Err(failure("failed", format!("this node's Whisper answered over {ANSWER_MAX_BYTES} bytes"))),
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return Err(unanswered(TRANSCRIBE, endpoint, &e)),
+            Err(_) => return Err(failure("down", format!("this node's Whisper did not finish its answer within {} s", ANSWER_READ.as_secs()))),
         },
         _ => crate::asyncrt::timeout(REFUSAL_READ, body_of(&mut response, REFUSAL_MAX_BYTES)).await.ok().and_then(Result::ok).unwrap_or_default(),
     };
@@ -622,6 +635,7 @@ async fn transcribed(dialect: Dialect, endpoint: &str, url: String, request: Whi
     // whisper.cpp's `error` is a string; OpenAI's an object with a message
     let said: String = body["error"].as_str().or_else(|| body["error"]["message"].as_str()).unwrap_or("").chars().take(200).collect();
     if status != 200 {
+        // its status alone: a refusal's text may echo what it was sent
         tracing::warn!(endpoint, status, "the AI endpoint refused a transcription");
     }
     Ok(match status {
@@ -633,36 +647,64 @@ async fn transcribed(dialect: Dialect, endpoint: &str, url: String, request: Whi
         500 if said.contains("FFmpeg conversion failed") => refused(400, 5006, "the audio could not be read"),
         // loading its model, or full: its caller tries again
         408 | 429 | 503 => refused(status, 3040, "this node's Whisper is busy; try again"),
-        400..=499 if said.is_empty() => refused(status, 5006, "this node's Whisper refused the call"),
-        400..=499 => refused(status, 5006, format!("this node's Whisper refused the call: {said}")),
+        // its status, never its text, which may echo an address or the input
+        400..=499 => refused(status, 5006, format!("this node's Whisper refused the call ({status})")),
         _ => refused(502, 3000, format!("this node's Whisper failed ({status})")),
     })
 }
 
 /// A `workers-ai` endpoint at `origin` runs `model` (a checked id: a path
-/// under `/run/`) on `inputs`; its answer is passed on as it comes, its
-/// body streamed.
-async fn passed(origin: &str, model: &str, inputs: &str) -> Result<Answer, Failure> {
+/// under `/run/`) on `inputs`; its answer is passed on as it comes. A 200's
+/// body is streamed, at most `ANSWER_MAX_BYTES`, its `slot` held until the
+/// stream ends; a refusal's is read briefly and passed whole, so its caller
+/// reads it at once.
+async fn passed(origin: &str, model: &str, inputs: &str, slot: tokio::sync::OwnedSemaphorePermit) -> Result<Answer, Failure> {
+    use futures_util::StreamExt as _;
     debug_assert!(valid_model_id(model), "Models::reserve checks the id");
     let sent = client().post(format!("{origin}/run/{model}")).header("content-type", "application/json").body(inputs.to_string()).send().await;
-    let response = sent.map_err(|e| unanswered(model, origin, &e))?;
+    let mut response = sent.map_err(|e| unanswered(model, origin, &e))?;
+    let status = response.status().as_u16();
     let mut kept = Vec::new();
     for name in std::iter::once("content-type").chain(PASSED_HEADERS) {
         if let Some(v) = response.headers().get(name).and_then(|v| v.to_str().ok()) {
             kept.push((name.to_string(), v.to_string()));
         }
     }
-    Ok(Answer { status: response.status().as_u16(), headers: kept, body: Body::Stream(Box::new(response)) })
+    if status != 200 {
+        let body = crate::asyncrt::timeout(REFUSAL_READ, body_of(&mut response, REFUSAL_MAX_BYTES)).await.ok().and_then(Result::ok).unwrap_or_default();
+        return Ok(Answer { status, headers: kept, body: Body::Bytes(body) });
+    }
+    let capped = response.bytes_stream().scan((0usize, false, slot), |(read, ended, _slot), chunk| {
+        if *ended {
+            return futures_util::future::ready(None);
+        }
+        let out = match chunk {
+            Ok(bytes) if *read + bytes.len() > ANSWER_MAX_BYTES => {
+                *ended = true;
+                Err(format!("the model's answer is over {ANSWER_MAX_BYTES} bytes"))
+            }
+            Ok(bytes) => {
+                *read += bytes.len();
+                Ok(bytes.to_vec())
+            }
+            Err(e) => {
+                *ended = true;
+                Err(format!("the model broke off its answer ({})", e.without_url()))
+            }
+        };
+        futures_util::future::ready(Some(out))
+    });
+    Ok(Answer { status, headers: kept, body: Body::Stream(Box::pin(capped)) })
 }
 
 /// An answer, or why there is none, as the op hands it to the isolate: the
 /// length of its metadata (4 bytes, big-endian), the metadata (`{status,
 /// headers}`, with a `streamId` when its body is a stream `register` gave
 /// one for, or `{code, message}`), then the body celld holds.
-pub fn frame(answer: Result<Answer, Failure>, register: impl FnOnce(reqwest::Response) -> Option<u64>) -> Vec<u8> {
+pub fn frame(answer: Result<Answer, Failure>, register: impl FnOnce(crate::engine_api::HttpChunkStream) -> Option<u64>) -> Vec<u8> {
     let (meta, body) = match answer {
         Ok(Answer { status, headers, body: Body::Bytes(body) }) => (json!({ "status": status, "headers": headers }), body),
-        Ok(Answer { status, headers, body: Body::Stream(response) }) => match register(*response) {
+        Ok(Answer { status, headers, body: Body::Stream(stream) }) => match register(stream) {
             Some(id) => (json!({ "status": status, "headers": headers, "streamId": id }), Vec::new()),
             None => (json!({ "code": "failed", "message": "the node is closing: the answer's stream was not opened" }), Vec::new()),
         },
@@ -834,7 +876,7 @@ mod tests {
     /// The op's frame: its metadata's length, the metadata, the body.
     #[test]
     fn an_answer_is_framed_for_the_isolate() {
-        let unused = |_: reqwest::Response| -> Option<u64> { panic!("no stream to register") };
+        let unused = |_: crate::engine_api::HttpChunkStream| -> Option<u64> { panic!("no stream to register") };
         let framed = frame(Ok(Answer { status: 200, headers: vec![("content-type".into(), "image/png".into())], body: Body::Bytes(vec![0x89, b'P']) }), unused);
         let n = u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize;
         assert_eq!(serde_json::from_slice::<Value>(&framed[4..4 + n]).unwrap(), json!({ "status": 200, "headers": [["content-type", "image/png"]] }));
