@@ -207,8 +207,8 @@ it has room. Its engine caps every container at its instance type's memory.
 Set the node memory ceiling at or above the largest instance type in use, plus
 headroom. When containers fill the node, it sheds cells as under any memory
 pressure: it refuses new cells and evicts idle ones. What that does to an
-evicted cell's container depends on `CELLD_OWNERSHIP_ON_EVICT`: with `release`
-(the default with a bucket) the eviction stops the container at once, with no
+evicted cell's container depends on `CELLD_PRESSURE_OWNERSHIP`: with `release`
+(the default) the eviction stops the container at once, with no
 grace period; with `sticky` the container keeps running for its inactivity
 window, so shedding returns little of its memory.
 
