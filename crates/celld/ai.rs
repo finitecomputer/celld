@@ -101,21 +101,33 @@ fn failure(code: &'static str, message: impl Into<String>) -> Failure {
 
 /// An answer: a status, headers (the content type among them) and a body,
 /// as Workers AI's would be.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Answer {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: Body,
+}
+
+/// An answer's body: bytes celld made or read whole, or a `workers-ai`
+/// endpoint's own, streamed to the isolate as it comes (a chat's events
+/// reach its caller one by one, as on Cloudflare).
+#[derive(Debug)]
+pub enum Body {
+    Bytes(Vec<u8>),
+    Stream(reqwest::Response),
 }
 
 impl Answer {
     fn json(status: u16, body: &Value) -> Answer {
-        Answer { status, headers: vec![("content-type".into(), "application/json".into())], body: body.to_string().into_bytes() }
+        Answer { status, headers: vec![("content-type".into(), "application/json".into())], body: Body::Bytes(body.to_string().into_bytes()) }
     }
 
-    /// The body as JSON, when it is.
+    /// The body as JSON, when it is one celld holds.
     pub fn value(&self) -> Option<Value> {
-        serde_json::from_slice(&self.body).ok()
+        match &self.body {
+            Body::Bytes(b) => serde_json::from_slice(b).ok(),
+            Body::Stream(_) => None,
+        }
     }
 }
 
@@ -571,26 +583,35 @@ async fn transcribed(place: &str, url: String, request: WhisperRequest) -> Resul
 }
 
 /// A `workers-ai` endpoint at `origin` runs `model` on `inputs`; its answer
-/// is passed on as it came.
+/// is passed on as it comes, its body streamed.
 async fn passed(origin: &str, model: &str, inputs: &str) -> Result<Answer, Failure> {
     let place = format!("the Workers AI endpoint at {origin}");
     let sent = client().post(format!("{origin}/run/{model}")).header("content-type", "application/json").body(inputs.to_string()).send().await;
-    let (status, headers, body) = read(&place, sent).await?;
+    let response = match sent {
+        Ok(response) => response,
+        Err(e) if e.is_timeout() => return Err(failure("down", format!("{place} did not answer within {} s", CALL_TIMEOUT.as_secs()))),
+        Err(e) => return Err(failure("down", format!("{place} is not answering ({})", e.without_url()))),
+    };
     let mut kept = Vec::new();
     for name in std::iter::once("content-type").chain(PASSED_HEADERS) {
-        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+        if let Some(v) = response.headers().get(name).and_then(|v| v.to_str().ok()) {
             kept.push((name.to_string(), v.to_string()));
         }
     }
-    Ok(Answer { status, headers: kept, body })
+    Ok(Answer { status: response.status().as_u16(), headers: kept, body: Body::Stream(response) })
 }
 
 /// An answer, or why there is none, as the op hands it to the isolate: the
 /// length of its metadata (4 bytes, big-endian), the metadata (`{status,
-/// headers}` or `{code, message}`), then the body.
-pub fn frame(answer: Result<Answer, Failure>) -> Vec<u8> {
+/// headers}`, with a `streamId` when its body is a stream `register` gave
+/// one for, or `{code, message}`), then the body celld holds.
+pub fn frame(answer: Result<Answer, Failure>, register: impl FnOnce(reqwest::Response) -> Option<u64>) -> Vec<u8> {
     let (meta, body) = match answer {
-        Ok(a) => (json!({ "status": a.status, "headers": a.headers }), a.body),
+        Ok(Answer { status, headers, body: Body::Bytes(body) }) => (json!({ "status": status, "headers": headers }), body),
+        Ok(Answer { status, headers, body: Body::Stream(response) }) => match register(response) {
+            Some(id) => (json!({ "status": status, "headers": headers, "streamId": id }), Vec::new()),
+            None => (json!({ "code": "failed", "message": "the node is closing: the answer's stream was not opened" }), Vec::new()),
+        },
         Err(f) => (json!({ "code": f.code, "message": f.message }), Vec::new()),
     };
     let meta = meta.to_string().into_bytes();
@@ -758,11 +779,12 @@ mod tests {
     /// The op's frame: its metadata's length, the metadata, the body.
     #[test]
     fn an_answer_is_framed_for_the_isolate() {
-        let framed = frame(Ok(Answer { status: 200, headers: vec![("content-type".into(), "image/png".into())], body: vec![0x89, b'P'] }));
+        let unused = |_: reqwest::Response| -> Option<u64> { panic!("no stream to register") };
+        let framed = frame(Ok(Answer { status: 200, headers: vec![("content-type".into(), "image/png".into())], body: Body::Bytes(vec![0x89, b'P']) }), unused);
         let n = u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize;
         assert_eq!(serde_json::from_slice::<Value>(&framed[4..4 + n]).unwrap(), json!({ "status": 200, "headers": [["content-type", "image/png"]] }));
         assert_eq!(&framed[4 + n..], &[0x89, b'P']);
-        let framed = frame(Err(failure("down", "gone")));
+        let framed = frame(Err(failure("down", "gone")), unused);
         let n = u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize;
         assert_eq!((serde_json::from_slice::<Value>(&framed[4..4 + n]).unwrap(), framed.len()), (json!({ "code": "down", "message": "gone" }), 4 + n));
     }

@@ -56,6 +56,16 @@ export default {
           stream: await settle(async () => (await new Response(await env.AI.run("@cf/x/png-model", { prompt: "a cat" })).arrayBuffer()).byteLength),
           refused: await settle(() => raw("@cf/x/refuses", { prompt: "x" })),
         });
+      case "/stream":
+        return Response.json(await settle(async () => {
+          const t0 = Date.now();
+          const r = await env.AI.run("@cf/x/stream", { messages: [], stream: true }, { ...OPTIONS, returnRawResponse: true });
+          const reader = r.body.getReader();
+          const { value } = await reader.read();
+          const ms = Date.now() - t0;
+          await reader.cancel();
+          return { status: r.status, type: r.headers.get("content-type"), first: new TextDecoder().decode(value), ms };
+        }));
       case "/refused":
         return Response.json({
           raw: await settle(() => raw(WHISPER, { audio, prefix: "so" })),
@@ -92,57 +102,72 @@ fn fake_endpoint() -> (String, Heard) {
     let kept = seen.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 65536];
-            let body_at = loop {
-                let n = stream.read(&mut chunk).unwrap_or(0);
-                if n == 0 {
-                    break None;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break Some(at + 4);
-                }
-            };
-            let Some(body_at) = body_at else { continue };
-            let head = String::from_utf8_lossy(&buf[..body_at]).to_lowercase();
-            let length: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-            while buf.len() < body_at + length {
-                let n = stream.read(&mut chunk).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            let line = head.lines().next().unwrap_or("").to_string();
-            let body = String::from_utf8_lossy(&buf[body_at..]).to_string();
-            kept.lock().unwrap().push(format!("{line}\n{body}"));
-            let german = body.contains("name=\"language\"\r\n\r\nde\r\n");
-            let segments = serde_json::json!([
-                { "id": 0, "text": " Hello from a voice memo.", "start": 0.0, "end": 1.5, "tokens": [1], "temperature": 0.0, "avg_logprob": -0.1, "no_speech_prob": 0.01 },
-                { "id": 1, "text": " Second line.", "start": 1.5, "end": 2.4, "tokens": [2], "temperature": 0.0, "avg_logprob": -0.2, "no_speech_prob": 0.02 }
-            ]);
-            let (status, kind, extra, answer): (&str, &str, &str, Vec<u8>) = if line.starts_with("post /inference ") {
-                let lang = if german { "german" } else { "english" };
-                ("200 OK", "application/json", "", serde_json::json!({ "task": "transcribe", "language": lang, "duration": 2.5, "text": " Hello from a voice memo.\n Second line.\n", "segments": segments }).to_string().into_bytes())
-            } else if line.starts_with("post /v1/audio/transcriptions ") {
-                ("200 OK", "application/json", "", serde_json::json!({ "task": "transcribe", "language": "English", "duration": 2.5, "text": " Hello from a voice memo. Second line.", "segments": segments }).to_string().into_bytes())
-            } else if line.starts_with("post /run/@cf/x/png-model ") {
-                ("200 OK", "image/png", "cf-ai-neurons: 7\r\n", b"\x89PNG\r\n\x1a\nfake".to_vec())
-            } else if line.starts_with("post /run/@cf/x/refuses ") {
-                ("400 Bad Request", "application/json", "", br#"{"errors":[{"code":5006,"message":"no"}],"success":false}"#.to_vec())
-            } else if let Some(model) = line.strip_prefix("post /run/") {
-                let model = model.split(' ').next().unwrap_or("");
-                ("200 OK", "application/json", "cf-aig-log-id: log-1\r\n", serde_json::json!({ "response": "hello", "model": model, "heard": serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default() }).to_string().into_bytes())
-            } else {
-                ("404 Not Found", "text/plain", "", b"where?".to_vec())
-            };
-            let _ = write!(stream, "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", answer.len());
-            let _ = stream.write_all(&answer);
+            let Ok(stream) = stream else { break };
+            let kept = kept.clone();
+            // one thread a connection: a held stream holds no other call
+            std::thread::spawn(move || answer(stream, &kept));
         }
     });
     (origin, seen)
+}
+
+/// One request heard and answered (`fake_endpoint`).
+fn answer(mut stream: std::net::TcpStream, kept: &Heard) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 65536];
+    let body_at = loop {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break Some(at + 4);
+        }
+    };
+    let Some(body_at) = body_at else { return };
+    let head = String::from_utf8_lossy(&buf[..body_at]).to_lowercase();
+    let length: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    while buf.len() < body_at + length {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let line = head.lines().next().unwrap_or("").to_string();
+    let body = String::from_utf8_lossy(&buf[body_at..]).to_string();
+    kept.lock().unwrap().push(format!("{line}\n{body}"));
+    let german = body.contains("name=\"language\"\r\n\r\nde\r\n");
+    let segments = serde_json::json!([
+        { "id": 0, "text": " Hello from a voice memo.", "start": 0.0, "end": 1.5, "tokens": [1], "temperature": 0.0, "avg_logprob": -0.1, "no_speech_prob": 0.01 },
+        { "id": 1, "text": " Second line.", "start": 1.5, "end": 2.4, "tokens": [2], "temperature": 0.0, "avg_logprob": -0.2, "no_speech_prob": 0.02 }
+    ]);
+    if line.starts_with("post /run/@cf/x/stream ") {
+        // a chat's stream: its first event, then nothing for a while
+        let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: first\n\n");
+        let _ = stream.flush();
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let _ = write!(stream, "data: [DONE]\n\n");
+        return;
+    }
+    let (status, kind, extra, answer): (&str, &str, &str, Vec<u8>) = if line.starts_with("post /inference ") {
+        let lang = if german { "german" } else { "english" };
+        ("200 OK", "application/json", "", serde_json::json!({ "task": "transcribe", "language": lang, "duration": 2.5, "text": " Hello from a voice memo.\n Second line.\n", "segments": segments }).to_string().into_bytes())
+    } else if line.starts_with("post /v1/audio/transcriptions ") {
+        ("200 OK", "application/json", "", serde_json::json!({ "task": "transcribe", "language": "English", "duration": 2.5, "text": " Hello from a voice memo. Second line.", "segments": segments }).to_string().into_bytes())
+    } else if line.starts_with("post /run/@cf/x/png-model ") {
+        ("200 OK", "image/png", "cf-ai-neurons: 7\r\n", b"\x89PNG\r\n\x1a\nfake".to_vec())
+    } else if line.starts_with("post /run/@cf/x/refuses ") {
+        ("400 Bad Request", "application/json", "", br#"{"errors":[{"code":5006,"message":"no"}],"success":false}"#.to_vec())
+    } else if let Some(model) = line.strip_prefix("post /run/") {
+        let model = model.split(' ').next().unwrap_or("");
+        ("200 OK", "application/json", "cf-aig-log-id: log-1\r\n", serde_json::json!({ "response": "hello", "model": model, "heard": serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default() }).to_string().into_bytes())
+    } else {
+        ("404 Not Found", "text/plain", "", b"where?".to_vec())
+    };
+    let _ = write!(stream, "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", answer.len());
+    let _ = stream.write_all(&answer);
 }
 
 fn start(dir: &Path, models: serde_json::Value) -> Dev {
@@ -200,6 +225,11 @@ fn whisper_is_the_nodes_and_the_rest_pass_on() {
         assert_eq!((got["image"]["value"]["type"].clone(), got["image"]["value"]["body"].clone()), (serde_json::json!("image/png"), serde_json::json!(12)), "{got}");
         assert_eq!(got["stream"]["value"], 12, "bytes, without returnRawResponse, are its body: {got}");
         assert_eq!((got["refused"]["value"]["status"].clone(), got["refused"]["value"]["body"]["errors"][0]["message"].clone()), (serde_json::json!(400), serde_json::json!("no")), "{got}");
+
+        // a chat's stream reaches the Worker event by event, not once whole
+        let (got, took) = dev.json("/stream");
+        assert_eq!((got["value"]["status"].clone(), got["value"]["first"].clone()), (serde_json::json!(200), serde_json::json!("data: first\n\n")), "{got}");
+        assert!(got["value"]["ms"].as_u64().unwrap() < 3000 && took < std::time::Duration::from_secs(3), "its first event came at once, while the endpoint held the rest 4 s: {got} in {took:?}");
     }
     let (got, _) = dev.json("/raw-de");
     assert_eq!(got["value"]["body"]["transcription_info"]["language"], "de", "{got}");

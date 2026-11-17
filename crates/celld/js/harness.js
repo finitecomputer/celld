@@ -879,7 +879,8 @@ class ImagesBindingImpl {
 
 // `ai`: Workers AI. A model the node's operator names (`CELLD_AI_FILE`,
 // ai.rs) is answered by the host from the endpoint the operator names, in
-// the catalog's shapes; every other model rejects. `returnRawResponse`
+// the catalog's shapes, a `workers-ai` endpoint's body streamed as it
+// comes; every other model rejects. `returnRawResponse`
 // answers the Response Workers AI would give (a refusal by its status);
 // without it, a JSON answer's object, another's body, or a rejection. The
 // options that only say where a call is logged (`gateway`, `extraHeaders`,
@@ -913,7 +914,10 @@ class Ai {
       error.code = meta.code;
       throw error;
     }
-    const response = new Response(framed.subarray(4 + length), { status: meta.status, headers: meta.headers });
+    // a `workers-ai` endpoint's body comes as it is read, a chat's events
+    // one by one; celld's own answers come whole
+    const answered = meta.streamId !== undefined ? new CelldHttpBodyStream(meta.streamId) : framed.subarray(4 + length);
+    const response = new Response(answered, { status: meta.status, headers: meta.headers });
     if (opts.returnRawResponse) return response;
     const json = (response.headers.get("content-type") ?? "").includes("json");
     if (meta.status !== 200) {
