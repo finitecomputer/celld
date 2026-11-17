@@ -427,6 +427,19 @@ struct RunInfo {
     /// fork: what the engine last reported the run holding that the machine
     /// cannot take back, and when (`asyncrt::mono_ms`).
     in_use: Option<(u64, u64)>,
+    /// fork: the engine's readings of the run's CPU time, what
+    /// `pressure::cpu_permille` needs of them (`pressure::keep_cpu_reading`).
+    cpu: std::collections::VecDeque<celld_logic::pressure::CpuReading>,
+}
+
+/// fork: what an engine reports of one running container: the memory it
+/// holds that the machine cannot take back, and the CPU time it has used
+/// (µs), each when the engine says.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub name: String,
+    pub in_use_bytes: Option<u64>,
+    pub cpu_usage_usec: Option<u64>,
 }
 
 #[derive(Default)]
@@ -733,16 +746,16 @@ pub(crate) trait Backend: Send + Sync {
     /// backend's intercept socket), at the node's stop.
     fn close(&self) {}
 
-    /// fork: whether `memory_in_use` reports anything; the node polls it
-    /// only then.
+    /// fork: whether `usage` reports anything; the node polls it only then.
     fn reports_memory(&self) -> bool {
         false
     }
 
     /// fork: what each running container holds that the machine cannot take
-    /// back, by container name. Empty for an engine that does not say
-    /// (Docker), whose containers then count their caps.
-    async fn memory_in_use(&self) -> anyhow::Result<Vec<(String, u64)>> {
+    /// back, and the CPU time it has used, by container name. Empty for an
+    /// engine that does not say (Docker), whose containers then count their
+    /// caps and are never known to be idle.
+    async fn usage(&self) -> anyhow::Result<Vec<Usage>> {
         Ok(Vec::new())
     }
 
@@ -1346,7 +1359,7 @@ impl ContainerEngine {
                 state.running.then(|| (cell.name.clone(), (cell.clone(), state.run)))
             })
             .collect();
-        let reply = asyncrt::timeout(Duration::from_millis(IN_USE_FRESH_MS), self.backend.memory_in_use()).await;
+        let reply = asyncrt::timeout(Duration::from_millis(IN_USE_FRESH_MS), self.backend.usage()).await;
         let reports = match reply {
             Ok(Ok(reports)) => reports,
             Ok(Err(error)) => {
@@ -1358,11 +1371,17 @@ impl ContainerEngine {
                 return;
             }
         };
-        for (name, bytes) in reports {
-            let Some((cell, run)) = asked.get(&name) else { continue };
+        for report in reports {
+            let Some((cell, run)) = asked.get(&report.name) else { continue };
             let mut state = cell.state.lock().unwrap();
             if state.running && state.run == *run {
-                state.info.in_use = Some((bytes, asked_at));
+                if let Some(bytes) = report.in_use_bytes {
+                    state.info.in_use = Some((bytes, asked_at));
+                }
+                if let Some(usage_usec) = report.cpu_usage_usec {
+                    let reading = celld_logic::pressure::CpuReading { at_mono_ms: asked_at, usage_usec };
+                    celld_logic::pressure::keep_cpu_reading(&mut state.info.cpu, reading);
+                }
             }
         }
     }
@@ -1625,6 +1644,7 @@ impl ContainerEngine {
                 started: false,
                 memory_bytes,
                 in_use: None,
+                cpu: Default::default(),
             };
             state.intercepts.iter().map(|i| i.rule.clone()).collect::<Vec<_>>()
         };
@@ -2066,12 +2086,14 @@ impl ContainerEngine {
                 let counted_bytes = cell.counted_memory_bytes(now)?;
                 let state = cell.state.lock().unwrap();
                 let reported = state.info.in_use.is_some_and(|(_, at)| now.saturating_sub(at) <= IN_USE_FRESH_MS);
+                let readings: Vec<_> = state.info.cpu.iter().copied().collect();
                 Some(celld_logic::pressure::ContainerSample {
                     cell: cell.scope.clone(),
                     counted_bytes,
                     released_mono_ms: state.released_mono_ms,
                     stopping: state.sweeping.is_some(),
                     provisional: reports && !reported,
+                    cpu_permille: celld_logic::pressure::cpu_permille(&readings, now),
                 })
             })
             .collect()
@@ -2332,6 +2354,8 @@ pub(crate) mod tests {
         installed: Mutex<Vec<InterceptRule>>,
         seen_by_exec: Mutex<Vec<Vec<String>>>,
         in_use: Mutex<Vec<(String, u64)>>,
+        /// The CPU time each container has used (µs), by name.
+        cpu: Mutex<BTreeMap<String, u64>>,
         /// Runs once a report is sampled, before it is answered: what
         /// happens to a container while the report is on its way.
         in_use_meanwhile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -2481,8 +2505,20 @@ pub(crate) mod tests {
         fn reports_memory(&self) -> bool {
             true
         }
-        async fn memory_in_use(&self) -> anyhow::Result<Vec<(String, u64)>> {
-            let report = self.in_use.lock().unwrap().clone();
+        async fn usage(&self) -> anyhow::Result<Vec<Usage>> {
+            let cpu = self.cpu.lock().unwrap().clone();
+            let mut report: Vec<Usage> = self
+                .in_use
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, bytes)| Usage { name: name.clone(), in_use_bytes: Some(*bytes), cpu_usage_usec: cpu.get(name).copied() })
+                .collect();
+            for (name, usec) in &cpu {
+                if !report.iter().any(|u| u.name == *name) {
+                    report.push(Usage { name: name.clone(), in_use_bytes: None, cpu_usage_usec: Some(*usec) });
+                }
+            }
             if let Some(meanwhile) = self.in_use_meanwhile.lock().unwrap().take() {
                 meanwhile();
             }

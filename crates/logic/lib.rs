@@ -503,6 +503,12 @@ struct Cell {
     /// cell. The count is process-local because the drain orders only this
     /// process's resident set.
     local_request_count: u64,
+    /// fork: when this cell last committed a write (a request's or a fired
+    /// alarm's), on the remembered monotonic clock; 0 before its first.
+    /// The pressure sleep's measure of a cell's activity: a read is not
+    /// one. A computer's guest asks after its own state every minute; that
+    /// leaves nothing to save, and must not keep an idle computer awake.
+    last_written_mono_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -619,6 +625,7 @@ impl Default for Cell {
             last_used_mono_ms: 0,
             last_used_request: 0,
             local_request_count: 0,
+            last_written_mono_ms: 0,
         }
     }
 }
@@ -3448,6 +3455,7 @@ impl State {
                 self.cells.get(&fired).map(|cell| &cell.phase),
                 Some(Phase::Resident { epoch: current }) if *current == epoch
             ) {
+                self.note_written(&fired, now_mono_ms);
                 let gate = self.op();
                 self.barriers.insert(
                     gate,
@@ -6289,7 +6297,7 @@ impl State {
             return;
         };
         let candidates = self.sleep_candidates(now_mono_ms);
-        let chosen: Vec<(CellId, u64, u64)> =
+        let chosen: Vec<(CellId, u64, u64, u32)> =
             pressure::containers_to_sleep(sample_bytes, resume_line, evictions_return_bytes, &candidates, now_mono_ms)
                 .into_iter()
                 .filter_map(|cell| candidates.iter().find(|c| c.cell == cell))
@@ -6298,15 +6306,17 @@ impl State {
                         c.cell.to_string(),
                         c.counted_bytes,
                         now_mono_ms.saturating_sub(c.last_active_mono_ms),
+                        c.cpu_permille.expect("only a container known CPU quiet sleeps"),
                     )
                 })
                 .collect();
-        for (cell, counted_bytes, idle_ms) in chosen {
+        for (cell, counted_bytes, idle_ms, cpu_permille) in chosen {
             self.container_sleeps.insert(cell.clone());
             effects.push(Effect::SleepContainer {
                 cell,
                 counted_bytes,
                 idle_ms,
+                cpu_permille,
             });
         }
     }
@@ -6346,13 +6356,12 @@ impl State {
                             || matches!(cell.alarm, Some(AlarmState::Firing { .. }))
                     }
                 };
-                // Its cell's last use; the time it let its container go
-                // when the core never saw it used, which is later.
-                let last_active_mono_ms = cell
-                    .map(|cell| cell.last_used_mono_ms)
-                    .filter(|used| *used > 0)
-                    .or(c.released_mono_ms)
-                    .unwrap_or(now_mono_ms);
+                // Its cell's last write. A cell the core no longer knows
+                // wrote, if ever, before it let its container go.
+                let last_active_mono_ms = match cell {
+                    Some(cell) => cell.last_written_mono_ms,
+                    None => c.released_mono_ms.unwrap_or(now_mono_ms),
+                };
                 pressure::SleepCandidate {
                     cell: &c.cell,
                     counted_bytes: c.counted_bytes,
@@ -6360,6 +6369,7 @@ impl State {
                     last_active_mono_ms,
                     stopping: c.stopping || self.container_sleeps.contains(&c.cell),
                     provisional: c.provisional,
+                    cpu_permille: c.cpu_permille,
                 }
             })
             .collect()
@@ -7285,5 +7295,79 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
         | Phase::Cleaning { epoch, .. }
         | Phase::Resident { epoch } => Some(*epoch),
         _ => None,
+    }
+}
+
+/// fork: the pressure sleep's measure of a cell's activity, as the core
+/// keeps it (`Cell::last_written_mono_ms`).
+#[cfg(test)]
+mod pressure_sleep_tests {
+    use super::*;
+
+    const MIN: u64 = 60_000;
+
+    fn node() -> State {
+        State::new(
+            "n1",
+            Config {
+                max_resident: 8,
+                max_activations: 8,
+                max_evictions: 8,
+                max_releases: 8,
+                max_outbound_websockets: 8,
+                ownership_on_evict: OwnershipOnEvict::Sticky,
+                require_node_lease: false,
+                peer_protocol: 1,
+                operation_deadline_ms: None,
+                owner_log_recovery_backoff_ms: 1_000,
+                owner_log_recovery_attempts: 1,
+                alarm_resident_ms: 1_000,
+                idle_evict_ms: None,
+                pressure: pressure::PressureConfig::default(),
+            },
+        )
+    }
+
+    /// A request on the computer's cell at `at`, its output a write to
+    /// `position` or a read, then done.
+    fn request(state: &mut State, request: RequestId, at: u64, position: Option<u64>) {
+        state.now_mono_ms = state.now_mono_ms.max(at);
+        State::record_local_request(state.cells.get_mut("Computer:a").unwrap(), request, at);
+        state.activate_request(request, "Computer:a".into());
+        state.output(request, Channel::Response, position, None, None, &mut Vec::new());
+        state.deactivate_request(request);
+    }
+
+    // Goal: only a write is a cell's activity for the pressure sleep. A
+    // computer whose guest reads its own state every minute (Fragment's
+    // bridge) and wrote nothing for two minutes may sleep; a write starts
+    // its two minutes again. Replay: the same reads change nothing; a write
+    // seen late never moves its time back.
+    #[test]
+    fn only_a_write_keeps_a_container_awake() {
+        let mut state = node();
+        let cell = Cell { phase: Phase::Resident { epoch: 1 }, ..Cell::default() };
+        state.cells.insert("Computer:a".into(), cell);
+        state.containers = vec![pressure::ContainerSample {
+            cell: "Computer:a".into(),
+            counted_bytes: 1 << 30,
+            released_mono_ms: None,
+            stopping: false,
+            provisional: false,
+            cpu_permille: Some(3),
+        }];
+        request(&mut state, 1, 10 * MIN, Some(7));
+        assert_eq!(state.cells["Computer:a"].last_written_mono_ms, 10 * MIN);
+        for (i, minute) in (11..=13).enumerate() {
+            request(&mut state, 10 + i as u64, minute * MIN, None);
+        }
+        assert_eq!(state.cells["Computer:a"].last_written_mono_ms, 10 * MIN, "reads are not activity");
+        assert_eq!(state.sleepable_containers(12 * MIN - 1), Vec::<CellId>::new(), "inside its two minutes");
+        assert_eq!(state.sleepable_containers(12 * MIN), vec!["Computer:a".to_string()], "read every minute, quiet two");
+        request(&mut state, 20, 13 * MIN, Some(9));
+        assert_eq!(state.sleepable_containers(14 * MIN), Vec::<CellId>::new(), "a write starts its two minutes again");
+        assert_eq!(state.sleepable_containers(15 * MIN), vec!["Computer:a".to_string()]);
+        state.note_written(&"Computer:a".to_string(), 11 * MIN);
+        assert_eq!(state.cells["Computer:a"].last_written_mono_ms, 13 * MIN, "never back");
     }
 }

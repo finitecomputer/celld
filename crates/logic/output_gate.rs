@@ -186,6 +186,15 @@ impl State {
         self.open_write_barrier(held, observed, effects);
     }
 
+    /// fork: a write this cell committed, as of `now_mono_ms`: a request's
+    /// (its own ticket, or a reader's that saw it first) or a fired
+    /// alarm's. The pressure sleep counts it as the cell's activity.
+    pub(crate) fn note_written(&mut self, cell: &CellId, now_mono_ms: u64) {
+        if let Some(record) = self.cells.get_mut(cell) {
+            record.last_written_mono_ms = record.last_written_mono_ms.max(now_mono_ms);
+        }
+    }
+
     /// Record a verified proof, so a later read-only output that observed no
     /// more than `position` at this epoch releases without a proof of its own.
     fn note_proven(&mut self, cell: &CellId, epoch: Epoch, position: u64) {
@@ -213,6 +222,7 @@ impl State {
             });
             return;
         };
+        self.note_written(&cell, self.now_mono_ms);
         let op = self.op();
         self.barriers.insert(
             op,

@@ -1048,8 +1048,11 @@ pub enum Effect {
         cell: CellId,
         /// What it counted against the node when the walk down chose it.
         counted_bytes: u64,
-        /// How long its cell had done nothing.
+        /// How long since its cell last wrote.
         idle_ms: u64,
+        /// The most of one core it used in any slice of the window, in
+        /// thousandths (`pressure::cpu_permille`).
+        cpu_permille: u32,
     },
     EvictionAdmission {
         request: RequestId,

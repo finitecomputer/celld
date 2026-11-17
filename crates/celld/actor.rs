@@ -3329,6 +3329,7 @@ impl Actor {
                 cell,
                 counted_bytes,
                 idle_ms,
+                cpu_permille,
             } => {
                 // fork: the walk down could not get the node down by
                 // evictions: this idle container sleeps, as its inactivity
@@ -3341,6 +3342,7 @@ impl Actor {
                     scope = %cell,
                     counted_bytes,
                     idle_ms,
+                    cpu_permille,
                     slept,
                     "idle container put to sleep for memory"
                 );

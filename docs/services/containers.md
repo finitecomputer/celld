@@ -222,16 +222,24 @@ the ceiling), the node puts idle containers to sleep: the stop their
 inactivity window would make, early. No eviction returns memory a container holds, so on every sample over the
 line the node sleeps at once for what the line needs beyond the node's own
 memory, and for the rest once the evictions have had 10 seconds and the node
-is still over its line. It chooses the least recently active
-first, and only as many as the rest of the way down needs, counting a stop
+is still over its line. It chooses the least recently active (by its cell's
+last write) first, and only as many as the rest of the way down needs, counting a stop
 already under way as memory on its way back. It waits while a container just
 started still counts its whole instance type's memory for want of its
 engine's first report (about 2 seconds): that count stands in for what it
 will use, and sleeping on it would stop what its real use does not need. It never stops a container whose
 object is at work (an open socket, a hibernated one included, a request in
-flight or waiting for it, an alarm running), nor one whose cell did anything
-in the last 2 minutes: an object may still be saving what its container did
-(Fragment's computer saves 30 seconds after its last activity). A container
+flight or waiting for it, an alarm running), nor one whose cell wrote
+anything in the last 2 minutes: an object may still be saving what its
+container did (Fragment's computer saves 30 seconds after its last activity).
+Only a write counts: a read leaves nothing to save, and a computer's guest
+reads its own state every minute. Nor one whose container was not CPU quiet
+across those 2 minutes: under 5% of one core in every 20 seconds of them,
+from its engine's `cpuUsageUsec` (krun; sandcastle reports it per VM from its
+cgroup's `cpu.stat`, futurepaul/sandcastle#17). A computer can be at work with nothing its object sees, a build its
+agent left running in the background; stopped, that work is lost. A container
+whose engine reports no CPU (Docker), or whose run is younger than the
+window, is never put to sleep. A container
 whose object was evicted goes with its handle; one whose object is loaded but
 idle stops the same way, and that object's `monitor()` sees the run end.
 
@@ -246,8 +254,9 @@ refused again, the start fails, and its `monitor()` rejects, with
 `running` reads true from `start()` until the start fails.
 
 Each such stop is logged as `container_slept_for_memory`, with the
-container's counted memory and how long its cell was idle (or the start that
-made room), and its end as `container_swept`. The next activation of the cell
+container's counted memory, how long since its cell last wrote, and its
+busiest 20 seconds of CPU in thousandths of a core (`cpu_permille`), or the
+start that made room, and its end as `container_swept`. The next activation of the cell
 starts the container again, as after its window. Cloudflare also stops
 containers for its own reasons; an object treats either stop as the end of a
 run it did not ask for.
