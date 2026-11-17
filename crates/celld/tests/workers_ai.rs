@@ -56,6 +56,17 @@ export default {
           stream: await settle(async () => (await new Response(await env.AI.run("@cf/x/png-model", { prompt: "a cat" })).arrayBuffer()).byteLength),
           refused: await settle(() => raw("@cf/x/refuses", { prompt: "x" })),
         });
+      case "/as": {
+        // whisper.cpp told what to answer (the fake reads it from the audio)
+        const t0 = Date.now();
+        const r = await settle(() => raw(WHISPER, { audio: btoa("SAY " + new URL(request.url).searchParams.get("say")) }));
+        return Response.json({ ...r, ms: Date.now() - t0 });
+      }
+      case "/traversal":
+        return Response.json({
+          up: await settle(() => env.AI.run("@cf/../../admin", { prompt: "x" })),
+          dots: await settle(() => env.AI.run("@cf/./x", { prompt: "x" })),
+        });
       case "/stream":
         return Response.json(await settle(async () => {
           const t0 = Date.now();
@@ -151,7 +162,16 @@ fn answer(mut stream: std::net::TcpStream, kept: &Heard) {
         let _ = write!(stream, "data: [DONE]\n\n");
         return;
     }
-    let (status, kind, extra, answer): (&str, &str, &str, Vec<u8>) = if line.starts_with("post /inference ") {
+    if line.starts_with("post /inference ") && body.contains("SAY 429") {
+        // full: its status at once, then a body that stalls
+        let _ = write!(stream, "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: 40\r\nconnection: close\r\n\r\n{{\"error\":");
+        let _ = stream.flush();
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        return;
+    }
+    let (status, kind, extra, answer): (&str, &str, &str, Vec<u8>) = if line.starts_with("post /inference ") && body.contains("SAY 401") {
+        ("401 Unauthorized", "application/json", "", br#"{"error":"no key"}"#.to_vec())
+    } else if line.starts_with("post /inference ") {
         let lang = if german { "german" } else { "english" };
         ("200 OK", "application/json", "", serde_json::json!({ "task": "transcribe", "language": lang, "duration": 2.5, "text": " Hello from a voice memo.\n Second line.\n", "segments": segments }).to_string().into_bytes())
     } else if line.starts_with("post /v1/audio/transcriptions ") {
@@ -226,6 +246,19 @@ fn whisper_is_the_nodes_and_the_rest_pass_on() {
         assert_eq!(got["stream"]["value"], 12, "bytes, without returnRawResponse, are its body: {got}");
         assert_eq!((got["refused"]["value"]["status"].clone(), got["refused"]["value"]["body"]["errors"][0]["message"].clone()), (serde_json::json!(400), serde_json::json!("no")), "{got}");
 
+        // a dot segment names no path but /run/'s: refused, nothing sent
+        let before = seen.lock().unwrap().len();
+        let (got, _) = dev.json("/traversal");
+        assert_eq!((got["up"]["code"].clone(), got["dots"]["code"].clone()), (serde_json::json!("invalid"), serde_json::json!("invalid")), "{got}");
+        assert_eq!(seen.lock().unwrap().len(), before, "nothing reached the endpoint");
+        // whisper.cpp full: its 429 at once, though its body stalls; its 401
+        // stays a refusal, never a 502 its caller would try again
+        let (got, _) = dev.json("/as?say=429");
+        assert_eq!(got["value"]["status"], 429, "{got}");
+        assert!(got["ms"].as_u64().unwrap() < 4000, "answered before the body's stall ends: {got}");
+        let (got, _) = dev.json("/as?say=401");
+        assert_eq!((got["value"]["status"].clone(), got["value"]["body"]["errors"][0]["message"].clone()), (serde_json::json!(401), serde_json::json!("this node's Whisper refused the call: no key")), "{got}");
+
         // a chat's stream reaches the Worker event by event, not once whole
         let (got, took) = dev.json("/stream");
         assert_eq!((got["value"]["status"].clone(), got["value"]["first"].clone()), (serde_json::json!(200), serde_json::json!("data: first\n\n")), "{got}");
@@ -288,7 +321,8 @@ fn out_of_shape_or_unserved_is_refused() {
     let dev = start(other.path(), serde_json::json!({ "@cf/openai/whisper-large-v3-turbo": { "engine": "whisper.cpp", "origin": origin } }));
     let (got, _) = dev.json("/object");
     assert_eq!(got["code"], "down", "{got}");
-    assert!(got["message"].as_str().unwrap().contains(&format!("whisper.cpp at {origin} is not answering")), "{got}");
+    assert_eq!(got["message"], "this node's endpoint for @cf/openai/whisper-large-v3-turbo is not answering", "{got}");
+    assert!(!got.to_string().contains(&origin), "its address stays in the node's log: {got}");
 }
 
 // A node's AI file that names what celld does not run stops the start,

@@ -162,12 +162,15 @@ pub struct Server {
 pub struct Models {
     servers: BTreeMap<String, Server>,
     otherwise: Option<Server>,
-    file: PathBuf,
 }
 
-/// Whether `id` is a model's id as the catalog names one.
+/// Whether `id` is a model's id as the catalog names one: segments of
+/// letters, digits and `.`, `_`, `-`, `:`, `@` between single `/`s, none
+/// empty, `.` or `..`, so it names a path under `/run/` and no other.
 fn valid_model_id(id: &str) -> bool {
-    (1..=MODEL_ID_MAX_BYTES).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':' | b'/' | b'@'))
+    (1..=MODEL_ID_MAX_BYTES).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':' | b'/' | b'@'))
+        && id.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
 }
 
 /// Whether `url` is an OpenAI-compatible API's base: an origin and a path,
@@ -198,7 +201,7 @@ impl Models {
         let Some(Value::Object(models)) = top.get("models") else {
             bail!("{VARIABLE} names its `models`: an object of each catalog id and its endpoint");
         };
-        let mut out = Models { file: file.to_path_buf(), ..Models::default() };
+        let mut out = Models::default();
         for (id, entry) in models {
             if id != OTHERWISE && !valid_model_id(id) {
                 bail!("{VARIABLE} names {id:?}, which is no catalog id (@cf/…) nor \"*\"");
@@ -247,33 +250,56 @@ impl Models {
         Ok(out)
     }
 
+    /// A slot on `model`'s endpoint for an input of `length` (its UTF-16
+    /// units, as the isolate holds it), taken before the input is copied
+    /// into the host: or the answer there is at once (too large, an id that
+    /// is none, no endpoint, no capacity: Workers AI's 429).
+    pub fn reserve(&self, model: &str, length: usize) -> Result<Reservation<'_>, Result<Answer, Failure>> {
+        if length > INPUT_MAX_BYTES {
+            return Err(Ok(refused(413, 5006, format!("the input is over {INPUT_MAX_BYTES} bytes"))));
+        }
+        if !valid_model_id(model) {
+            return Err(Err(failure("invalid", "that is no model's id")));
+        }
+        let Some(server) = self.servers.get(model).or(self.otherwise.as_ref()) else {
+            return Err(Err(failure("unbound", format!("this node has no Workers AI model {model}: its operator names none in {VARIABLE}"))));
+        };
+        let Ok(slot) = server.slots.clone().try_acquire_owned() else {
+            return Err(Ok(refused(429, 3040, "Capacity temporarily exceeded, please try again.")));
+        };
+        Ok(Reservation { server, _slot: slot })
+    }
+}
+
+/// A call's slot on its endpoint (`Models::reserve`), held until its answer
+/// starts (or the call is dropped).
+pub struct Reservation<'a> {
+    server: &'a Server,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Reservation<'_> {
     /// `model`'s answer to `inputs` (the isolate's JSON), or why there is
     /// none.
-    pub async fn run(&self, model: &str, inputs: &str) -> Result<Answer, Failure> {
-        let Some(server) = self.servers.get(model).or(self.otherwise.as_ref()) else {
-            return Err(failure("unbound", format!("this node has no Workers AI model {model} ({VARIABLE} {} names none)", self.file.display())));
-        };
+    pub async fn run(self, model: &str, inputs: &str) -> Result<Answer, Failure> {
         if inputs.len() > INPUT_MAX_BYTES {
             return Ok(refused(413, 5006, format!("the input is {} bytes; at most {INPUT_MAX_BYTES}", inputs.len())));
         }
-        let request = match &server.engine {
-            Engine::WorkersAi { .. } => None,
-            engine => match whisper_request(inputs).and_then(|r| r.for_engine(engine)) {
-                Ok(request) => Some(request),
-                Err(answer) => return Ok(answer),
-            },
+        let engine = &self.server.engine;
+        if let Engine::WorkersAi { origin } = engine {
+            return passed(origin, model, inputs).await;
+        }
+        let request = match whisper_request(inputs).and_then(|r| r.for_engine(engine)) {
+            Ok(request) => request,
+            Err(answer) => return Ok(answer),
         };
-        let Ok(_slot) = server.slots.clone().try_acquire_owned() else {
-            return Ok(refused(429, 3040, "Capacity temporarily exceeded, please try again."));
-        };
-        match (&server.engine, request) {
-            (Engine::WhisperCpp { origin }, Some(r)) => transcribed(&format!("whisper.cpp at {origin}"), format!("{origin}/inference"), r).await,
-            (Engine::OpenAi { base_url, .. }, Some(r)) => {
-                let path = if r.translate { "translations" } else { "transcriptions" };
-                transcribed(&format!("the transcription server at {base_url}"), format!("{base_url}/audio/{path}"), r).await
+        match engine {
+            Engine::WhisperCpp { origin } => transcribed(Dialect::WhisperCpp, origin, format!("{origin}/inference"), request).await,
+            Engine::OpenAi { base_url, .. } => {
+                let path = if request.translate { "translations" } else { "transcriptions" };
+                transcribed(Dialect::OpenAi, base_url, format!("{base_url}/audio/{path}"), request).await
             }
-            (Engine::WorkersAi { origin }, _) => passed(origin, model, inputs).await,
-            (_, None) => unreachable!("a transcription engine's request is bounded above"),
+            Engine::WorkersAi { .. } => unreachable!("answered above"),
         }
     }
 }
@@ -439,17 +465,30 @@ fn code_of(language: &str) -> Option<&'static str> {
     LANGUAGES.split(',').filter_map(|pair| pair.split_once(':')).find(|(code, name)| *code == l || *name == l).map(|(code, _)| code)
 }
 
+/// Whose `verbose_json` a transcription is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    WhisperCpp,
+    OpenAi,
+}
+
 /// A transcription server's `verbose_json` (whisper.cpp's, or OpenAI's) as
 /// the catalog's answer: the text, its words counted, its segments and a
 /// WebVTT of them, and what was heard (`transcription_info`: the language's
 /// code and the audio's length, which a caller meters by). What the server
 /// does not measure is left out, never made up: `duration_after_vad`, and
 /// a segment's words' timings.
-pub fn catalog_answer(verbose: &Value, asked: Option<&str>) -> Option<Value> {
-    // whisper.cpp ends each segment's text with a newline; each begins with
-    // its own space where the language has one
-    let text = verbose["text"].as_str()?.replace('\n', "").trim().to_string();
-    let duration = verbose["duration"].as_f64().filter(|d| d.is_finite() && *d >= 0.0)?;
+pub fn catalog_answer(dialect: Dialect, verbose: &Value, asked: Option<&str>) -> Option<Value> {
+    let said = verbose["text"].as_str()?;
+    let (text, duration) = match dialect {
+        // whisper.cpp ends each segment's text with a newline, each begins
+        // with its own space where the language has one, and it measures
+        // the audio in single precision (2.2 s as 2.200000047683716): to
+        // the millisecond, which its samples are
+        Dialect::WhisperCpp => (said.replace('\n', "").trim().to_string(), verbose["duration"].as_f64().map(|d| (d * 1000.0).round() / 1000.0)),
+        Dialect::OpenAi => (said.trim().to_string(), verbose["duration"].as_f64()),
+    };
+    let duration = duration.filter(|d| d.is_finite() && *d >= 0.0)?;
     let language = asked.or_else(|| verbose["language"].as_str()).and_then(code_of);
     let mut segments = Vec::new();
     let mut vtt = String::from("WEBVTT\n\n");
@@ -503,18 +542,18 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
-/// `request` as a `multipart/form-data` body, its boundary one the audio
-/// does not hold.
-fn form(request: &WhisperRequest) -> (String, Vec<u8>) {
-    let mut n: u64 = 0x5eed_cafe;
-    let boundary = loop {
-        let candidate = format!("celld-ai-{n:016x}{:08x}", request.audio.len());
-        let b = candidate.as_bytes();
-        if !request.audio.windows(b.len()).any(|w| w == b) && request.fields.iter().all(|(_, v)| !v.contains(&candidate)) {
-            break candidate;
-        }
-        n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    };
+/// `request` as a `multipart/form-data` body, its boundary 128 random
+/// bits, checked once against the audio and the fields (`None`: they hold
+/// it, which no caller makes happen).
+fn form(request: &WhisperRequest) -> Option<(String, Vec<u8>)> {
+    use rand::RngCore as _;
+    let mut random = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    let boundary = format!("celld-ai-{}", random.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let b = boundary.as_bytes();
+    if request.audio.windows(b.len()).any(|w| w == b) || request.fields.iter().any(|(_, v)| v.contains(&boundary)) {
+        return None;
+    }
     let mut body = Vec::with_capacity(request.audio.len() + 4096);
     for (name, value) in &request.fields {
         body.extend_from_slice(format!("--{boundary}\r\ncontent-disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
@@ -522,41 +561,46 @@ fn form(request: &WhisperRequest) -> (String, Vec<u8>) {
     body.extend_from_slice(format!("--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"audio\"\r\ncontent-type: application/octet-stream\r\n\r\n").as_bytes());
     body.extend_from_slice(&request.audio);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    (boundary, body)
+    Some((boundary, body))
 }
 
-/// An endpoint's answer, read whole and bounded: its status, headers and
-/// body.
-async fn read(place: &str, sent: Result<reqwest::Response, reqwest::Error>) -> Result<(u16, reqwest::header::HeaderMap, Vec<u8>), Failure> {
-    let late = || failure("down", format!("{place} did not answer within {} s", CALL_TIMEOUT.as_secs()));
-    let mut response = match sent {
-        Ok(response) => response,
-        Err(e) if e.is_timeout() => return Err(late()),
-        Err(e) => return Err(failure("down", format!("{place} is not answering ({})", e.without_url()))),
-    };
-    let status = response.status().as_u16();
-    let headers = response.headers().clone();
-    let mut bytes = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if bytes.len() + chunk.len() > ANSWER_MAX_BYTES {
-                    return Err(failure("failed", format!("{place} answered {status} with over {ANSWER_MAX_BYTES} bytes")));
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Err(e) if e.is_timeout() => return Err(late()),
-            Err(e) => return Err(failure("down", format!("{place} broke off its answer ({})", e.without_url()))),
-        }
+/// How long an endpoint's refusal is read, at most, and how much of it: a
+/// refusal is answered at once, so its caller tries again in time.
+const REFUSAL_READ: Duration = Duration::from_secs(2);
+const REFUSAL_MAX_BYTES: usize = 4096;
+
+/// Why an endpoint gave no answer, for the Worker: the endpoint's address
+/// stays in the node's log, never in what a Worker sees.
+fn unanswered(model: &str, endpoint: &str, e: &reqwest::Error) -> Failure {
+    tracing::warn!(model, endpoint, error = %e, "the AI endpoint did not answer");
+    match e.is_timeout() {
+        true => failure("down", format!("this node's endpoint for {model} did not answer within {} s", CALL_TIMEOUT.as_secs())),
+        false => failure("down", format!("this node's endpoint for {model} is not answering")),
     }
-    Ok((status, headers, bytes))
 }
 
-/// A transcription server at `url` hears `request`; its `verbose_json` is
-/// the catalog's answer.
-async fn transcribed(place: &str, url: String, request: WhisperRequest) -> Result<Answer, Failure> {
-    let (boundary, body) = form(&request);
+/// An endpoint's body, read up to `max` bytes and no further.
+async fn body_of(response: &mut reqwest::Response, max: usize) -> Result<Vec<u8>, reqwest::Error> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > max {
+            bytes.extend_from_slice(&chunk[..max - bytes.len()]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// A transcription server (`endpoint`, at `url`) hears `request`; its
+/// `verbose_json` is the catalog's answer. A refusal is answered as soon as
+/// its status comes, its body read a little and briefly; a status its
+/// caller may try again on (408, 429, 503) is kept, as is another 4xx, and
+/// a server's failure is a 502.
+async fn transcribed(dialect: Dialect, endpoint: &str, url: String, request: WhisperRequest) -> Result<Answer, Failure> {
+    let Some((boundary, body)) = form(&request) else {
+        return Ok(refused(400, 5006, "the audio holds the form's boundary"));
+    };
     let sent = client()
         .post(url)
         .header("content-type", format!("multipart/form-data; boundary={boundary}"))
@@ -564,34 +608,44 @@ async fn transcribed(place: &str, url: String, request: WhisperRequest) -> Resul
         .body(body)
         .send()
         .await;
-    let (status, _, bytes) = read(place, sent).await?;
+    let mut response = sent.map_err(|e| unanswered(TRANSCRIBE, endpoint, &e))?;
+    let status = response.status().as_u16();
+    let bytes = match status {
+        200 => match body_of(&mut response, ANSWER_MAX_BYTES + 1).await {
+            Ok(b) if b.len() > ANSWER_MAX_BYTES => return Err(failure("failed", format!("this node's Whisper answered over {ANSWER_MAX_BYTES} bytes"))),
+            Ok(b) => b,
+            Err(e) => return Err(unanswered(TRANSCRIBE, endpoint, &e)),
+        },
+        _ => crate::asyncrt::timeout(REFUSAL_READ, body_of(&mut response, REFUSAL_MAX_BYTES)).await.ok().and_then(Result::ok).unwrap_or_default(),
+    };
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     // whisper.cpp's `error` is a string; OpenAI's an object with a message
     let said: String = body["error"].as_str().or_else(|| body["error"]["message"].as_str()).unwrap_or("").chars().take(200).collect();
+    if status != 200 {
+        tracing::warn!(endpoint, status, "the AI endpoint refused a transcription");
+    }
     Ok(match status {
-        200 => match catalog_answer(&body, request.language.as_deref()) {
+        200 => match catalog_answer(dialect, &body, request.language.as_deref()) {
             Some(answer) => Answer::json(200, &answer),
-            None => refused(502, 3000, format!("{place} answered with no text or length")),
+            None => refused(502, 3000, "this node's Whisper answered with no text or length"),
         },
         // the audio is none ffmpeg reads: the call's, as Workers AI's 400
         500 if said.contains("FFmpeg conversion failed") => refused(400, 5006, "the audio could not be read"),
-        400 | 413 | 415 | 422 => refused(400, 5006, format!("{place} refused the call: {said}")),
-        // loading its model, or full
-        503 | 429 => refused(status, 3040, format!("{place} is not ready: {said}")),
-        _ => refused(502, 3000, format!("{place} answered {status}: {said}")),
+        // loading its model, or full: its caller tries again
+        408 | 429 | 503 => refused(status, 3040, "this node's Whisper is busy; try again"),
+        400..=499 if said.is_empty() => refused(status, 5006, "this node's Whisper refused the call"),
+        400..=499 => refused(status, 5006, format!("this node's Whisper refused the call: {said}")),
+        _ => refused(502, 3000, format!("this node's Whisper failed ({status})")),
     })
 }
 
-/// A `workers-ai` endpoint at `origin` runs `model` on `inputs`; its answer
-/// is passed on as it comes, its body streamed.
+/// A `workers-ai` endpoint at `origin` runs `model` (a checked id: a path
+/// under `/run/`) on `inputs`; its answer is passed on as it comes, its
+/// body streamed.
 async fn passed(origin: &str, model: &str, inputs: &str) -> Result<Answer, Failure> {
-    let place = format!("the Workers AI endpoint at {origin}");
+    debug_assert!(valid_model_id(model), "Models::reserve checks the id");
     let sent = client().post(format!("{origin}/run/{model}")).header("content-type", "application/json").body(inputs.to_string()).send().await;
-    let response = match sent {
-        Ok(response) => response,
-        Err(e) if e.is_timeout() => return Err(failure("down", format!("{place} did not answer within {} s", CALL_TIMEOUT.as_secs()))),
-        Err(e) => return Err(failure("down", format!("{place} is not answering ({})", e.without_url()))),
-    };
+    let response = sent.map_err(|e| unanswered(model, origin, &e))?;
     let mut kept = Vec::new();
     for name in std::iter::once("content-type").chain(PASSED_HEADERS) {
         if let Some(v) = response.headers().get(name).and_then(|v| v.to_str().ok()) {
@@ -654,11 +708,12 @@ pub fn load() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `model`'s answer to `inputs`, or why there is none.
-pub async fn run(model: &str, inputs: &str) -> Result<Answer, Failure> {
+/// A slot on `model`'s endpoint for an input of `length`, or the answer
+/// there is at once (`Models::reserve`).
+pub fn reserve(model: &str, length: usize) -> Result<Reservation<'static>, Result<Answer, Failure>> {
     match MODELS.get_or_init(|| from_env().expect("validated CELLD_AI_FILE")) {
-        Some(models) => models.run(model, inputs).await,
-        None => Err(failure("unbound", format!("this node has no Workers AI model {model}: name its endpoint in {VARIABLE}"))),
+        Some(models) => models.reserve(model, length),
+        None => Err(Err(failure("unbound", format!("this node has no Workers AI model {model}: name its endpoint in {VARIABLE}")))),
     }
 }
 
@@ -744,36 +799,36 @@ mod tests {
                 { "id": 1, "text": " General Kenobi.", "start": 1.5, "end": 3.25, "tokens": [2], "temperature": 0.0, "avg_logprob": -0.3, "no_speech_prob": 0.02 }
             ]
         });
-        let a = catalog_answer(&verbose, None).unwrap();
+        let a = catalog_answer(Dialect::WhisperCpp, &verbose, None).unwrap();
         assert_eq!(a["text"], "Hello there. General Kenobi.");
         assert_eq!(a["word_count"], 4);
         assert_eq!(a["transcription_info"], json!({ "language": "en", "language_probability": 0.97, "duration": 3.5 }));
         assert_eq!(a["segments"][1], json!({ "start": 1.5, "end": 3.25, "text": "General Kenobi.", "temperature": 0.0, "avg_logprob": -0.3, "no_speech_prob": 0.02 }));
         assert_eq!(a["vtt"], "WEBVTT\n\n00:00:00.000 --> 00:00:01.200\nHello there.\n\n00:00:01.500 --> 00:00:03.250\nGeneral Kenobi.\n\n");
         assert!(a["transcription_info"].get("duration_after_vad").is_none(), "not measured, not made up");
-        let asked = catalog_answer(&verbose, Some("de")).unwrap();
+        let asked = catalog_answer(Dialect::WhisperCpp, &verbose, Some("de")).unwrap();
         assert_eq!(asked["transcription_info"], json!({ "language": "de", "duration": 3.5 }), "the language it was told");
         // OpenAI's own shape: a compression ratio, a language that may be a code
         let openai = json!({ "task": "transcribe", "language": "English", "duration": 2.0, "text": "Hi.", "segments": [{ "id": 0, "seek": 0, "start": 0.0, "end": 2.0, "text": " Hi.", "tokens": [1], "temperature": 0.0, "avg_logprob": -0.1, "compression_ratio": 0.5, "no_speech_prob": 0.0 }] });
-        let a = catalog_answer(&openai, None).unwrap();
+        let a = catalog_answer(Dialect::OpenAi, &openai, None).unwrap();
         assert_eq!((a["transcription_info"]["language"].clone(), a["segments"][0]["compression_ratio"].clone()), (json!("en"), json!(0.5)));
-        let silent = catalog_answer(&json!({ "text": "", "duration": 2.0, "segments": [] }), None).unwrap();
+        let silent = catalog_answer(Dialect::WhisperCpp, &json!({ "text": "", "duration": 2.0, "segments": [] }), None).unwrap();
         assert_eq!((silent["text"].clone(), silent["word_count"].clone()), (json!(""), json!(0)), "silence is no words");
-        assert_eq!(catalog_answer(&json!({ "duration": 2.0 }), None), None);
-        assert_eq!(catalog_answer(&json!({ "text": "hi" }), None), None);
-        assert_eq!(catalog_answer(&json!({ "text": "hi", "duration": -1.0 }), None), None);
+        assert_eq!(catalog_answer(Dialect::WhisperCpp, &json!({ "duration": 2.0 }), None), None);
+        assert_eq!(catalog_answer(Dialect::WhisperCpp, &json!({ "text": "hi" }), None), None);
+        assert_eq!(catalog_answer(Dialect::WhisperCpp, &json!({ "text": "hi", "duration": -1.0 }), None), None);
     }
 
     /// The form's boundary is in neither the audio nor a field.
     #[test]
     fn the_forms_boundary_is_its_own() {
-        let mut r = whisper_request(&json!({ "audio": b64(b"x") }).to_string()).unwrap().for_engine(&cpp()).unwrap();
-        let (first, _) = form(&r);
-        r.audio = format!("abc{first}def").into_bytes();
-        let (boundary, body) = form(&r);
-        assert_ne!(boundary, first);
+        let r = whisper_request(&json!({ "audio": b64(b"x") }).to_string()).unwrap().for_engine(&cpp()).unwrap();
+        let (first, body) = form(&r).unwrap();
         let text = String::from_utf8_lossy(&body);
-        assert!(text.ends_with(&format!("--{boundary}--\r\n")) && text.contains("name=\"file\"; filename=\"audio\""));
+        assert!(text.ends_with(&format!("--{first}--\r\n")) && text.contains("name=\"file\"; filename=\"audio\""));
+        let (second, _) = form(&r).unwrap();
+        assert_ne!(first, second, "random, not predictable");
+        assert_eq!(first.len(), "celld-ai-".len() + 32);
     }
 
     /// The op's frame: its metadata's length, the metadata, the body.
@@ -825,6 +880,57 @@ mod tests {
         ] {
             assert!(Models::parse(bad.as_bytes(), f).is_err(), "{bad}");
         }
+    }
+
+    /// A model's id is a path under /run/ and no other; the configured
+    /// ones too.
+    #[test]
+    fn a_model_id_is_a_path_under_run() {
+        for ok in ["@cf/openai/whisper-large-v3-turbo", "@cf/meta/llama-3.1-8b-instruct", "alibaba/hh1-t2v", "qwen3:8b"] {
+            assert!(valid_model_id(ok), "{ok}");
+        }
+        for bad in ["", "..", "../admin", "@cf/../../admin", "@cf/./x", "a//b", "/a", "a/", "a b", "a?b", "a%2e%2e"] {
+            assert!(!valid_model_id(bad), "{bad}");
+        }
+        let f = Path::new("/etc/celld/ai.json");
+        assert!(Models::parse(br#"{"models":{"@cf/../x":{"engine":"workers-ai","origin":"http://127.0.0.1:1"}}}"#, f).is_err());
+    }
+
+    /// A call is refused before its input is copied: too large, an id that
+    /// is none, no endpoint; and past its endpoint's concurrency, 429 until
+    /// a slot is let go.
+    #[tokio::test]
+    async fn a_call_is_reserved_before_its_input_is_read() {
+        let f = Path::new("/etc/celld/ai.json");
+        let m = Models::parse(br#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"whisper.cpp","origin":"http://127.0.0.1:1","concurrency":1}}}"#, f).unwrap();
+        let status = |r: Result<Reservation<'_>, Result<Answer, Failure>>| match r {
+            Ok(_) => "reserved".to_string(),
+            Err(Ok(a)) => a.status.to_string(),
+            Err(Err(f)) => f.code.to_string(),
+        };
+        assert_eq!(status(m.reserve(TRANSCRIBE, INPUT_MAX_BYTES + 1)), "413");
+        assert_eq!(status(m.reserve("../admin", 10)), "invalid");
+        assert_eq!(status(m.reserve("@cf/meta/llama-3.1-8b-instruct", 10)), "unbound", "no \"*\": another model has no endpoint");
+        let held = m.reserve(TRANSCRIBE, 10);
+        assert!(held.is_ok());
+        assert_eq!(status(m.reserve(TRANSCRIBE, 10)), "429", "its one slot is held");
+        drop(held);
+        assert_eq!(status(m.reserve(TRANSCRIBE, 10)), "reserved", "and let go");
+    }
+
+    /// whisper.cpp's single-precision length is the millisecond its samples
+    /// are, so a caller that meters by the millisecond charges no more;
+    /// OpenAI's text keeps its own line breaks.
+    #[test]
+    fn whisper_cpps_length_is_to_the_millisecond() {
+        // what whisper.cpp writes: the length as an f32, widened
+        for (heard, ms) in [(f64::from(2.2_f32), 2.2), (f64::from(10.435_f32), 10.435), (f64::from(3.07_f32), 3.07), (f64::from(59.425_f32), 59.425)] {
+            assert_ne!(heard, ms, "single precision is not the millisecond's");
+            let a = catalog_answer(Dialect::WhisperCpp, &json!({ "text": "x", "duration": heard }), None).unwrap();
+            assert_eq!(a["transcription_info"]["duration"], json!(ms), "{heard}");
+        }
+        let a = catalog_answer(Dialect::OpenAi, &json!({ "text": "First line.\nSecond line.", "duration": 2.0 }), None).unwrap();
+        assert_eq!((a["text"].clone(), a["word_count"].clone()), (json!("First line.\nSecond line."), json!(4)));
     }
 
     #[test]

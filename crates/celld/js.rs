@@ -7277,15 +7277,33 @@ fn op_ai_run(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let model = args.get(0).to_rust_string_lossy(scope);
-    let inputs = args.get(1).to_rust_string_lossy(scope);
-    let streams = http_stream_service();
-    let id = asyncrt::enqueue(async move {
-        let answer = crate::ai::run(&model, &inputs).await;
-        // a `workers-ai` endpoint's body, streamed as a fetch's is
-        let framed = crate::ai::frame(answer, |response| streams.register_source(HttpStreamSource::Response(response)));
-        Ok::<_, String>(asyncrt::OpOut::Bytes(framed))
-    });
+    // the model's id and the input's size, then a slot on its endpoint,
+    // before the input is copied out of the isolate: a call refused (too
+    // large, no endpoint, no capacity) copies none of it
+    let length = |scope: &mut v8::PinScope, v: v8::Local<v8::Value>| v.to_string(scope).map_or(0, |s| s.length());
+    let model_arg = args.get(0);
+    let model = match length(scope, model_arg) {
+        n if n > 256 => String::new(),
+        _ => model_arg.to_rust_string_lossy(scope),
+    };
+    let input_arg = args.get(1);
+    let input_length = length(scope, input_arg);
+    let id = match crate::ai::reserve(&model, input_length) {
+        Err(answered) => {
+            let framed = crate::ai::frame(answered, |_| None);
+            asyncrt::enqueue(async move { Ok::<_, String>(asyncrt::OpOut::Bytes(framed)) })
+        }
+        Ok(reservation) => {
+            let inputs = input_arg.to_rust_string_lossy(scope);
+            let streams = http_stream_service();
+            asyncrt::enqueue(async move {
+                let answer = reservation.run(&model, &inputs).await;
+                // a `workers-ai` endpoint's body, streamed as a fetch's is
+                let framed = crate::ai::frame(answer, |response| streams.register_source(HttpStreamSource::Response(response)));
+                Ok::<_, String>(asyncrt::OpOut::Bytes(framed))
+            })
+        }
+    };
     rv.set(promise_for(scope, id));
 }
 

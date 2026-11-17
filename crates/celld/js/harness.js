@@ -919,7 +919,9 @@ class Ai {
     const answered = meta.streamId !== undefined ? new CelldHttpBodyStream(meta.streamId) : framed.subarray(4 + length);
     const response = new Response(answered, { status: meta.status, headers: meta.headers });
     if (opts.returnRawResponse) return response;
-    const json = (response.headers.get("content-type") ?? "").includes("json");
+    // its media type, without parameters or case: JSON's, or a +json one
+    const essence = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    const json = essence === "application/json" || essence.endsWith("+json");
     if (meta.status !== 200) {
       let first;
       try {
