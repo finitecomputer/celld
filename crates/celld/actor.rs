@@ -471,6 +471,7 @@ pub enum Message {
     /// (`crate::container`), told as it happens.
     ContainerRunning {
         cell: String,
+        run: u64,
         running: bool,
     },
     /// fork: a start of `starting`'s container that the engine refused for
@@ -2904,8 +2905,8 @@ impl Actor {
                 };
                 let _ = reply.send(epoch);
             }
-            Message::ContainerRunning { cell, running } => {
-                self.drive(Event::ContainerRunning { cell, running }, out)
+            Message::ContainerRunning { cell, run, running } => {
+                self.drive(Event::ContainerRunning { cell, run, running }, out)
             }
             Message::MakeRoom { starting, reply } => {
                 let candidates: Vec<String> = self

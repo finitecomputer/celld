@@ -866,6 +866,9 @@ pub enum Event {
     /// (`State::holds_container`), so this cannot wait for the next sample.
     ContainerRunning {
         cell: CellId,
+        /// The run's id, rising across the node's runs: a stop of an older
+        /// run never undoes a newer one's start.
+        run: u64,
         running: bool,
     },
     /// A periodic resource sample from the edge.

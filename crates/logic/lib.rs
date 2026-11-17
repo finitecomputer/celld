@@ -807,7 +807,7 @@ pub struct State {
     /// The cells whose container runs, as `Event::ContainerRunning` says
     /// each start and end: what keeps a cell here through an eviction made
     /// for room, between samples.
-    running_containers: BTreeSet<CellId>,
+    running_containers: BTreeMap<CellId, u64>,
     /// Which ceilings are latched. Held apart from `shed_reason`, which names
     /// only the more serious crossing.
     latches: pressure::Latches,
@@ -905,7 +905,7 @@ impl State {
             shed_cut: None,
             containers: Vec::new(),
             container_sleeps: BTreeSet::new(),
-            running_containers: BTreeSet::new(),
+            running_containers: BTreeMap::new(),
             latches: pressure::Latches::default(),
             shedding: false,
             memory_headroom: false,
@@ -6237,7 +6237,7 @@ impl State {
     /// start and end were told (`Event::ContainerRunning`), or the last
     /// sample listed it.
     fn holds_container(&self, id: &str) -> bool {
-        self.running_containers.contains(id) || self.containers.iter().any(|c| c.cell == id)
+        self.running_containers.contains_key(id) || self.containers.iter().any(|c| c.cell == id)
     }
 
     /// A container put to sleep outside the walk down (a start the engine
@@ -7066,10 +7066,16 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             now_mono_ms,
             containers,
         } => state.load_sampled(load, now_mono_ms, containers, &mut effects),
-        Event::ContainerRunning { cell, running } => {
+        Event::ContainerRunning { cell, run, running } => {
+            let newest = state.running_containers.get(&cell).copied();
             if running {
-                state.running_containers.insert(cell);
-            } else {
+                // a start told late, after a newer run's, changes nothing
+                if newest.is_none_or(|newest| newest < run) {
+                    state.running_containers.insert(cell, run);
+                }
+            } else if newest.is_some_and(|newest| newest <= run) {
+                // its stop ends it, and any older run's too; a newer one
+                // runs on
                 state.running_containers.remove(&cell);
             }
         }

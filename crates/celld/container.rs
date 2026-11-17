@@ -201,13 +201,23 @@ pub fn set_actor(tx: mpsc::UnboundedSender<crate::actor::Message>) {
     let _ = ACTOR.set(tx);
 }
 
-/// fork: tells the core the cell's container started or stopped running,
-/// as it happens: a cell that holds one stays on this node through an
-/// eviction made for room (`State::holds_container`).
-fn tell_running(scope: &str, running: bool) {
+/// fork: tells the core the cell's container run `run` (`next_run_id`)
+/// started or stopped running, as it happens: a cell that holds one stays
+/// on this node through an eviction made for room
+/// (`State::holds_container`). Called with the cell's state locked, after
+/// the change it tells, so what one cell tells arrives in the order it
+/// happened; the run's id keeps a late stop from undoing a newer start.
+fn tell_running(scope: &str, run: u64, running: bool) {
     if let Some(actor) = ACTOR.get() {
-        let _ = actor.send(crate::actor::Message::ContainerRunning { cell: scope.to_string(), running });
+        let _ = actor.send(crate::actor::Message::ContainerRunning { cell: scope.to_string(), run, running });
     }
+}
+
+/// fork: a run's id, across every handle of this node: a handle made again
+/// for a cell begins its runs at one, its ids never go back.
+fn next_run_id() -> u64 {
+    static IDS: AtomicU64 = AtomicU64::new(0);
+    IDS.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// fork: the engine refused a start for want of memory (krun: 429, "the
@@ -435,6 +445,8 @@ struct CellState {
     /// fork: its sweep, once begun (`ContainerEngine::begin_sweep`): true
     /// once that stop has ended. A cell that comes back waits for it.
     sweeping: Option<watch::Receiver<bool>>,
+    /// fork: the current run's id (`next_run_id`), what `tell_running` names.
+    run_id: u64,
     /// Bumped per start so a wait from a previous run cannot report for
     /// this one.
     run: u64,
@@ -583,10 +595,11 @@ impl CellContainer {
     }
 
     pub fn begin_run(&self) -> u64 {
-        tell_running(&self.scope, true);
         let mut state = self.state.lock().unwrap();
         state.run += 1;
         state.running = true;
+        state.run_id = next_run_id();
+        tell_running(&self.scope, state.run_id, true);
         state.address = Address::None;
         state.info = RunInfo::default();
         state.installed = 0;
@@ -1259,9 +1272,12 @@ impl ContainerEngine {
         let mut state = cell.state.lock().unwrap();
         state.running = running.is_some();
         state.address = running.unwrap_or_default();
-        let runs = state.running;
+        // a start is told as its run opens (`begin_run`); none running is
+        // told here, for a handle that had one
+        if !state.running {
+            tell_running(&cell.scope, state.run_id, false);
+        }
         drop(state);
-        tell_running(&cell.scope, runs);
         Ok(cell)
     }
 
@@ -1411,14 +1427,20 @@ impl ContainerEngine {
         // that name: bounded by the sweep's grace and its kill
         let sweeping = cell.state.lock().unwrap().sweeping.clone();
         if let Some(mut done) = sweeping {
-            let _ = asyncrt::timeout(self.sweep_bound(), async {
+            let ended = asyncrt::timeout(self.sweep_bound(), async {
                 while !*done.borrow_and_update() {
                     if done.changed().await.is_err() {
                         return;
                     }
                 }
             })
-            .await;
+            .await
+            .is_ok();
+            // never launched under its name while that removal may still
+            // land: the start fails, and the object may try again
+            if !ended {
+                return Err(self.fail_start(cell, run, anyhow!("the container's last run is still being stopped: start() again once it has")));
+            }
         }
         let again = params.clone();
         let mut started = self.create_and_start(cell, params).await;
@@ -1447,29 +1469,7 @@ impl ContainerEngine {
         }
         let (address, launched) = match started {
             Ok(started) => started,
-            Err(error) => {
-                // `start()` is fire-and-forget for the object, and its
-                // `monitor()` sees this error only if it was already
-                // waiting; say it here too, or a start that fails fast
-                // leaves no trace anywhere.
-                tracing::warn!(
-                    event = "container_start_failed",
-                    cell = %cell.scope,
-                    engine = self.backend.kind(),
-                    error = %format!("{error:#}"),
-                    "the container did not start"
-                );
-                let mut state = cell.state.lock().unwrap();
-                state.running = false;
-                if state.run == run {
-                    state.start_failed = Some((run, format!("{error:#}")));
-                }
-                drop(state);
-                tell_running(&cell.scope, false);
-                cell.record(run, Err(format!("{error:#}")));
-                cell.up.send_replace(run);
-                return Err(error);
-            }
+            Err(error) => return Err(self.fail_start(cell, run, error)),
         };
         // `destroy()` may have come while the start was under way (`start()`
         // returns at once, and its object can destroy at once): what the
@@ -1539,21 +1539,18 @@ impl ContainerEngine {
                 let latest = cell_.state.lock().unwrap().run == run;
                 end(latest).await;
             }
-            let (destroyed, ended) = {
+            let destroyed = {
                 let mut state = cell_.state.lock().unwrap();
                 let destroyed = state.destroyed == Some(run);
-                let ended = state.run == run;
-                if ended {
+                if state.run == run {
                     state.running = false;
                     if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
                         forwarder.close();
                     }
+                    tell_running(&cell_.scope, state.run_id, false);
                 }
-                (destroyed, ended)
+                destroyed
             };
-            if ended {
-                tell_running(&cell_.scope, false);
-            }
             let result = result.map(|exit| RunExit {
                 code: exit.code,
                 destroyed: exit.destroyed || destroyed,
@@ -1671,6 +1668,31 @@ impl ContainerEngine {
         }
     }
 
+    /// Run `run`'s start failed: its end, and the error to return.
+    fn fail_start(&self, cell: &Arc<CellContainer>, run: u64, error: anyhow::Error) -> anyhow::Error {
+        // `start()` is fire-and-forget for the object, and its `monitor()`
+        // sees this error only if it was already waiting; say it here too,
+        // or a start that fails fast leaves no trace anywhere.
+        tracing::warn!(
+            event = "container_start_failed",
+            cell = %cell.scope,
+            engine = self.backend.kind(),
+            error = %format!("{error:#}"),
+            "the container did not start"
+        );
+        let mut state = cell.state.lock().unwrap();
+        // fork: of this run only: a later one's state is its own
+        if state.run == run {
+            state.running = false;
+            state.start_failed = Some((run, format!("{error:#}")));
+            tell_running(&cell.scope, state.run_id, false);
+        }
+        drop(state);
+        cell.record(run, Err(format!("{error:#}")));
+        cell.up.send_replace(run);
+        error
+    }
+
     pub async fn destroy(&self, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
         {
             let mut state = cell.state.lock().unwrap();
@@ -1682,8 +1704,7 @@ impl ContainerEngine {
         if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
             forwarder.close();
         }
-        drop(state);
-        tell_running(&cell.scope, false);
+        tell_running(&cell.scope, state.run_id, false);
         Ok(())
     }
 
@@ -1939,15 +1960,31 @@ impl ContainerEngine {
             if running {
                 // its stop ends with its removal
                 engine.stop_gracefully(&cell, run, why).await;
+            } else if cell.state.lock().unwrap().released_mono_ms.is_some() {
+                // none running: what the engine may keep of it goes (a start
+                // of a run its cell took back waits for this sweep)
+                engine.backend.remove(&cell.name).await;
             }
             // the handle goes, unless its cell took it back meanwhile (an
-            // `attach` that waited past the sweep's bound)
-            let released = cell.state.lock().unwrap().released_mono_ms.is_some();
-            if released {
-                if running {
-                    engine.let_go(&cell);
+            // `attach` that waited past the sweep's bound): checked and
+            // taken under the locks `attach` takes, in its order, so the two
+            // never both have it; one taken back is swept no more
+            let gone = {
+                let mut cells = engine.cells.lock().unwrap();
+                let mut state = cell.state.lock().unwrap();
+                if state.released_mono_ms.is_some() {
+                    if cells.get(&cell.scope).is_some_and(|current| Arc::ptr_eq(current, &cell)) {
+                        cells.remove(&cell.scope);
+                    }
+                    true
                 } else {
-                    engine.forget(&cell).await;
+                    state.sweeping = None;
+                    false
+                }
+            };
+            if gone {
+                for id in cell.processes.lock().unwrap().drain(..) {
+                    drop_process(id);
                 }
             }
             done.send_replace(true);
@@ -1999,8 +2036,7 @@ impl ContainerEngine {
                 if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
                     forwarder.close();
                 }
-                drop(state);
-                tell_running(&cell.scope, false);
+                tell_running(&cell.scope, state.run_id, false);
             }
         }
         tracing::info!(
@@ -2769,6 +2805,44 @@ pub(crate) mod tests {
         });
     }
 
+    // Goal (fork; Codex's second round): a start that waits past the bound
+    // for a sweep whose removal is still under way never launches under
+    // that name (the removal could land on it): it fails, and its object's
+    // monitor() says why; once the removal ends, a start runs. Method: the
+    // removal held past the bound (a grace of 400 ms and a slack of 200).
+    #[test]
+    fn a_start_never_launches_while_a_removal_may_land() {
+        rt().block_on(async {
+            let fake = Arc::new(Fake::default());
+            fake.ends.store(true, Ordering::SeqCst);
+            fake.exits_at_term.store(true, Ordering::SeqCst);
+            let mut engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap();
+            engine.sweep_grace = Duration::from_millis(400);
+            engine.sweep_slack = Duration::from_millis(200);
+            let engine = Arc::new(engine);
+            let cell = a_box();
+            engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+            let first = cell.begin_run();
+            engine.start(&cell, first, start_img()).await.expect("started");
+            fake.removal.hold();
+            assert!(engine.sleep_for_memory(&cell.scope));
+            fake.removal.reached().await;
+            let second = cell.begin_run();
+            let error = engine.start(&cell, second, start_img()).await.expect_err("past the bound, no launch");
+            assert!(error.to_string().contains("still being stopped"), "{error:#}");
+            assert_eq!(fake.asked_of(&cell.name), ["start", "signal 15"], "nothing launched under its name");
+            assert!(!cell.running() && cell.ended(second).is_some_and(|e| e.is_err()), "its monitor() says why");
+            let mut done = cell.state.lock().unwrap().sweeping.clone().expect("its sweep");
+            fake.removal.open();
+            while !*done.borrow_and_update() {
+                done.changed().await.unwrap();
+            }
+            let third = cell.begin_run();
+            engine.start(&cell, third, start_img()).await.expect("once the removal ended, it starts");
+            assert_eq!(fake.asked_of(&cell.name), ["start", "signal 15", "remove", "start"]);
+        });
+    }
+
     // Goal (fork; Codex on this PR): a sweep whose cell took its handle back
     // before the sweep ended (an `attach` that waited past the sweep's
     // bound) leaves that handle where it is: the cell's, in the engine.
@@ -2792,15 +2866,15 @@ pub(crate) mod tests {
             fake.removal.hold();
             assert!(engine.sleep_for_memory(&cell.scope));
             fake.removal.reached().await;
+            let done = cell.state.lock().unwrap().sweeping.clone().expect("its sweep");
             cell.state.lock().unwrap().released_mono_ms = None;
             fake.removal.open();
-            for _ in 0..200 {
-                if cell.state.lock().unwrap().sweeping.as_ref().is_some_and(|done| *done.borrow()) {
-                    break;
-                }
-                asyncrt::sleep(Duration::from_millis(5)).await;
+            let mut done = done;
+            while !*done.borrow_and_update() {
+                done.changed().await.unwrap();
             }
             assert!(engine.cell(&cell.scope).is_some_and(|kept| Arc::ptr_eq(&kept, &cell)), "the handle is its cell's still");
+            assert!(cell.state.lock().unwrap().sweeping.is_none(), "and is swept no more: its next release arms its timer");
         });
     }
 
