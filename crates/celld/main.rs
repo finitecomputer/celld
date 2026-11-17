@@ -3754,6 +3754,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 session_token: storage.session_token.clone(),
             });
     let (tx, rx) = mpsc::unbounded_channel();
+    // fork: the container engine tells the actor each container's start and
+    // end, and asks it for room (`celld::container`)
+    celld::container::set_actor(tx.clone());
     let sample_tx = tx.clone();
     let alarm_tx = tx.clone();
     let alarm_observer: celld::runtime::AlarmObserver = Arc::new(move |cell, alarm| {

@@ -467,6 +467,21 @@ pub enum Message {
     /// A periodic resource sample. The measuring is the shell's job; every
     /// decision that follows belongs to the core.
     SampleLoad(crate::host_services::HostMetricsSample),
+    /// fork: a cell's container started or stopped running
+    /// (`crate::container`), told as it happens.
+    ContainerRunning {
+        cell: String,
+        run: u64,
+        running: bool,
+    },
+    /// fork: a start of `starting`'s container that the engine refused for
+    /// want of memory asks for room: the idlest container that may sleep now
+    /// (`State::sleepable_containers`, as of this step) is put to sleep, and
+    /// the answer names its cell, or none.
+    MakeRoom {
+        starting: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
     /// The log tier changed the folded log object the next lease write
     /// must carry (lease-fold): renew now so the change becomes durable.
     NudgeNodeLease,
@@ -2673,7 +2688,15 @@ impl Actor {
             container_reserved_bytes: crate::container::reserved_memory_bytes(),
         };
         let now_mono_ms = crate::asyncrt::mono_ms();
-        self.drive(Event::LoadSampled { load, now_mono_ms }, out);
+        let containers = crate::container::container_samples();
+        self.drive(
+            Event::LoadSampled {
+                load,
+                now_mono_ms,
+                containers,
+            },
+            out,
+        );
         // Report a change of shed reason once. `rss-hard` retains its
         // established name, but in a Linux cgroup it says
         // `memory.current` crossed the absolute cap.
@@ -2881,6 +2904,23 @@ impl Actor {
                     _ => None,
                 };
                 let _ = reply.send(epoch);
+            }
+            Message::ContainerRunning { cell, run, running } => {
+                self.drive(Event::ContainerRunning { cell, run, running }, out)
+            }
+            Message::MakeRoom { starting, reply } => {
+                let candidates: Vec<(String, u64)> = self
+                    .state
+                    .sleepable_containers(crate::asyncrt::mono_ms())
+                    .into_iter()
+                    .filter(|(cell, _)| *cell != starting)
+                    .collect();
+                let slept = crate::container::engine_if_ready()
+                    .and_then(|engine| engine.sleep_one_for_room(&candidates));
+                if let Some(cell) = &slept {
+                    self.state.note_container_sleep(cell);
+                }
+                let _ = reply.send(slept);
             }
             Message::SampleLoad(metrics) if self.preserving => self.live_load.store_sample(metrics),
             Message::SampleLoad(metrics) => self.sample_load(metrics, out),
@@ -3283,6 +3323,30 @@ impl Actor {
                         authority_expires_ms,
                     },
                     &self.ownership,
+                );
+            }
+            Effect::SleepContainer {
+                cell,
+                run,
+                counted_bytes,
+                idle_ms,
+                cpu_permille,
+            } => {
+                // fork: the walk down could not get the node down by
+                // evictions: this idle container sleeps, as its inactivity
+                // timer would put it to sleep, early. Its object sees the
+                // same end. Logged in the node's own log, never the owner's.
+                let slept = crate::container::engine_if_ready()
+                    .is_some_and(|engine| engine.sleep_for_memory(&cell, run));
+                tracing::info!(
+                    event = "container_slept_for_memory",
+                    scope = %cell,
+                    run,
+                    counted_bytes,
+                    idle_ms,
+                    cpu_permille,
+                    slept,
+                    "idle container put to sleep for memory"
                 );
             }
             Effect::ReadLocalCells => {

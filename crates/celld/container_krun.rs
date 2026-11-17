@@ -217,15 +217,16 @@ impl Backend for KrunBackend {
         true
     }
 
-    /// sandcastle's `memoryInUseBytes`: a VM's charge less the host's page
-    /// cache of its disks. An engine too old to report it reports nothing.
-    async fn memory_in_use(&self) -> anyhow::Result<Vec<(String, u64)>> {
+    /// sandcastle's `memoryInUseBytes`, a VM's charge less the host's page
+    /// cache of its disks, and `cpuUsageUsec`, the CPU time its cgroup has
+    /// used. An engine too old to report one reports nothing of it.
+    async fn usage(&self) -> anyhow::Result<Vec<crate::container::Usage>> {
         let list = self
             .api
             .expect("GET", "/v1/containers", None, "list containers")
             .await?
             .json()?;
-        Ok(in_use_of(&list))
+        Ok(usage_of(&list))
     }
 
     async fn prepare(&self) -> anyhow::Result<()> {
@@ -294,12 +295,24 @@ impl Backend for KrunBackend {
         if let Some(entrypoint) = &launch.entrypoint {
             body["entrypoint"] = json!(entrypoint);
         }
-        self.post(
-            &format!("/v1/containers/{name}/start?wait=ready"),
-            body,
-            "start container",
-        )
-        .await?;
+        let path = format!("/v1/containers/{name}/start?wait=ready");
+        let reply = self.api.call("POST", &path, Some(body)).await?;
+        // fork: the engine admits a VM by its whole memory: refused for want
+        // of it, the start may make room (`EngineFull`)
+        if reply.status.as_u16() == 429 {
+            return Err(crate::container::EngineFull(format!(
+                "start container failed with [429] {}",
+                reply.message_or_error()
+            ))
+            .into());
+        }
+        if !reply.status.is_success() {
+            return Err(anyhow!(
+                "start container failed with [{}] {}",
+                reply.status.as_u16(),
+                reply.message_or_error()
+            ));
+        }
         Ok(Address::Forwarded(Arc::new(Forwarder::new(name, &self.ports))))
     }
 
@@ -708,16 +721,21 @@ pub(crate) async fn load_dev_images(socket: &Path, images: &[String]) -> anyhow:
     Ok(loaded)
 }
 
-/// The engine's list as (name, memory in use) for each container that
-/// reports it.
-fn in_use_of(list: &Value) -> Vec<(String, u64)> {
+/// The engine's list as what each named container reports of its memory
+/// in use and its CPU time, for each that reports either.
+fn usage_of(list: &Value) -> Vec<crate::container::Usage> {
     list.as_array()
         .into_iter()
         .flatten()
         .filter_map(|entry| {
             let name = entry.get("name")?.as_str()?;
-            let bytes = entry.get("memoryInUseBytes")?.as_u64()?;
-            Some((name.to_string(), bytes))
+            let in_use_bytes = entry.get("memoryInUseBytes").and_then(Value::as_u64);
+            let cpu_usage_usec = entry.get("cpuUsageUsec").and_then(Value::as_u64);
+            (in_use_bytes.is_some() || cpu_usage_usec.is_some()).then(|| crate::container::Usage {
+                name: name.to_string(),
+                in_use_bytes,
+                cpu_usage_usec,
+            })
         })
         .collect()
 }
@@ -1419,15 +1437,18 @@ mod tests {
     }
 
     #[test]
-    fn memory_in_use_from_the_list() {
+    fn memory_in_use_and_cpu_from_the_list() {
+        use crate::container::Usage;
         let list = json!([
-            {"name": "a", "running": true, "memoryBytes": 4_000, "memoryInUseBytes": 3_000},
+            {"name": "a", "running": true, "memoryBytes": 4_000, "memoryInUseBytes": 3_000, "cpuUsageUsec": 70},
             {"name": "b", "running": true, "memoryBytes": 4_000},
             {"name": "c", "memoryInUseBytes": null},
             {"memoryInUseBytes": 1},
+            {"name": "d", "cpuUsageUsec": 9},
         ]);
-        assert_eq!(super::in_use_of(&list), vec![("a".to_string(), 3_000)]);
-        assert!(super::in_use_of(&json!({"error": "no"})).is_empty());
+        let usage = |name: &str, in_use_bytes, cpu_usage_usec| Usage { name: name.into(), in_use_bytes, cpu_usage_usec };
+        assert_eq!(super::usage_of(&list), vec![usage("a", Some(3_000), Some(70)), usage("d", None, Some(9))]);
+        assert!(super::usage_of(&json!({"error": "no"})).is_empty());
     }
 
     #[test]

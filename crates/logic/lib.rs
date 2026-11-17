@@ -503,6 +503,12 @@ struct Cell {
     /// cell. The count is process-local because the drain orders only this
     /// process's resident set.
     local_request_count: u64,
+    /// fork: when this cell last committed a write (a request's or a fired
+    /// alarm's), on the remembered monotonic clock; 0 before its first.
+    /// The pressure sleep's measure of a cell's activity: a read is not
+    /// one. A computer's guest asks after its own state every minute; that
+    /// leaves nothing to save, and must not keep an idle computer awake.
+    last_written_mono_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -619,6 +625,7 @@ impl Default for Cell {
             last_used_mono_ms: 0,
             last_used_request: 0,
             local_request_count: 0,
+            last_written_mono_ms: 0,
         }
     }
 }
@@ -799,6 +806,18 @@ pub struct State {
     /// compares against this: a completed cut that left the number flat makes
     /// another cut futile.
     shed_cut: Option<ShedCut>,
+    /// The node's running containers, as the last load sample listed them.
+    containers: Vec<pressure::ContainerSample>,
+    /// The containers this walk down asked to sleep that the samples still
+    /// list: what they count is on its way back, so none is asked twice.
+    container_sleeps: BTreeSet<CellId>,
+    /// When the shedding latch last engaged (monotonic ms): how long its
+    /// evictions have had (`pressure::evictions_may_return`).
+    shed_since_mono_ms: Option<u64>,
+    /// The cells whose container runs, as `Event::ContainerRunning` says
+    /// each start and end: what keeps a cell here through an eviction made
+    /// for room, between samples.
+    running_containers: BTreeMap<CellId, u64>,
     /// Which ceilings are latched. Held apart from `shed_reason`, which names
     /// only the more serious crossing.
     latches: pressure::Latches,
@@ -894,6 +913,10 @@ impl State {
             now_mono_ms: 0,
             shed_floor: 0,
             shed_cut: None,
+            containers: Vec::new(),
+            container_sleeps: BTreeSet::new(),
+            running_containers: BTreeMap::new(),
+            shed_since_mono_ms: None,
             latches: pressure::Latches::default(),
             shedding: false,
             memory_headroom: false,
@@ -3432,6 +3455,7 @@ impl State {
                 self.cells.get(&fired).map(|cell| &cell.phase),
                 Some(Phase::Resident { epoch: current }) if *current == epoch
             ) {
+                self.note_written(&fired, now_mono_ms);
                 let gate = self.op();
                 self.barriers.insert(
                     gate,
@@ -5812,10 +5836,13 @@ impl State {
             .cells
             .iter()
             .filter_map(|(id, cell)| match cell.phase {
+                // A cell whose container still runs here does not move:
+                // its next activation elsewhere would start a second one.
                 Phase::Dormant { epoch }
                     if cell.releasing.is_none()
                         && cell.requests.is_empty()
-                        && !self.alarm_is_imminent(cell) =>
+                        && !self.alarm_is_imminent(cell)
+                        && !self.holds_container(id) =>
                 {
                     Some((id.clone(), epoch, cell.last_used_mono_ms))
                 }
@@ -6147,7 +6174,17 @@ impl State {
     /// ceiling is crossed again. `PressureConfig` holds the node in shedding
     /// until every configured low watermark clears, so the node walks down to
     /// its target instead of oscillating around its ceiling.
-    fn load_sampled(&mut self, load: pressure::Load, now_mono_ms: u64, effects: &mut Vec<Effect>) {
+    fn load_sampled(
+        &mut self,
+        load: pressure::Load,
+        now_mono_ms: u64,
+        containers: Vec<pressure::ContainerSample>,
+        effects: &mut Vec<Effect>,
+    ) {
+        // A sleep asked for is done once its container is gone from the list.
+        self.container_sleeps
+            .retain(|cell| containers.iter().any(|c| c.cell == *cell));
+        self.containers = containers;
         self.memory_headroom = self.config.pressure.has_headroom(load);
         // Both latches are folded, and the reason names the more serious of the
         // two. The latches are state of their own: derived from the reason
@@ -6156,6 +6193,11 @@ impl State {
         self.latches = latches;
         self.shed_reason = reason;
         self.shedding = reason.is_some();
+        self.shed_since_mono_ms = match (self.shedding, self.shed_since_mono_ms) {
+            (false, _) => None,
+            (true, None) => Some(now_mono_ms),
+            (true, since) => since,
+        };
         if !self.shedding {
             // Relieved. Whatever was queued for capacity may proceed.
             self.shed_cut = None;
@@ -6174,6 +6216,18 @@ impl State {
         // coincidence.
         let metric = pressure::PressureConfig::walk_metric(latches);
         let sample_bytes = load.metric_bytes(metric);
+        // No eviction returns memory a container holds: what the line needs
+        // beyond the node's own share, idle containers give now; the rest
+        // too once the evictions have had their window and the node is still
+        // over (`pressure::evictions_may_return`). Waiting for the walk down
+        // to find them futile kept a node with many cells shut to new ones
+        // for minutes (a real Fragment node on celld).
+        let latched_ms = self
+            .shed_since_mono_ms
+            .map_or(0, |since| now_mono_ms.saturating_sub(since));
+        let evictions_may_return =
+            pressure::evictions_may_return(sample_bytes, load.container_reserved_bytes, latched_ms);
+        self.sleep_containers(metric, sample_bytes, evictions_may_return, now_mono_ms, effects);
         if self.shed_cut.is_some_and(|cut| cut.metric != metric) {
             self.shed_cut = None;
         }
@@ -6185,6 +6239,9 @@ impl State {
             // decides nothing about what a cut must achieve.
             let rose = sample_bytes > cut.bytes.saturating_add(cut.bytes / 100);
             if cut_landed && !rose && !self.shedding_can_reach_resume_line(cut, sample_bytes) {
+                // The evictions cannot get the node down: its idle
+                // containers may.
+                self.sleep_containers(metric, sample_bytes, 0, now_mono_ms, effects);
                 return;
             }
         }
@@ -6198,6 +6255,130 @@ impl State {
             cells: load.resident_cells,
         });
         self.shed_toward_floor(effects);
+        // Nothing left to evict and nothing leaving: the evictions are done
+        // with what they can return, so the idle containers may give the rest.
+        if self.eviction_permits.is_empty() && self.shed_candidate().is_none() {
+            self.sleep_containers(metric, sample_bytes, 0, now_mono_ms, effects);
+        }
+    }
+
+    /// Whether the cell holds a running container on this node: as its
+    /// start and end were told (`Event::ContainerRunning`), or the last
+    /// sample listed it.
+    fn holds_container(&self, id: &str) -> bool {
+        self.running_containers.contains_key(id) || self.containers.iter().any(|c| c.cell == id)
+    }
+
+    /// A container put to sleep outside the walk down (a start the engine
+    /// refused for want of memory made room with it): what it counts is on
+    /// its way back, as for one the walk down put to sleep.
+    pub fn note_container_sleep(&mut self, cell: &str) {
+        self.container_sleeps.insert(cell.to_string());
+    }
+
+    /// Put idle containers to sleep for what the evictions cannot return on
+    /// the way to the node's resume line (`pressure::containers_to_sleep`):
+    /// `evictions_return_bytes` is the most they may still return
+    /// (`pressure::evictions_may_return`: the node's own share of the sample
+    /// for the first `EVICTIONS_FIRST_MS` of a latch, none after it or once
+    /// the walk down finds them futile). The least recently active first, as
+    /// many as that needs, never one whose object is resident or whose cell
+    /// did anything in the last `pressure::CONTAINER_QUIET_MS`
+    /// (`sleep_candidates` says what resident is).
+    fn sleep_containers(
+        &mut self,
+        metric: pressure::Metric,
+        sample_bytes: u64,
+        evictions_return_bytes: u64,
+        now_mono_ms: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(resume_line) = self.config.pressure.resume_line(metric) else {
+            return;
+        };
+        let candidates = self.sleep_candidates(now_mono_ms);
+        let chosen: Vec<(CellId, u64, u64, u64, u32)> =
+            pressure::containers_to_sleep(sample_bytes, resume_line, evictions_return_bytes, &candidates, now_mono_ms)
+                .into_iter()
+                .filter_map(|cell| candidates.iter().find(|c| c.cell == cell))
+                .map(|c| {
+                    (
+                        c.cell.to_string(),
+                        c.run,
+                        c.counted_bytes,
+                        now_mono_ms.saturating_sub(c.last_active_mono_ms),
+                        c.cpu_permille.expect("only a container known CPU quiet sleeps"),
+                    )
+                })
+                .collect();
+        for (cell, run, counted_bytes, idle_ms, cpu_permille) in chosen {
+            self.container_sleeps.insert(cell.clone());
+            effects.push(Effect::SleepContainer {
+                cell,
+                run,
+                counted_bytes,
+                idle_ms,
+                cpu_permille,
+            });
+        }
+    }
+
+    /// The containers that may be put to sleep now, the least recently
+    /// active first (`pressure::sleepable`): what a start the engine refuses
+    /// for want of memory takes, the actor asking as it happens.
+    pub fn sleepable_containers(&self, now_mono_ms: u64) -> Vec<(CellId, u64)> {
+        let candidates = self.sleep_candidates(now_mono_ms);
+        pressure::sleepable(&candidates, now_mono_ms)
+            .into_iter()
+            .map(|c| (c.cell.to_string(), c.run))
+            .collect()
+    }
+
+    /// The last sample's containers, each with what the core knows of its
+    /// cell (`sleep_containers` says which count as resident).
+    fn sleep_candidates(&self, now_mono_ms: u64) -> Vec<pressure::SleepCandidate<'_>> {
+        self.containers
+            .iter()
+            .map(|c| {
+                let cell = self.cells.get(&c.cell);
+                // Resident is at work: a request in flight or waiting for
+                // it, a socket open (a hibernated one too: a computer's
+                // guest holds its keepalive through one), an alarm firing, or
+                // the cell between phases. A cell loaded but doing none of
+                // that is not; nor is one out of memory, its container on its
+                // inactivity timer: dormant, or inactive (a request refused
+                // while the node was full leaves an evicted cell so, to
+                // re-read its owner when it next comes). A container whose
+                // cell the core does not know is taken only once its cell
+                // let it go.
+                let resident = match cell {
+                    None => c.released_mono_ms.is_none(),
+                    Some(cell) => {
+                        !matches!(cell.phase, Phase::Inactive | Phase::Dormant { .. } | Phase::Resident { .. })
+                            || self.is_active(&c.cell)
+                            || !cell.requests.is_empty()
+                            || !cell.websockets.is_empty()
+                            || matches!(cell.alarm, Some(AlarmState::Firing { .. }))
+                    }
+                };
+                // Its cell's last write. A cell the core no longer knows
+                // wrote, if ever, before it let its container go.
+                let last_active_mono_ms = match cell {
+                    Some(cell) => cell.last_written_mono_ms,
+                    None => c.released_mono_ms.unwrap_or(now_mono_ms),
+                };
+                pressure::SleepCandidate {
+                    cell: &c.cell,
+                    run: c.run,
+                    counted_bytes: c.counted_bytes,
+                    resident,
+                    last_active_mono_ms,
+                    stopping: c.stopping || self.container_sleeps.contains(&c.cell),
+                    provisional: c.provisional,
+                    cpu_permille: c.cpu_permille,
+                }
+            })
+            .collect()
     }
 
     /// Is there a heap this walk down can still take back whole?
@@ -6316,10 +6497,12 @@ impl State {
             let Some(victim) = self.shed_candidate() else {
                 return;
             };
-            if self
-                .begin_eviction(&victim, self.rebalances(), effects)
-                .is_err()
-            {
+            // A cell whose container runs here stays here: handed away, its
+            // next activation elsewhere would start a second container
+            // while this one runs out its inactivity timer. It keeps the
+            // container, which a walk down that needs more puts to sleep.
+            let rebalance = self.rebalances() && !self.holds_container(&victim);
+            if self.begin_eviction(&victim, rebalance, effects).is_err() {
                 return;
             }
         }
@@ -6920,8 +7103,23 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
         Event::EvictRequested { request, cell, .. } => {
             state.evict_requested(request, cell, &mut effects)
         }
-        Event::LoadSampled { load, now_mono_ms } => {
-            state.load_sampled(load, now_mono_ms, &mut effects)
+        Event::LoadSampled {
+            load,
+            now_mono_ms,
+            containers,
+        } => state.load_sampled(load, now_mono_ms, containers, &mut effects),
+        Event::ContainerRunning { cell, run, running } => {
+            let newest = state.running_containers.get(&cell).copied();
+            if running {
+                // a start told late, after a newer run's, changes nothing
+                if newest.is_none_or(|newest| newest < run) {
+                    state.running_containers.insert(cell, run);
+                }
+            } else if newest.is_some_and(|newest| newest <= run) {
+                // its stop ends it, and any older run's too; a newer one
+                // runs on
+                state.running_containers.remove(&cell);
+            }
         }
         Event::InvalidateRemote { cell, node, epoch } => {
             state.invalidate_remote(&cell, &node, epoch)
@@ -7103,5 +7301,108 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
         | Phase::Cleaning { epoch, .. }
         | Phase::Resident { epoch } => Some(*epoch),
         _ => None,
+    }
+}
+
+/// fork: the pressure sleep's measure of a cell's activity, as the core
+/// keeps it (`Cell::last_written_mono_ms`).
+#[cfg(test)]
+mod pressure_sleep_tests {
+    use super::*;
+
+    const MIN: u64 = 60_000;
+
+    fn node() -> State {
+        State::new(
+            "n1",
+            Config {
+                max_resident: 8,
+                max_activations: 8,
+                max_evictions: 8,
+                max_releases: 8,
+                max_outbound_websockets: 8,
+                ownership_on_evict: OwnershipOnEvict::Sticky,
+                require_node_lease: false,
+                peer_protocol: 1,
+                operation_deadline_ms: None,
+                owner_log_recovery_backoff_ms: 1_000,
+                owner_log_recovery_attempts: 1,
+                alarm_resident_ms: 1_000,
+                idle_evict_ms: None,
+                pressure: pressure::PressureConfig::default(),
+            },
+        )
+    }
+
+    /// A request on the computer's cell at `at`, its output a write to
+    /// `position` or a read, then done.
+    fn request(state: &mut State, request: RequestId, at: u64, position: Option<u64>) {
+        state.now_mono_ms = state.now_mono_ms.max(at);
+        State::record_local_request(state.cells.get_mut("Computer:a").unwrap(), request, at);
+        state.activate_request(request, "Computer:a".into());
+        state.output(request, Channel::Response, position, None, None, &mut Vec::new());
+        state.deactivate_request(request);
+    }
+
+    // Goal: only a write is a cell's activity for the pressure sleep. A
+    // computer whose guest reads its own state every minute (Fragment's
+    // bridge) and wrote nothing for two minutes may sleep; a write starts
+    // its two minutes again. Replay: the same reads change nothing; a write
+    // seen late never moves its time back.
+    #[test]
+    fn only_a_write_keeps_a_container_awake() {
+        let mut state = node();
+        let cell = Cell { phase: Phase::Resident { epoch: 1 }, ..Cell::default() };
+        state.cells.insert("Computer:a".into(), cell);
+        state.containers = vec![pressure::ContainerSample {
+            cell: "Computer:a".into(),
+            run: 4,
+            counted_bytes: 1 << 30,
+            released_mono_ms: None,
+            stopping: false,
+            provisional: false,
+            cpu_permille: Some(3),
+        }];
+        request(&mut state, 1, 10 * MIN, Some(7));
+        assert_eq!(state.cells["Computer:a"].last_written_mono_ms, 10 * MIN);
+        for (i, minute) in (11..=13).enumerate() {
+            request(&mut state, 10 + i as u64, minute * MIN, None);
+        }
+        assert_eq!(state.cells["Computer:a"].last_written_mono_ms, 10 * MIN, "reads are not activity");
+        assert_eq!(state.sleepable_containers(12 * MIN - 1), Vec::<(CellId, u64)>::new(), "inside its two minutes");
+        assert_eq!(state.sleepable_containers(12 * MIN), vec![("Computer:a".to_string(), 4)], "read every minute, quiet two");
+        request(&mut state, 20, 13 * MIN, Some(9));
+        assert_eq!(state.sleepable_containers(14 * MIN), Vec::<(CellId, u64)>::new(), "a write starts its two minutes again");
+        assert_eq!(state.sleepable_containers(15 * MIN), vec![("Computer:a".to_string(), 4)]);
+        state.note_written(&"Computer:a".to_string(), 11 * MIN);
+        assert_eq!(state.cells["Computer:a"].last_written_mono_ms, 13 * MIN, "never back");
+    }
+
+    // Goal (the real run on krun): a container whose cell is out of memory
+    // sleeps whether the cell is dormant (evicted) or inactive (a request
+    // refused while the node was full left it to re-read its owner), its
+    // container let go; one whose cell waits for room to come back never.
+    #[test]
+    fn a_cell_out_of_memory_lets_its_container_sleep() {
+        for (phase, sleeps) in [
+            (Phase::Dormant { epoch: 1 }, true),
+            (Phase::Inactive, true),
+            (Phase::WaitingCapacity, false),
+        ] {
+            let mut state = node();
+            let cell = Cell { phase: phase.clone(), last_written_mono_ms: MIN, ..Cell::default() };
+            state.cells.insert("Computer:a".into(), cell);
+            state.containers = vec![pressure::ContainerSample {
+                cell: "Computer:a".into(),
+                run: 2,
+                counted_bytes: 1 << 30,
+                released_mono_ms: Some(2 * MIN),
+                stopping: false,
+                provisional: false,
+                cpu_permille: Some(0),
+            }];
+            let expect = if sleeps { vec![("Computer:a".to_string(), 2)] } else { vec![] };
+            assert_eq!(state.sleepable_containers(10 * MIN), expect, "{phase:?}");
+        }
     }
 }
