@@ -6270,9 +6270,10 @@ impl State {
 
     /// Put idle containers to sleep for what the evictions cannot return on
     /// the way to the node's resume line (`pressure::containers_to_sleep`):
-    /// `evictions_return_bytes` is the most they may still return (the
-    /// node's own share of the sample, on any latched sample; none once the
-    /// walk down finds them futile). The least recently active first, as
+    /// `evictions_return_bytes` is the most they may still return
+    /// (`pressure::evictions_may_return`: the node's own share of the sample
+    /// for the first `EVICTIONS_FIRST_MS` of a latch, none after it or once
+    /// the walk down finds them futile). The least recently active first, as
     /// many as that needs, never one whose object is resident or whose cell
     /// did anything in the last `pressure::CONTAINER_QUIET_MS`
     /// (`sleep_candidates` says what resident is).
