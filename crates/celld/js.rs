@@ -7267,10 +7267,10 @@ fn op_secret_get(
 }
 
 /// fork: `__ai_run(model, inputsJson)`, the `ai` binding's `run()`
-/// (ai.rs). Resolves to `{"status", "body"}`, Workers AI's answer, or to
-/// `{"code", "message"}` saying why the node has none; the harness throws
-/// the latter. The model's server is the node's: its address stays in this
-/// process.
+/// (ai.rs). Resolves to a `Uint8Array` framed by `ai::frame`: the answer's
+/// `{"status", "headers"}` and body, or `{"code", "message"}` saying why
+/// there is none, which the harness throws. The model's endpoint is the
+/// node's: its address stays in this process.
 fn op_ai_run(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -7278,12 +7278,7 @@ fn op_ai_run(
 ) {
     let model = args.get(0).to_rust_string_lossy(scope);
     let inputs = args.get(1).to_rust_string_lossy(scope);
-    let id = asyncrt::enqueue(async move {
-        Ok::<_, String>(match crate::ai::run(&model, &inputs).await {
-            Ok(answer) => serde_json::json!({ "status": answer.status, "body": answer.body }).to_string(),
-            Err(failure) => serde_json::json!({ "code": failure.code, "message": failure.message }).to_string(),
-        })
-    });
+    let id = asyncrt::enqueue(async move { Ok::<_, String>(asyncrt::OpOut::Bytes(crate::ai::frame(crate::ai::run(&model, &inputs).await))) });
     rv.set(promise_for(scope, id));
 }
 

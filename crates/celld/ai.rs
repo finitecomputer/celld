@@ -1,30 +1,49 @@
 //! fork: a node's Workers AI, the `ai` binding's `run()` (harness.js, `Ai`;
 //! docs/services/workers-ai.md). Cloudflare's binding runs a model of its
-//! catalog by its id; celld runs only the models the node's operator names,
-//! each on a server the operator runs beside the node, and answers in the
-//! catalog's shapes, so a Worker written for Cloudflare calls it as it is.
-//! Every other model rejects, saying the node has none.
+//! catalog by its id; celld runs the models the node's operator names, each
+//! on an endpoint the operator runs or chooses (a model installed on the
+//! box's own machine, say), and answers in the catalog's shapes, so a
+//! Worker written for Cloudflare calls it as it is. A model the file does
+//! not name goes where its `"*"` entry says, or rejects, saying the node
+//! has none.
 //!
-//! `CELLD_AI_FILE` names a JSON file that maps a catalog id to its server:
+//! `CELLD_AI_FILE` names a JSON file that maps a catalog id to its endpoint:
 //!
 //! ```json
-//! { "models": { "@cf/openai/whisper-large-v3-turbo":
-//!     { "engine": "whisper.cpp", "origin": "http://127.0.0.1:8178", "concurrency": 4 } } }
+//! { "models": {
+//!     "@cf/openai/whisper-large-v3-turbo": { "engine": "whisper.cpp", "origin": "http://host.lima.internal:8178" },
+//!     "*": { "engine": "workers-ai", "origin": "http://127.0.0.1:8796" } } }
 //! ```
 //!
-//! One engine so far: `whisper.cpp`'s server (`/inference`, started with
-//! `--convert`, so it reads what browsers and phones record, and with a VAD
-//! model, for `vad_filter`), for the catalog's Whisper (`TRANSCRIBE`). The
-//! server is the node's own service, usually on loopback, which a Worker's
-//! fetch never reaches: the host calls it, outside every isolate, and the
-//! Worker never sees its address. Its `/load` swaps the model, so only the
-//! node may reach it.
+//! An engine is how celld speaks to the endpoint (`Engine`):
 //!
-//! A call is bounded (`AUDIO_MAX_BYTES`, `ANSWER_MAX_BYTES`, `CALL_TIMEOUT`)
-//! and at most `concurrency` are in flight to one server (the server runs
-//! one at a time and queues the rest); past that the call is answered 429,
-//! as Workers AI answers one it has no capacity for, and its caller tries
-//! again. Nothing is logged of the audio or the words.
+//! - `whisper.cpp`: whisper.cpp's server (`/inference`), for the catalog's
+//!   Whisper (`TRANSCRIBE`). Run it with `--convert` (ffmpeg), so it reads
+//!   what browsers and phones record, and a VAD model, for `vad_filter`.
+//! - `openai`: an OpenAI-compatible transcription server
+//!   (`<base_url>/audio/transcriptions`, its `model`), for the catalog's
+//!   Whisper: speaches, LocalAI, whisper.cpp's server on that path.
+//! - `workers-ai`: an endpoint that answers as the binding does,
+//!   `POST <origin>/run/<model>` with the model's JSON input, its answer
+//!   passed on as it came (fragment's dev fake is one). It is the one
+//!   engine `"*"` may name.
+//!
+//! Text and embeddings models are not translated here yet: a Worker that
+//! can name an OpenAI-compatible endpoint itself (fragment's models config
+//! does) needs no binding for them. A later engine plugs in as these do:
+//! a catalog id, its translation in and out, an entry in the file.
+//!
+//! An endpoint is the node's own service, often on loopback or the
+//! machine the node's VM runs on, which a Worker's fetch never reaches: the
+//! host calls it, outside every isolate, and the Worker never sees its
+//! address. whisper.cpp's `/load` swaps the model, so only the node may
+//! reach it.
+//!
+//! A call is bounded (`INPUT_MAX_BYTES`, `AUDIO_MAX_BYTES`,
+//! `ANSWER_MAX_BYTES`, `CALL_TIMEOUT`) and at most `concurrency` are in
+//! flight to one endpoint; past that the call is answered 429, as Workers
+//! AI answers one it has no capacity for, and its caller tries again.
+//! Nothing is logged of an input or an answer.
 
 use anyhow::{anyhow, bail};
 use base64::Engine as _;
@@ -38,6 +57,8 @@ use std::time::Duration;
 pub const VARIABLE: &str = "CELLD_AI_FILE";
 /// The AI file, at most.
 pub const FILE_MAX_BYTES: u64 = 64 * 1024;
+/// The entry for every model the file does not name.
+pub const OTHERWISE: &str = "*";
 /// The catalog's Whisper (developers.cloudflare.com/workers-ai/models/
 /// whisper-large-v3-turbo/): `{audio: <base64>, task?, language?,
 /// vad_filter?, initial_prompt?, …}` in, `{text, word_count, segments, vtt,
@@ -45,18 +66,27 @@ pub const FILE_MAX_BYTES: u64 = 64 * 1024;
 pub const TRANSCRIBE: &str = "@cf/openai/whisper-large-v3-turbo";
 /// The audio of one call, at most (OpenAI's own transcription limit).
 pub const AUDIO_MAX_BYTES: usize = 25 * 1024 * 1024;
-/// A call's inputs as the isolate sends them: the audio as base64, and room.
+/// A call's input as the isolate sends it: Whisper's audio as base64, and
+/// room.
 pub const INPUT_MAX_BYTES: usize = AUDIO_MAX_BYTES / 3 * 4 + 64 * 1024;
-/// The server's answer, at most: an hour's segments and their tokens.
+/// An endpoint's answer, at most: an hour's segments, or an image.
 pub const ANSWER_MAX_BYTES: usize = 16 * 1024 * 1024;
-/// One call, at most, the server's queue included.
+/// One call, at most, the endpoint's queue included.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(600);
-/// How many calls a server has in flight, by default.
+/// How many calls a transcription server has in flight, by default: it
+/// runs one at a time.
 pub const CONCURRENCY_DEFAULT: usize = 4;
+/// And a `workers-ai` endpoint, which serves chat.
+pub const CONCURRENCY_PASSED_DEFAULT: usize = 32;
 /// And at most.
-pub const CONCURRENCY_MAX: usize = 64;
+pub const CONCURRENCY_MAX: usize = 256;
 /// A prompt, at most (Whisper reads 224 tokens of one).
 const PROMPT_MAX_BYTES: usize = 4096;
+/// A model's id or an endpoint's model, at most.
+const MODEL_ID_MAX_BYTES: usize = 128;
+/// The answer's headers a `workers-ai` endpoint's are passed on with,
+/// beside its content type: what the binding's answer carries.
+const PASSED_HEADERS: [&str; 2] = ["cf-aig-log-id", "cf-ai-neurons"];
 
 /// Why a call is not answered: the binding rejects with `message`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,30 +99,77 @@ fn failure(code: &'static str, message: impl Into<String>) -> Failure {
     Failure { code, message: message.into() }
 }
 
-/// An answer: the status and JSON body Workers AI's REST API would give.
+/// An answer: a status, headers (the content type among them) and a body,
+/// as Workers AI's would be.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Answer {
     pub status: u16,
-    pub body: Value,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Answer {
+    fn json(status: u16, body: &Value) -> Answer {
+        Answer { status, headers: vec![("content-type".into(), "application/json".into())], body: body.to_string().into_bytes() }
+    }
+
+    /// The body as JSON, when it is.
+    pub fn value(&self) -> Option<Value> {
+        serde_json::from_slice(&self.body).ok()
+    }
 }
 
 /// A refusal in Workers AI's shape (`{errors: [{code, message}], success}`).
 fn refused(status: u16, code: u32, message: impl Into<String>) -> Answer {
-    Answer { status, body: json!({ "success": false, "errors": [{ "code": code, "message": message.into() }] }) }
+    Answer::json(status, &json!({ "success": false, "errors": [{ "code": code, "message": message.into() }] }))
 }
 
-/// One model's server.
+/// How celld speaks to an endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Engine {
+    WhisperCpp { origin: String },
+    OpenAi { base_url: String, model: String },
+    WorkersAi { origin: String },
+}
+
+impl Engine {
+    fn transcribes(&self) -> bool {
+        matches!(self, Engine::WhisperCpp { .. } | Engine::OpenAi { .. })
+    }
+}
+
+/// One model's endpoint.
 #[derive(Debug)]
 pub struct Server {
-    origin: String,
+    engine: Engine,
     slots: Arc<tokio::sync::Semaphore>,
 }
 
-/// The node's models, by catalog id.
+/// The node's models, by catalog id, and where the rest go.
 #[derive(Debug, Default)]
 pub struct Models {
     servers: BTreeMap<String, Server>,
+    otherwise: Option<Server>,
     file: PathBuf,
+}
+
+/// Whether `id` is a model's id as the catalog names one.
+fn valid_model_id(id: &str) -> bool {
+    (1..=MODEL_ID_MAX_BYTES).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':' | b'/' | b'@'))
+}
+
+/// Whether `url` is an OpenAI-compatible API's base: an origin and a path,
+/// no query, user or trailing `/` (celld adds `/audio/transcriptions`).
+fn valid_base_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else {
+        return false;
+    };
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let origin = &url[..url.len() - rest.len() + host.len()];
+    crate::secrets::origin(origin)
+        && !url.ends_with('/')
+        && path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        && !path.split('/').any(|s| s == "." || s == "..")
 }
 
 impl Models {
@@ -107,75 +184,109 @@ impl Models {
             bail!("{VARIABLE} takes `models`, not `{key}`");
         }
         let Some(Value::Object(models)) = top.get("models") else {
-            bail!("{VARIABLE} names its `models`: an object of each catalog id and its server");
+            bail!("{VARIABLE} names its `models`: an object of each catalog id and its endpoint");
         };
-        let mut servers = BTreeMap::new();
+        let mut out = Models { file: file.to_path_buf(), ..Models::default() };
         for (id, entry) in models {
-            if id != TRANSCRIBE {
-                bail!("{VARIABLE} names {id:?}, which celld does not translate; it runs {TRANSCRIBE}");
+            if id != OTHERWISE && !valid_model_id(id) {
+                bail!("{VARIABLE} names {id:?}, which is no catalog id (@cf/…) nor \"*\"");
             }
             let Value::Object(entry) = entry else {
-                bail!("{VARIABLE}'s {id} is an object: {{\"engine\", \"origin\"}}");
+                bail!("{VARIABLE}'s {id} is an object naming its engine");
             };
-            if let Some(key) = entry.keys().find(|k| !["engine", "origin", "concurrency"].contains(&k.as_str())) {
-                bail!("{VARIABLE}'s {id} takes engine, origin and concurrency, not `{key}`");
+            let text = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or_default();
+            let (engine, keys): (Engine, &[&str]) = match text("engine") {
+                "whisper.cpp" => (Engine::WhisperCpp { origin: text("origin").to_string() }, &["engine", "origin", "concurrency"]),
+                "openai" => (Engine::OpenAi { base_url: text("base_url").to_string(), model: text("model").to_string() }, &["engine", "base_url", "model", "concurrency"]),
+                "workers-ai" => (Engine::WorkersAi { origin: text("origin").to_string() }, &["engine", "origin", "concurrency"]),
+                _ => bail!("{VARIABLE}'s {id} names its engine: \"whisper.cpp\", \"openai\" or \"workers-ai\""),
+            };
+            if let Some(key) = entry.keys().find(|k| !keys.contains(&k.as_str())) {
+                bail!("{VARIABLE}'s {id} takes {}, not `{key}`", keys.join(", "));
             }
-            if entry.get("engine").and_then(Value::as_str) != Some("whisper.cpp") {
-                bail!("{VARIABLE}'s {id} names its engine: \"whisper.cpp\" (its server)");
+            match &engine {
+                Engine::WhisperCpp { origin } | Engine::WorkersAi { origin } if !crate::secrets::origin(origin) => {
+                    bail!("{VARIABLE}'s {id} names its endpoint's origin (http://127.0.0.1:8178, no path)")
+                }
+                Engine::OpenAi { base_url, .. } if !valid_base_url(base_url) => {
+                    bail!("{VARIABLE}'s {id} names its server's base_url (http://127.0.0.1:8000/v1, no query or trailing /)")
+                }
+                Engine::OpenAi { model, .. } if !valid_model_id(model) => bail!("{VARIABLE}'s {id} names the server's `model`"),
+                _ => {}
             }
-            let origin = entry.get("origin").and_then(Value::as_str).unwrap_or_default();
-            if !crate::secrets::origin(origin) {
-                bail!("{VARIABLE}'s {id} names its server's origin (http://127.0.0.1:8178, no path)");
+            if engine.transcribes() && id != TRANSCRIBE {
+                bail!("{VARIABLE}'s {id}: a transcription engine serves {TRANSCRIBE}; another model's endpoint is a \"workers-ai\" one");
             }
+            let default = if engine.transcribes() { CONCURRENCY_DEFAULT } else { CONCURRENCY_PASSED_DEFAULT };
             let concurrency = match entry.get("concurrency") {
-                None => CONCURRENCY_DEFAULT,
+                None => default,
                 Some(n) => match n.as_u64() {
                     Some(n) if (1..=CONCURRENCY_MAX as u64).contains(&n) => n as usize,
                     _ => bail!("{VARIABLE}'s {id} concurrency is 1 to {CONCURRENCY_MAX}"),
                 },
             };
-            servers.insert(id.clone(), Server { origin: origin.to_string(), slots: Arc::new(tokio::sync::Semaphore::new(concurrency)) });
+            let server = Server { engine, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)) };
+            if id == OTHERWISE {
+                out.otherwise = Some(server);
+            } else {
+                out.servers.insert(id.clone(), server);
+            }
         }
-        Ok(Models { servers, file: file.to_path_buf() })
+        Ok(out)
     }
 
     /// `model`'s answer to `inputs` (the isolate's JSON), or why there is
     /// none.
     pub async fn run(&self, model: &str, inputs: &str) -> Result<Answer, Failure> {
-        let Some(server) = self.servers.get(model) else {
+        let Some(server) = self.servers.get(model).or(self.otherwise.as_ref()) else {
             return Err(failure("unbound", format!("this node has no Workers AI model {model} ({VARIABLE} {} names none)", self.file.display())));
         };
-        let request = match whisper_request(inputs) {
-            Ok(request) => request,
-            Err(answer) => return Ok(answer),
+        if inputs.len() > INPUT_MAX_BYTES {
+            return Ok(refused(413, 5006, format!("the input is {} bytes; at most {INPUT_MAX_BYTES}", inputs.len())));
+        }
+        let request = match &server.engine {
+            Engine::WorkersAi { .. } => None,
+            engine => match whisper_request(inputs).and_then(|r| r.for_engine(engine)) {
+                Ok(request) => Some(request),
+                Err(answer) => return Ok(answer),
+            },
         };
         let Ok(_slot) = server.slots.clone().try_acquire_owned() else {
             return Ok(refused(429, 3040, "Capacity temporarily exceeded, please try again."));
         };
-        whisper_cpp(&server.origin, request).await
+        match (&server.engine, request) {
+            (Engine::WhisperCpp { origin }, Some(r)) => transcribed(&format!("whisper.cpp at {origin}"), format!("{origin}/inference"), r).await,
+            (Engine::OpenAi { base_url, .. }, Some(r)) => {
+                let path = if r.translate { "translations" } else { "transcriptions" };
+                transcribed(&format!("the transcription server at {base_url}"), format!("{base_url}/audio/{path}"), r).await
+            }
+            (Engine::WorkersAi { origin }, _) => passed(origin, model, inputs).await,
+            (_, None) => unreachable!("a transcription engine's request is bounded above"),
+        }
     }
 }
 
-/// What a Whisper call asks of whisper.cpp's server.
+/// A Whisper call, bounded, and the form an engine sends it as.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhisperRequest {
     pub audio: Vec<u8>,
-    /// `language` (`auto`: detect it), `prompt`, `translate`, `vad`,
-    /// `beam_size`, `no_speech_thold`, `logprob_thold`, as its form names
-    /// them.
-    pub fields: Vec<(&'static str, String)>,
-    /// The language the call named, to answer it by its code.
+    pub translate: bool,
+    /// The language the call named (`None`: detect it).
     pub language: Option<String>,
+    pub prompt: Option<String>,
+    pub vad: bool,
+    pub beam_size: Option<u32>,
+    pub no_speech_threshold: Option<f64>,
+    pub log_prob_threshold: Option<f64>,
+    /// Its form's fields, as `for_engine` names them for its engine.
+    pub fields: Vec<(&'static str, String)>,
 }
 
-/// The catalog's Whisper input, as whisper.cpp's form, or the refusal
-/// Workers AI would answer (400). A key of the catalog's that celld does
-/// not translate is refused by name, never let go: the caller asked for it.
+/// The catalog's Whisper input, bounded, or the refusal Workers AI would
+/// answer (400). A key of the catalog's that celld does not translate is
+/// refused by name, never let go: the caller asked for it.
 pub fn whisper_request(inputs: &str) -> Result<WhisperRequest, Answer> {
     let bad = |m: String| refused(400, 5006, m);
-    if inputs.len() > INPUT_MAX_BYTES {
-        return Err(refused(413, 5006, format!("the input is {} bytes; at most {INPUT_MAX_BYTES}", inputs.len())));
-    }
     let Ok(Value::Object(input)) = serde_json::from_str::<Value>(inputs) else {
         return Err(bad("the input is an object".into()));
     };
@@ -213,61 +324,115 @@ pub fn whisper_request(inputs: &str) -> Result<WhisperRequest, Answer> {
             Some(v) => v.as_f64().filter(|n| n.is_finite()).map(Some).ok_or_else(|| bad(format!("{key} is a number"))),
         }
     };
-    let mut fields: Vec<(&'static str, String)> = Vec::new();
     let language = match text("language")?.map(str::trim).filter(|l| !l.is_empty()) {
         None => None,
         Some(l) if code_of(l).is_some() => Some(l.to_string()),
         Some(l) => return Err(bad(format!("{l:?} is no language Whisper knows"))),
     };
-    fields.push(("language", language.clone().unwrap_or_else(|| "auto".into())));
-    match text("task")? {
-        None | Some("transcribe") => {}
-        Some("translate") => fields.push(("translate", "true".into())),
+    let translate = match text("task")? {
+        None | Some("transcribe") => false,
+        Some("translate") => true,
         Some(_) => return Err(bad("task is transcribe or translate".into())),
-    }
-    if let Some(prompt) = text("initial_prompt")?.filter(|p| !p.trim().is_empty()) {
-        if prompt.len() > PROMPT_MAX_BYTES {
-            return Err(bad(format!("initial_prompt is at most {PROMPT_MAX_BYTES} bytes")));
-        }
-        fields.push(("prompt", prompt.to_string()));
-    }
-    match input.get("vad_filter") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => {}
-        Some(Value::Bool(true)) => fields.push(("vad", "true".into())),
+    };
+    let prompt = match text("initial_prompt")?.filter(|p| !p.trim().is_empty()) {
+        Some(p) if p.len() > PROMPT_MAX_BYTES => return Err(bad(format!("initial_prompt is at most {PROMPT_MAX_BYTES} bytes"))),
+        p => p.map(str::to_string),
+    };
+    let vad = match input.get("vad_filter") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
         Some(_) => return Err(bad("vad_filter is true or false".into())),
-    }
-    if let Some(n) = number("beam_size")? {
-        if !(n.fract() == 0.0 && (1.0..=16.0).contains(&n)) {
-            return Err(bad("beam_size is 1 to 16".into()));
-        }
-        fields.push(("beam_size", format!("{n}")));
-    }
-    if let Some(n) = number("no_speech_threshold")? {
-        fields.push(("no_speech_thold", format!("{n}")));
-    }
-    if let Some(n) = number("log_prob_threshold")? {
-        fields.push(("logprob_thold", format!("{n}")));
-    }
-    fields.push(("response_format", "verbose_json".into()));
-    fields.push(("temperature", "0".into()));
-    Ok(WhisperRequest { audio, fields, language })
+    };
+    let beam_size = match number("beam_size")? {
+        None => None,
+        Some(n) if n.fract() == 0.0 && (1.0..=16.0).contains(&n) => Some(n as u32),
+        Some(_) => return Err(bad("beam_size is 1 to 16".into())),
+    };
+    Ok(WhisperRequest {
+        audio,
+        translate,
+        language,
+        prompt,
+        vad,
+        beam_size,
+        no_speech_threshold: number("no_speech_threshold")?,
+        log_prob_threshold: number("log_prob_threshold")?,
+        fields: Vec::new(),
+    })
 }
 
-/// Whisper's languages, by code and by the name whisper.cpp answers with
-/// (its `g_lang`).
+impl WhisperRequest {
+    /// Its form for `engine`, or the refusal of what that engine cannot
+    /// honour.
+    fn for_engine(mut self, engine: &Engine) -> Result<WhisperRequest, Answer> {
+        let mut f: Vec<(&'static str, String)> = Vec::new();
+        match engine {
+            Engine::WhisperCpp { .. } => {
+                f.push(("language", self.language.clone().unwrap_or_else(|| "auto".into())));
+                if self.translate {
+                    f.push(("translate", "true".into()));
+                }
+                if let Some(p) = &self.prompt {
+                    f.push(("prompt", p.clone()));
+                }
+                if self.vad {
+                    f.push(("vad", "true".into()));
+                }
+                if let Some(n) = self.beam_size {
+                    f.push(("beam_size", n.to_string()));
+                }
+                if let Some(n) = self.no_speech_threshold {
+                    f.push(("no_speech_thold", n.to_string()));
+                }
+                if let Some(n) = self.log_prob_threshold {
+                    f.push(("logprob_thold", n.to_string()));
+                }
+            }
+            Engine::OpenAi { model, .. } => {
+                for (named, key) in [(self.beam_size.is_some(), "beam_size"), (self.no_speech_threshold.is_some(), "no_speech_threshold"), (self.log_prob_threshold.is_some(), "log_prob_threshold")] {
+                    if named {
+                        return Err(refused(400, 5006, format!("this node's Whisper (an OpenAI-compatible server) takes no `{key}`")));
+                    }
+                }
+                f.push(("model", model.clone()));
+                // OpenAI's API detects a language it is not told
+                if let Some(l) = &self.language {
+                    f.push(("language", code_of(l).unwrap_or(l).to_string()));
+                }
+                if let Some(p) = &self.prompt {
+                    f.push(("prompt", p.clone()));
+                }
+                // the server's own VAD, by the name faster-whisper's
+                // servers take; one with none lets it go
+                if self.vad {
+                    f.push(("vad_filter", "true".into()));
+                }
+            }
+            Engine::WorkersAi { .. } => unreachable!("a workers-ai endpoint takes the input as it is"),
+        }
+        f.push(("response_format", "verbose_json".into()));
+        f.push(("temperature", "0".into()));
+        self.fields = f;
+        Ok(self)
+    }
+}
+
+/// Whisper's languages, by code and by the name whisper.cpp and OpenAI
+/// answer with (whisper.cpp's `g_lang`).
 const LANGUAGES: &str = "en:english,zh:chinese,de:german,es:spanish,ru:russian,ko:korean,fr:french,ja:japanese,pt:portuguese,tr:turkish,pl:polish,ca:catalan,nl:dutch,ar:arabic,sv:swedish,it:italian,id:indonesian,hi:hindi,fi:finnish,vi:vietnamese,he:hebrew,uk:ukrainian,el:greek,ms:malay,cs:czech,ro:romanian,da:danish,hu:hungarian,ta:tamil,no:norwegian,th:thai,ur:urdu,hr:croatian,bg:bulgarian,lt:lithuanian,la:latin,mi:maori,ml:malayalam,cy:welsh,sk:slovak,te:telugu,fa:persian,lv:latvian,bn:bengali,sr:serbian,az:azerbaijani,sl:slovenian,kn:kannada,et:estonian,mk:macedonian,br:breton,eu:basque,is:icelandic,hy:armenian,ne:nepali,mn:mongolian,bs:bosnian,kk:kazakh,sq:albanian,sw:swahili,gl:galician,mr:marathi,pa:punjabi,si:sinhala,km:khmer,sn:shona,yo:yoruba,so:somali,af:afrikaans,oc:occitan,ka:georgian,be:belarusian,tg:tajik,sd:sindhi,gu:gujarati,am:amharic,yi:yiddish,lo:lao,uz:uzbek,fo:faroese,ht:haitian creole,ps:pashto,tk:turkmen,nn:nynorsk,mt:maltese,sa:sanskrit,lb:luxembourgish,my:myanmar,bo:tibetan,tl:tagalog,mg:malagasy,as:assamese,tt:tatar,haw:hawaiian,ln:lingala,ha:hausa,ba:bashkir,jw:javanese,su:sundanese,yue:cantonese";
 
-/// The code of a language, named by its code or its name.
+/// The code of a language, named by its code or its name (any case).
 fn code_of(language: &str) -> Option<&'static str> {
-    LANGUAGES.split(',').filter_map(|pair| pair.split_once(':')).find(|(code, name)| *code == language || *name == language).map(|(code, _)| code)
+    let l = language.to_ascii_lowercase();
+    LANGUAGES.split(',').filter_map(|pair| pair.split_once(':')).find(|(code, name)| *code == l || *name == l).map(|(code, _)| code)
 }
 
-/// whisper.cpp's `verbose_json` as the catalog's answer: the text, its
-/// words counted, its segments and a WebVTT of them, and what was heard
-/// (`transcription_info`: the language's code and the audio's length,
-/// which a caller meters by). What whisper.cpp does not measure is left
-/// out, never made up: `duration_after_vad`, a segment's
-/// `compression_ratio` and its `words`' timings.
+/// A transcription server's `verbose_json` (whisper.cpp's, or OpenAI's) as
+/// the catalog's answer: the text, its words counted, its segments and a
+/// WebVTT of them, and what was heard (`transcription_info`: the language's
+/// code and the audio's length, which a caller meters by). What the server
+/// does not measure is left out, never made up: `duration_after_vad`, and
+/// a segment's words' timings.
 pub fn catalog_answer(verbose: &Value, asked: Option<&str>) -> Option<Value> {
     // whisper.cpp ends each segment's text with a newline; each begins with
     // its own space where the language has one
@@ -280,7 +445,7 @@ pub fn catalog_answer(verbose: &Value, asked: Option<&str>) -> Option<Value> {
         let (start, end) = (s["start"].as_f64().unwrap_or(0.0), s["end"].as_f64().unwrap_or(0.0));
         let said = s["text"].as_str().unwrap_or("").trim();
         let mut segment = json!({ "start": start, "end": end, "text": said });
-        for key in ["temperature", "avg_logprob", "no_speech_prob"] {
+        for key in ["temperature", "avg_logprob", "compression_ratio", "no_speech_prob"] {
             if let Some(v) = s.get(key).filter(|v| v.is_number()) {
                 segment[key] = v.clone();
             }
@@ -311,8 +476,8 @@ fn stamp(seconds: f64) -> String {
     format!("{:02}:{:02}:{:02}.{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
 }
 
-/// The client whisper.cpp's server is called with: no proxy, no redirect,
-/// each call bounded. Not a Worker's egress: the server is the node's own.
+/// The client endpoints are called with: no proxy, no redirect, each call
+/// bounded. Not a Worker's egress: an endpoint is the node's own.
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -322,7 +487,7 @@ fn client() -> &'static reqwest::Client {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(CALL_TIMEOUT)
             .build()
-            .expect("build the AI servers' HTTP client")
+            .expect("build the AI endpoints' HTTP client")
     })
 }
 
@@ -348,23 +513,17 @@ fn form(request: &WhisperRequest) -> (String, Vec<u8>) {
     (boundary, body)
 }
 
-/// whisper.cpp's server at `origin` hears `request`.
-async fn whisper_cpp(origin: &str, request: WhisperRequest) -> Result<Answer, Failure> {
-    let place = format!("whisper.cpp at {origin}");
-    let (boundary, body) = form(&request);
-    let sent = client()
-        .post(format!("{origin}/inference"))
-        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
-        .header("accept", "application/json")
-        .body(body)
-        .send()
-        .await;
+/// An endpoint's answer, read whole and bounded: its status, headers and
+/// body.
+async fn read(place: &str, sent: Result<reqwest::Response, reqwest::Error>) -> Result<(u16, reqwest::header::HeaderMap, Vec<u8>), Failure> {
+    let late = || failure("down", format!("{place} did not answer within {} s", CALL_TIMEOUT.as_secs()));
     let mut response = match sent {
         Ok(response) => response,
-        Err(e) if e.is_timeout() => return Err(failure("down", format!("{place} did not answer within {} s", CALL_TIMEOUT.as_secs()))),
+        Err(e) if e.is_timeout() => return Err(late()),
         Err(e) => return Err(failure("down", format!("{place} is not answering ({})", e.without_url()))),
     };
     let status = response.status().as_u16();
+    let headers = response.headers().clone();
     let mut bytes = Vec::new();
     loop {
         match response.chunk().await {
@@ -375,24 +534,71 @@ async fn whisper_cpp(origin: &str, request: WhisperRequest) -> Result<Answer, Fa
                 bytes.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(e) if e.is_timeout() => return Err(failure("down", format!("{place} did not finish its answer within {} s", CALL_TIMEOUT.as_secs()))),
+            Err(e) if e.is_timeout() => return Err(late()),
             Err(e) => return Err(failure("down", format!("{place} broke off its answer ({})", e.without_url()))),
         }
     }
+    Ok((status, headers, bytes))
+}
+
+/// A transcription server at `url` hears `request`; its `verbose_json` is
+/// the catalog's answer.
+async fn transcribed(place: &str, url: String, request: WhisperRequest) -> Result<Answer, Failure> {
+    let (boundary, body) = form(&request);
+    let sent = client()
+        .post(url)
+        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .header("accept", "application/json")
+        .body(body)
+        .send()
+        .await;
+    let (status, _, bytes) = read(place, sent).await?;
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    let said: String = body["error"].as_str().unwrap_or("").chars().take(200).collect();
+    // whisper.cpp's `error` is a string; OpenAI's an object with a message
+    let said: String = body["error"].as_str().or_else(|| body["error"]["message"].as_str()).unwrap_or("").chars().take(200).collect();
     Ok(match status {
         200 => match catalog_answer(&body, request.language.as_deref()) {
-            Some(answer) => Answer { status: 200, body: answer },
+            Some(answer) => Answer::json(200, &answer),
             None => refused(502, 3000, format!("{place} answered with no text or length")),
         },
         // the audio is none ffmpeg reads: the call's, as Workers AI's 400
         500 if said.contains("FFmpeg conversion failed") => refused(400, 5006, "the audio could not be read"),
-        400 => refused(400, 5006, format!("{place} refused the call: {said}")),
-        // loading its model
-        503 => refused(503, 3040, format!("{place} is not ready")),
+        400 | 413 | 415 | 422 => refused(400, 5006, format!("{place} refused the call: {said}")),
+        // loading its model, or full
+        503 | 429 => refused(status, 3040, format!("{place} is not ready: {said}")),
         _ => refused(502, 3000, format!("{place} answered {status}: {said}")),
     })
+}
+
+/// A `workers-ai` endpoint at `origin` runs `model` on `inputs`; its answer
+/// is passed on as it came.
+async fn passed(origin: &str, model: &str, inputs: &str) -> Result<Answer, Failure> {
+    let place = format!("the Workers AI endpoint at {origin}");
+    let sent = client().post(format!("{origin}/run/{model}")).header("content-type", "application/json").body(inputs.to_string()).send().await;
+    let (status, headers, body) = read(&place, sent).await?;
+    let mut kept = Vec::new();
+    for name in std::iter::once("content-type").chain(PASSED_HEADERS) {
+        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            kept.push((name.to_string(), v.to_string()));
+        }
+    }
+    Ok(Answer { status, headers: kept, body })
+}
+
+/// An answer, or why there is none, as the op hands it to the isolate: the
+/// length of its metadata (4 bytes, big-endian), the metadata (`{status,
+/// headers}` or `{code, message}`), then the body.
+pub fn frame(answer: Result<Answer, Failure>) -> Vec<u8> {
+    let (meta, body) = match answer {
+        Ok(a) => (json!({ "status": a.status, "headers": a.headers }), a.body),
+        Err(f) => (json!({ "code": f.code, "message": f.message }), Vec::new()),
+    };
+    let meta = meta.to_string().into_bytes();
+    let mut out = Vec::with_capacity(4 + meta.len() + body.len());
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&meta);
+    out.extend_from_slice(&body);
+    out
 }
 
 /// The node's models, read once (`load`).
@@ -431,7 +637,7 @@ pub fn load() -> anyhow::Result<()> {
 pub async fn run(model: &str, inputs: &str) -> Result<Answer, Failure> {
     match MODELS.get_or_init(|| from_env().expect("validated CELLD_AI_FILE")) {
         Some(models) => models.run(model, inputs).await,
-        None => Err(failure("unbound", format!("this node has no Workers AI model {model}: name its server in {VARIABLE}"))),
+        None => Err(failure("unbound", format!("this node has no Workers AI model {model}: name its endpoint in {VARIABLE}"))),
     }
 }
 
@@ -443,17 +649,43 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
+    fn cpp() -> Engine {
+        Engine::WhisperCpp { origin: "http://127.0.0.1:8178".into() }
+    }
+
+    fn oai() -> Engine {
+        Engine::OpenAi { base_url: "http://127.0.0.1:8000/v1".into(), model: "Systran/faster-whisper-small".into() }
+    }
+
+    fn fields(input: Value, engine: &Engine) -> Result<Vec<(&'static str, String)>, Answer> {
+        whisper_request(&input.to_string()).and_then(|r| r.for_engine(engine)).map(|r| r.fields)
+    }
+
     /// Valid: the fragment cell's input (audio, task, vad_filter, and a
-    /// language and prompt when it has them) is whisper.cpp's form.
+    /// language and prompt when it has them) is each engine's form.
     #[test]
-    fn the_catalogs_input_is_whisper_cpps_form() {
-        let r = whisper_request(&json!({ "audio": b64(b"OggS voice"), "task": "transcribe", "vad_filter": true }).to_string()).unwrap();
-        assert_eq!(r.audio, b"OggS voice");
-        assert_eq!(r.fields, vec![("language", "auto".into()), ("vad", "true".into()), ("response_format", "verbose_json".into()), ("temperature", "0".into())]);
-        assert_eq!(r.language, None, "no language: Whisper detects it");
-        let r = whisper_request(&json!({ "audio": b64(b"x"), "language": "de", "initial_prompt": "Paul, fragment", "task": "translate", "beam_size": 5 }).to_string()).unwrap();
-        assert!(r.fields.contains(&("language", "de".into())) && r.fields.contains(&("prompt", "Paul, fragment".into())) && r.fields.contains(&("translate", "true".into())) && r.fields.contains(&("beam_size", "5".into())), "{:?}", r.fields);
-        assert!(!r.fields.iter().any(|(k, _)| *k == "vad"), "no vad_filter: none");
+    fn the_catalogs_input_is_each_engines_form() {
+        let cell = json!({ "audio": b64(b"OggS voice"), "task": "transcribe", "vad_filter": true });
+        let r = whisper_request(&cell.to_string()).unwrap();
+        assert_eq!((r.audio.as_slice(), r.language.as_deref()), (&b"OggS voice"[..], None), "no language: Whisper detects it");
+        assert_eq!(fields(cell.clone(), &cpp()).unwrap(), vec![("language", "auto".into()), ("vad", "true".into()), ("response_format", "verbose_json".into()), ("temperature", "0".into())]);
+        assert_eq!(
+            fields(cell, &oai()).unwrap(),
+            vec![("model", "Systran/faster-whisper-small".into()), ("vad_filter", "true".into()), ("response_format", "verbose_json".into()), ("temperature", "0".into())],
+            "OpenAI's API detects a language it is not told: no `auto`"
+        );
+        let told = json!({ "audio": b64(b"x"), "language": "de", "initial_prompt": "Paul, fragment", "task": "translate", "beam_size": 5 });
+        let f = fields(told.clone(), &cpp()).unwrap();
+        for want in [("language", "de"), ("prompt", "Paul, fragment"), ("translate", "true"), ("beam_size", "5")] {
+            assert!(f.contains(&(want.0, want.1.into())), "{want:?} in {f:?}");
+        }
+        assert!(!f.iter().any(|(k, _)| *k == "vad"), "no vad_filter: none");
+        assert!(fields(told.clone(), &oai()).is_err_and(|a| a.status == 400 && a.value().unwrap().to_string().contains("beam_size")), "what the engine cannot honour is refused by name");
+        let mut told = told;
+        told.as_object_mut().unwrap().remove("beam_size");
+        let f = fields(told, &oai()).unwrap();
+        assert!(f.contains(&("language", "de".into())) && f.contains(&("prompt", "Paul, fragment".into())), "{f:?}");
+        assert!(whisper_request(&json!({ "audio": b64(b"x"), "task": "translate" }).to_string()).unwrap().translate, "OpenAI's translations path");
     }
 
     /// Invalid: what Whisper's catalog has no input for, or celld does not
@@ -461,7 +693,7 @@ mod tests {
     /// none, or past its bound.
     #[test]
     fn an_input_out_of_shape_is_refused() {
-        let status = |input: Value| whisper_request(&input.to_string()).err().map(|a| (a.status, a.body["errors"][0]["message"].as_str().unwrap_or("").to_string()));
+        let status = |input: Value| whisper_request(&input.to_string()).err().map(|a| (a.status, a.value().unwrap()["errors"][0]["message"].as_str().unwrap_or("").to_string()));
         assert!(status(json!({})).is_some_and(|(s, m)| s == 400 && m.contains("audio")));
         assert!(status(json!({ "audio": "not base64!" })).is_some_and(|(s, _)| s == 400));
         assert!(status(json!({ "audio": [1, 2, 3] })).is_some_and(|(s, _)| s == 400), "the old Whisper's byte array is not this model's");
@@ -477,12 +709,12 @@ mod tests {
         assert!(whisper_request(&json!({ "audio": b64(&big[..AUDIO_MAX_BYTES]) }).to_string()).is_ok(), "the bound itself is taken");
     }
 
-    /// whisper.cpp's verbose_json is the catalog's answer: its text, words,
-    /// segments, a WebVTT, and the language's code and the audio's length;
-    /// what it does not measure is left out. One without text or length is
-    /// none.
+    /// A server's verbose_json (whisper.cpp's, OpenAI's) is the catalog's
+    /// answer: its text, words, segments, a WebVTT, and the language's code
+    /// and the audio's length; what it does not measure is left out. One
+    /// without text or length is none.
     #[test]
-    fn whisper_cpps_answer_is_the_catalogs() {
+    fn a_servers_answer_is_the_catalogs() {
         let verbose = json!({
             "task": "transcribe", "language": "english", "duration": 3.5, "text": " Hello there.\n General Kenobi.\n",
             "detected_language": "english", "detected_language_probability": 0.97,
@@ -500,6 +732,10 @@ mod tests {
         assert!(a["transcription_info"].get("duration_after_vad").is_none(), "not measured, not made up");
         let asked = catalog_answer(&verbose, Some("de")).unwrap();
         assert_eq!(asked["transcription_info"], json!({ "language": "de", "duration": 3.5 }), "the language it was told");
+        // OpenAI's own shape: a compression ratio, a language that may be a code
+        let openai = json!({ "task": "transcribe", "language": "English", "duration": 2.0, "text": "Hi.", "segments": [{ "id": 0, "seek": 0, "start": 0.0, "end": 2.0, "text": " Hi.", "tokens": [1], "temperature": 0.0, "avg_logprob": -0.1, "compression_ratio": 0.5, "no_speech_prob": 0.0 }] });
+        let a = catalog_answer(&openai, None).unwrap();
+        assert_eq!((a["transcription_info"]["language"].clone(), a["segments"][0]["compression_ratio"].clone()), (json!("en"), json!(0.5)));
         let silent = catalog_answer(&json!({ "text": "", "duration": 2.0, "segments": [] }), None).unwrap();
         assert_eq!((silent["text"].clone(), silent["word_count"].clone()), (json!(""), json!(0)), "silence is no words");
         assert_eq!(catalog_answer(&json!({ "duration": 2.0 }), None), None);
@@ -510,7 +746,7 @@ mod tests {
     /// The form's boundary is in neither the audio nor a field.
     #[test]
     fn the_forms_boundary_is_its_own() {
-        let mut r = whisper_request(&json!({ "audio": b64(b"x") }).to_string()).unwrap();
+        let mut r = whisper_request(&json!({ "audio": b64(b"x") }).to_string()).unwrap().for_engine(&cpp()).unwrap();
         let (first, _) = form(&r);
         r.audio = format!("abc{first}def").into_bytes();
         let (boundary, body) = form(&r);
@@ -519,22 +755,51 @@ mod tests {
         assert!(text.ends_with(&format!("--{boundary}--\r\n")) && text.contains("name=\"file\"; filename=\"audio\""));
     }
 
-    /// The AI file: the one model, its engine and origin; anything else
-    /// stops the node, saying what it takes.
+    /// The op's frame: its metadata's length, the metadata, the body.
     #[test]
-    fn the_ai_file_names_whisper_on_whisper_cpp() {
+    fn an_answer_is_framed_for_the_isolate() {
+        let framed = frame(Ok(Answer { status: 200, headers: vec![("content-type".into(), "image/png".into())], body: vec![0x89, b'P'] }));
+        let n = u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize;
+        assert_eq!(serde_json::from_slice::<Value>(&framed[4..4 + n]).unwrap(), json!({ "status": 200, "headers": [["content-type", "image/png"]] }));
+        assert_eq!(&framed[4 + n..], &[0x89, b'P']);
+        let framed = frame(Err(failure("down", "gone")));
+        let n = u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize;
+        assert_eq!((serde_json::from_slice::<Value>(&framed[4..4 + n]).unwrap(), framed.len()), (json!({ "code": "down", "message": "gone" }), 4 + n));
+    }
+
+    /// The AI file: Whisper on a transcription engine, any model (or "*")
+    /// on a workers-ai endpoint; anything else stops the node, saying what
+    /// it takes.
+    #[test]
+    fn the_ai_file_names_each_models_endpoint() {
         let f = Path::new("/etc/celld/ai.json");
-        let ok = Models::parse(br#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"whisper.cpp","origin":"http://127.0.0.1:8178","concurrency":2}}}"#, f).unwrap();
-        assert_eq!(ok.servers[TRANSCRIBE].origin, "http://127.0.0.1:8178");
+        let ok = Models::parse(
+            br#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"whisper.cpp","origin":"http://host.lima.internal:8178","concurrency":2},
+                           "@cf/baai/bge-m3":{"engine":"workers-ai","origin":"http://127.0.0.1:8796"},
+                           "*":{"engine":"workers-ai","origin":"http://127.0.0.1:8796"}}}"#,
+            f,
+        )
+        .unwrap();
+        assert_eq!(ok.servers[TRANSCRIBE].engine, Engine::WhisperCpp { origin: "http://host.lima.internal:8178".into() });
         assert_eq!(ok.servers[TRANSCRIBE].slots.available_permits(), 2);
+        assert_eq!(ok.servers["@cf/baai/bge-m3"].slots.available_permits(), CONCURRENCY_PASSED_DEFAULT);
+        assert_eq!(ok.otherwise.as_ref().unwrap().engine, Engine::WorkersAi { origin: "http://127.0.0.1:8796".into() });
+        let openai = Models::parse(br#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"openai","base_url":"http://127.0.0.1:8000/v1","model":"Systran/faster-whisper-small"}}}"#, f).unwrap();
+        assert_eq!(openai.servers[TRANSCRIBE].engine, oai());
         for bad in [
             r#"[]"#,
             r#"{"models":{}, "extra": 1}"#,
             r#"{"models":{"@cf/meta/llama-3.1-8b-instruct":{"engine":"whisper.cpp","origin":"http://127.0.0.1:8178"}}}"#,
+            r#"{"models":{"*":{"engine":"whisper.cpp","origin":"http://127.0.0.1:8178"}}}"#,
+            r#"{"models":{"not a model":{"engine":"workers-ai","origin":"http://127.0.0.1:8796"}}}"#,
             r#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"faster-whisper","origin":"http://127.0.0.1:8178"}}}"#,
             r#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"whisper.cpp","origin":"http://127.0.0.1:8178/inference"}}}"#,
             r#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"whisper.cpp","origin":"http://127.0.0.1:8178","concurrency":0}}}"#,
             r#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"whisper.cpp","origin":"http://127.0.0.1:8178","threads":8}}}"#,
+            r#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"openai","base_url":"http://127.0.0.1:8000/v1/","model":"m"}}}"#,
+            r#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"openai","base_url":"http://127.0.0.1:8000/v1?x=1","model":"m"}}}"#,
+            r#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"openai","base_url":"http://127.0.0.1:8000/v1"}}}"#,
+            r#"{"models":{"@cf/openai/whisper-large-v3-turbo":{"engine":"openai","origin":"http://127.0.0.1:8000","model":"m"}}}"#,
         ] {
             assert!(Models::parse(bad.as_bytes(), f).is_err(), "{bad}");
         }
@@ -544,6 +809,7 @@ mod tests {
     fn languages_by_code_and_name() {
         assert_eq!(code_of("en"), Some("en"));
         assert_eq!(code_of("english"), Some("en"));
+        assert_eq!(code_of("English"), Some("en"));
         assert_eq!(code_of("haitian creole"), Some("ht"));
         assert_eq!(code_of("yue"), Some("yue"));
         assert_eq!(code_of("xx"), None);

@@ -878,13 +878,15 @@ class ImagesBindingImpl {
 }
 
 // `ai`: Workers AI. A model the node's operator names (`CELLD_AI_FILE`,
-// ai.rs) is answered by the host from the operator's server, in the
-// catalog's shapes; every other model rejects. `returnRawResponse` answers
-// the Response Workers AI's REST API would give (a refusal by its status);
-// without it, the answer's object, or a rejection. The options that only
-// say where a call is logged (`gateway`, `extraHeaders`, `prefix`, `tags`)
-// are taken and have no effect: a node has no AI Gateway. Those that change
-// what a call does (`queueRequest`, `websocket`) are refused by name.
+// ai.rs) is answered by the host from the endpoint the operator names, in
+// the catalog's shapes; every other model rejects. `returnRawResponse`
+// answers the Response Workers AI would give (a refusal by its status);
+// without it, a JSON answer's object, another's body, or a rejection. The
+// options that only say where a call is logged (`gateway`, `extraHeaders`,
+// `prefix`, `tags`) are taken and have no effect: a node has no AI
+// Gateway. Those that change what a call does (`queueRequest`,
+// `websocket`) are refused by name, and so is a multipart input: celld
+// forwards JSON.
 const __AI_NOT_MODELED = ["queueRequest", "websocket"];
 class Ai {
   async run(model, inputs, options) {
@@ -892,32 +894,40 @@ class Ai {
     for (const key of __AI_NOT_MODELED) {
       if (opts[key]) throw new Error(`celld's Workers AI does not take the option ${key}`);
     }
+    if (inputs?.multipart !== undefined) {
+      throw new Error("celld's Workers AI takes JSON inputs, not a multipart form");
+    }
     let body;
     try {
       body = JSON.stringify(inputs ?? {});
     } catch {
       throw new Error("celld's Workers AI takes JSON inputs");
     }
-    const answer = JSON.parse(await __ai_run(String(model), body));
-    if (answer.code !== undefined) {
-      const error = new Error(answer.message);
+    // ai::frame: the metadata's length, the metadata, the body
+    const framed = await __ai_run(String(model), body);
+    const length = new DataView(framed.buffer, framed.byteOffset, 4).getUint32(0);
+    const meta = JSON.parse(new TextDecoder().decode(framed.subarray(4, 4 + length)));
+    if (meta.code !== undefined) {
+      const error = new Error(meta.message);
       error.name = "AiError";
-      error.code = answer.code;
+      error.code = meta.code;
       throw error;
     }
-    if (opts.returnRawResponse) {
-      return new Response(JSON.stringify(answer.body), {
-        status: answer.status,
-        headers: { "content-type": "application/json" },
-      });
-    }
-    if (answer.status !== 200) {
-      const first = answer.body?.errors?.[0];
-      const error = new Error(`${first?.code ?? answer.status}: ${first?.message ?? "the model refused the call"}`);
+    const response = new Response(framed.subarray(4 + length), { status: meta.status, headers: meta.headers });
+    if (opts.returnRawResponse) return response;
+    const json = (response.headers.get("content-type") ?? "").includes("json");
+    if (meta.status !== 200) {
+      let first;
+      try {
+        first = JSON.parse(await response.text())?.errors?.[0];
+      } catch {
+        // an answer that is not JSON says nothing more
+      }
+      const error = new Error(`${first?.code ?? meta.status}: ${first?.message ?? "the model refused the call"}`);
       error.name = "InferenceUpstreamError";
       throw error;
     }
-    return answer.body;
+    return json ? await response.json() : response.body;
   }
 }
 
