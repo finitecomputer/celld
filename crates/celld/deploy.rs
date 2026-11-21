@@ -669,15 +669,18 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             runtime: decl.runtime.clone(),
         });
     }
-    // Every image a node may be asked to start, each saved once.
-    let mut images: Vec<String> = Vec::new();
-    for spec in &container_specs {
-        for image in spec.image.iter().chain(spec.images.values()) {
-            if !images.contains(image) {
-                images.push(image.clone());
-            }
-        }
-    }
+    // Every image a node may be asked to start, each saved once, but one
+    // the config names by its content key: that image was built and loaded
+    // into the nodes' engines by another machine (`already_resolved`), so
+    // this deploy, which may have no Docker CLI, has nothing to save.
+    let preloaded: BTreeSet<String> = project
+        .containers
+        .iter()
+        .filter(|_| runs_containers)
+        .flat_map(|decl| decl.image.iter().chain(decl.images.values().filter_map(|i| i.image.as_ref())))
+        .filter_map(|image| already_resolved(image))
+        .collect();
+    let images = images_to_save(&container_specs, &preloaded);
     if !container_specs.is_empty() {
         project.metadata["containers"] = json!(container_specs);
     }
@@ -970,6 +973,21 @@ fn pull_image(image: &str, platform: Option<&str>) -> anyhow::Result<String> {
         run_engine(&inspect, "inspect container image")?
     };
     content_reference(&id)
+}
+
+/// The images a deployment saves to the bucket: each image its classes
+/// may start, once, in config order, less those named by a content key
+/// (`preloaded`), which their builder loaded into the engines.
+fn images_to_save(specs: &[crate::container::ContainerSpec], preloaded: &BTreeSet<String>) -> Vec<String> {
+    let mut images: Vec<String> = Vec::new();
+    for spec in specs {
+        for image in spec.image.iter().chain(spec.images.values()) {
+            if !images.contains(image) && !preloaded.contains(image) {
+                images.push(image.clone());
+            }
+        }
+    }
+    images
 }
 
 /// A reference that is already a content key (`celld-image:<sha256>`), as
@@ -3458,6 +3476,35 @@ mod deploy_contract {
 
 // fork: the bindings of services a node does not run, read as Wrangler
 // declares them.
+#[cfg(test)]
+mod preloaded_image_tests {
+    use super::*;
+
+    fn spec(images: &[(&str, &str)]) -> crate::container::ContainerSpec {
+        serde_json::from_value(json!({
+            "class_name": "Computer",
+            "images": images.iter().map(|(n, i)| (n.to_string(), i.to_string())).collect::<BTreeMap<_, _>>(),
+            "scheduling_policy": "durable_object",
+        }))
+        .expect("a container spec")
+    }
+
+    // A deploy from a machine with no Docker CLI (a home in a sandbox) names
+    // an image by its content key: it saves none, since the image's builder
+    // loaded it into the engines. A built image is still saved, once.
+    #[test]
+    fn a_content_key_is_never_saved() {
+        let key = format!("celld-image:{}", "a".repeat(64));
+        let built = format!("celld-image:{}", "b".repeat(64));
+        let specs = [spec(&[("hermes", &key), ("stub", &built)]), spec(&[("again", &built)])];
+        let preloaded: BTreeSet<String> = [key.clone()].into_iter().collect();
+        assert_eq!(images_to_save(&specs, &preloaded), vec![built.clone()]);
+        assert_eq!(already_resolved(&key), Some(key.clone()));
+        assert_eq!(already_resolved("celld-image:short"), None);
+        assert_eq!(images_to_save(&specs, &BTreeSet::new()), vec![key, built], "without it, every image once, in its class's order");
+    }
+}
+
 #[cfg(test)]
 mod stand_in_tests {
     use super::*;
