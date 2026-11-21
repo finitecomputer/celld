@@ -30,8 +30,8 @@ pub use crate::container_krun::{answer_intercepted_websockets, InterceptBody, In
 use anyhow::anyhow;
 use bytes::Bytes;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -207,6 +207,51 @@ const IN_USE_FRESH_MS: u64 = 10_000;
 /// inside this to enforce `sleepAfter`, so this is the backstop for an
 /// object that never wakes, not the policy.
 const DEFAULT_INACTIVITY: Duration = Duration::from_secs(10 * 60);
+
+/// fork: set by a stop that asked to keep its containers
+/// (`/shutdown?handoff=preserve&containers=keep`); see `shutdown`.
+static KEEP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// fork: the stop under way asks to keep this node's containers running.
+pub fn request_keep() {
+    KEEP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// fork: what a preserve stop that kept its containers leaves in the node's
+/// data directory (`shutdown`), for the same node's next start (`connect`).
+const KEPT_MARKER: &str = "containers-kept.json";
+/// The marker's ceiling: a node name and a time fit many times.
+const KEPT_MARKER_BYTES_MAX: u64 = 4096;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Kept {
+    node: String,
+    at_ms: u64,
+}
+
+/// Writes the marker whole or not at all (a rename over a written file).
+fn write_kept(dir: &Path, node: &str, at_ms: u64) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(&Kept { node: node.to_string(), at_ms })?;
+    let partial = dir.join(format!("{KEPT_MARKER}.partial"));
+    std::fs::write(&partial, body)?;
+    std::fs::rename(&partial, dir.join(KEPT_MARKER))?;
+    Ok(())
+}
+
+/// Takes the marker (removed before it is read, so it is used once) and
+/// says whether it kept this node's containers. A marker of another node,
+/// one past its ceiling or one that does not parse keeps nothing.
+fn take_kept(dir: &Path, node: &str) -> bool {
+    let path = dir.join(KEPT_MARKER);
+    let Ok(file) = std::fs::File::open(&path) else { return false };
+    let _ = std::fs::remove_file(&path);
+    let mut body = Vec::new();
+    use std::io::Read as _;
+    if file.take(KEPT_MARKER_BYTES_MAX + 1).read_to_end(&mut body).is_err() || body.len() as u64 > KEPT_MARKER_BYTES_MAX {
+        return false;
+    }
+    serde_json::from_slice::<Kept>(&body).is_ok_and(|kept| kept.node == node)
+}
 
 /// Environment every container sees. The values mirror workerd's local
 /// engine: applications read the names, never the values.
@@ -592,8 +637,8 @@ impl CellContainer {
 pub(crate) trait Backend: Send + Sync {
     /// What the engine is, for messages.
     fn kind(&self) -> &'static str;
-    /// Reap every container of `node` a previous process left behind.
-    async fn reap(&self, node: &str) -> anyhow::Result<()>;
+    /// Reap every container of `node` but those named in `keep`.
+    async fn reap(&self, node: &str, keep: &HashSet<String>) -> anyhow::Result<()>;
     /// What every start needs first (Docker: its bridges and the fence).
     async fn prepare(&self) -> anyhow::Result<()>;
     async fn has_image(&self, image: &str) -> anyhow::Result<bool>;
@@ -619,6 +664,20 @@ pub(crate) trait Backend: Send + Sync {
     /// fork: lets go of what the backend holds outside the engine (the krun
     /// backend's intercept socket), at the node's stop.
     fn close(&self) {}
+
+    /// fork: whether a preserve stop may leave this engine's containers
+    /// running for the same node's next start to adopt (`shutdown`). Only
+    /// an engine that outlives celld and holds its containers by name says
+    /// so: the krun engine. Docker's containers are reaped as before.
+    fn keeps_through_restart(&self) -> bool {
+        false
+    }
+
+    /// fork: ends every connection celld holds into a container (its
+    /// ports' and its execs'), the containers left running. A preserve stop
+    /// does this where it used to destroy them, so that the drain does not
+    /// wait out its deadline on an object's socket into its container.
+    fn detach(&self) {}
 
     /// fork: whether `memory_in_use` reports anything; the node polls it
     /// only then.
@@ -657,6 +716,11 @@ pub struct ContainerEngine {
     /// load the tar once.
     images: Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>,
     cells: Mutex<HashMap<String, Arc<CellContainer>>>,
+    /// fork: where a preserve stop leaves `KEPT_MARKER`.
+    data_dir: PathBuf,
+    /// fork: this start adopted what a preserve stop kept; its sweeper
+    /// destroys any no cell claims within `DEFAULT_INACTIVITY`.
+    adopting: bool,
 }
 
 /// Which engine `CELLD_CONTAINER_ENGINE` names.
@@ -823,7 +887,18 @@ pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
                 ),
                 EngineChoice::None => anyhow::bail!("this node runs no computers"),
             };
-            let engine = Arc::new(ContainerEngine::connect(backend, node, bucket).await?);
+            let engine = Arc::new(ContainerEngine::connect(backend, node, bucket, data_dir).await?);
+            if engine.adopting {
+                // Ends when the engine does (the node's stop drops it).
+                let weak = Arc::downgrade(&engine);
+                asyncrt::spawn(async move {
+                    asyncrt::sleep(DEFAULT_INACTIVITY).await;
+                    if let Some(engine) = weak.upgrade() {
+                        engine.sweep_unclaimed().await;
+                    }
+                })
+                .detach();
+            }
             if engine.backend.reports_memory() {
                 // Ends when the engine does (the node's stop drops it).
                 let weak = Arc::downgrade(&engine);
@@ -851,18 +926,65 @@ pub fn engine_if_ready() -> Option<Arc<ContainerEngine>> {
 /// none of them, and a handoff cut by the deadline leaves cells behind
 /// too; without this their containers ran on until the next start of the
 /// same node reaped them, invisible to the object that owned them.
-pub async fn shutdown() {
+///
+/// fork: `preserve` (the same node starts again at the same address, its
+/// cells with it) that asked to keep its containers (`request_keep`), on
+/// an engine that `keeps_through_restart`, keeps them instead, as
+/// Cloudflare keeps a container through its Worker's restart: it ends
+/// celld's connections into them, leaves `KEPT_MARKER`, and the next start
+/// adopts them, so an awake computer loses nothing to a restart. A preserve
+/// stop that did not ask (`celld dev`'s Ctrl-C, whose node may never start
+/// again) reaps as before, and so does a handoff (the cells leave this
+/// node), which also removes any marker.
+pub async fn shutdown(preserve: bool) {
+    let preserve = preserve && KEEP_REQUESTED.load(Ordering::SeqCst);
+    let data_dir = CONFIG.read().unwrap().as_ref().map(|c| c.data_dir.clone());
+    if !preserve {
+        if let Some(dir) = &data_dir {
+            let _ = std::fs::remove_file(dir.join(KEPT_MARKER));
+        }
+    }
     let Some(engine) = engine_if_ready() else {
+        // Not connected in this life: nothing was adopted, and a marker an
+        // earlier preserve stop left stays for the next start.
         return;
     };
-    if let Err(error) = engine.backend.reap(&engine.node).await {
-        tracing::warn!(
-            event = "container_shutdown_reap_failed",
-            error = %format!("{error:#}"),
-            "containers of this node may still be running"
-        );
+    engine.stop(preserve).await;
+}
+
+impl ContainerEngine {
+    /// `shutdown`'s work on a connected engine.
+    async fn stop(&self, preserve: bool) {
+        if preserve && self.backend.keeps_through_restart() {
+            match write_kept(&self.data_dir, &self.node, crate::ownership_store::now_ms()) {
+                Ok(()) => {
+                    self.backend.detach();
+                    self.backend.close();
+                    tracing::info!(event = "containers_kept", node = %self.node, "containers of this node keep running for its next start");
+                    return;
+                }
+                Err(error) => tracing::warn!(
+                    event = "containers_kept_failed",
+                    error = %format!("{error:#}"),
+                    "the containers of this node are reaped instead"
+                ),
+            }
+        } else if !preserve {
+            let _ = std::fs::remove_file(self.data_dir.join(KEPT_MARKER));
+        }
+        self.reap_all().await;
     }
-    engine.backend.close();
+
+    async fn reap_all(&self) {
+        if let Err(error) = self.backend.reap(&self.node, &HashSet::new()).await {
+            tracing::warn!(
+                event = "container_shutdown_reap_failed",
+                error = %format!("{error:#}"),
+                "containers of this node may still be running"
+            );
+        }
+        self.backend.close();
+    }
 }
 
 /// fork: the internal request that wakes an object whose container's run
@@ -1019,19 +1141,51 @@ impl ContainerEngine {
     /// containers still belong to cells it will own again, and a container
     /// whose object has lost track of it is a leak, so a restart starts
     /// clean. The next `start()` of each object creates a fresh one.
+    ///
+    /// fork: unless the previous process was a preserve stop that kept
+    /// them (`shutdown`): then its cells are this node's again, each
+    /// object's `attach` adopts its container by name, and the sweeper
+    /// (`sweep_unclaimed`) destroys any no cell claims within
+    /// `DEFAULT_INACTIVITY`. The marker is taken first, so a start that
+    /// fails or a second restart without another preserve stop reaps.
     async fn connect(
         backend: Arc<dyn Backend>,
         node: String,
         bucket: Option<crate::bucket::Bucket>,
+        data_dir: PathBuf,
     ) -> anyhow::Result<Self> {
-        backend.reap(&node).await?;
+        let adopting = take_kept(&data_dir, &node) && backend.keeps_through_restart();
+        if adopting {
+            tracing::info!(event = "containers_adopting", node = %node, "this node's kept containers wait for their cells");
+        } else {
+            backend.reap(&node, &HashSet::new()).await?;
+        }
         Ok(Self {
             backend,
             node,
             bucket,
             images: Mutex::new(HashMap::new()),
             cells: Mutex::new(HashMap::new()),
+            data_dir,
+            adopting,
         })
+    }
+
+    /// fork: after an adopting start's window, destroys every container of
+    /// this node no cell has claimed: a kept container whose cell never
+    /// came back is a leak, as `connect` says of every container.
+    pub(crate) async fn sweep_unclaimed(&self) {
+        let claimed: HashSet<String> = self
+            .cells
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|cell| cell.running())
+            .map(|cell| cell.name.clone())
+            .collect();
+        if let Err(error) = self.backend.reap(&self.node, &claimed).await {
+            tracing::warn!(event = "containers_sweep_failed", error = %format!("{error:#}"), "unclaimed containers may still be running");
+        }
     }
 
     /// Make an image present in the engine, loading it from the bucket when
@@ -1889,6 +2043,11 @@ pub(crate) mod tests {
         in_use_meanwhile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// How long a sampled report takes to be answered.
         in_use_delay: Mutex<Option<std::time::Duration>>,
+        /// fork: each reap's kept names, in order.
+        reaped: Mutex<Vec<Vec<String>>>,
+        /// fork: whether it keeps its containers through a restart.
+        keeps: AtomicBool,
+        detached: AtomicBool,
     }
 
     impl Fake {
@@ -1922,8 +2081,15 @@ pub(crate) mod tests {
         fn kind(&self) -> &'static str {
             "fake"
         }
-        async fn reap(&self, _: &str) -> anyhow::Result<()> {
+        async fn reap(&self, _: &str, keep: &HashSet<String>) -> anyhow::Result<()> {
+            self.reaped.lock().unwrap().push(keep.iter().cloned().collect());
             Ok(())
+        }
+        fn keeps_through_restart(&self) -> bool {
+            self.keeps.load(Ordering::SeqCst)
+        }
+        fn detach(&self) {
+            self.detached.store(true, Ordering::SeqCst);
         }
         async fn prepare(&self) -> anyhow::Result<()> {
             Ok(())
@@ -2020,7 +2186,15 @@ pub(crate) mod tests {
     }
 
     async fn an_engine(fake: &Arc<Fake>) -> Arc<ContainerEngine> {
-        Arc::new(ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap())
+        Arc::new(ContainerEngine::connect(fake.clone(), "node-a".into(), None, a_dir()).await.unwrap())
+    }
+
+    /// A data directory of a test's own, left for the temp dir's cleaner.
+    fn a_dir() -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("celld-kept-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn start_img() -> StartParams {
@@ -2052,6 +2226,91 @@ pub(crate) mod tests {
             asyncrt::sleep(Duration::from_millis(1)).await;
         }
         panic!("{n} intercepts were never recorded");
+    }
+
+    // Goal: a preserve stop on an engine that keeps its containers leaves
+    // them running (no reap, celld's connections ended) and its marker;
+    // the same node's next start adopts them, reaping nothing; the marker
+    // is used once, so the start after that reaps (replay). A handoff
+    // stop reaps and removes a marker. Method: the fake engine, its reaps
+    // counted, and the marker on disk.
+    #[test]
+    fn a_preserve_stop_keeps_containers_for_the_next_start() {
+        rt().block_on(async {
+            let fake = Arc::new(Fake::default());
+            fake.keeps.store(true, Ordering::SeqCst);
+            let dir = a_dir();
+            let connect = || ContainerEngine::connect(fake.clone(), "node-a".into(), None, dir.clone());
+            let first = connect().await.unwrap();
+            assert!(!first.adopting);
+            assert_eq!(fake.reaped.lock().unwrap().len(), 1, "a start with no marker reaps");
+            first.stop(true).await;
+            assert_eq!(fake.reaped.lock().unwrap().len(), 1, "a preserve stop destroys nothing");
+            assert!(fake.detached.load(Ordering::SeqCst), "and ends celld's connections into them");
+            assert!(dir.join(KEPT_MARKER).exists());
+            let second = connect().await.unwrap();
+            assert!(second.adopting);
+            assert_eq!(fake.reaped.lock().unwrap().len(), 1, "the next start adopts");
+            assert!(!dir.join(KEPT_MARKER).exists(), "and takes the marker");
+            let third = connect().await.unwrap();
+            assert!(!third.adopting);
+            assert_eq!(fake.reaped.lock().unwrap().len(), 2, "a start after that reaps");
+            third.stop(true).await;
+            third.stop(false).await;
+            assert!(!dir.join(KEPT_MARKER).exists(), "a handoff removes the marker");
+            assert_eq!(fake.reaped.lock().unwrap().len(), 3, "and reaps");
+        });
+    }
+
+    // Goal: only this node's marker keeps anything: another node's, one
+    // that does not parse and one past its ceiling all reap, and are taken;
+    // so does a valid one on an engine that does not keep its containers
+    // (Docker's), and a preserve stop there reaps as before.
+    #[test]
+    fn only_this_nodes_marker_keeps_containers() {
+        rt().block_on(async {
+            for keeps in [true, false] {
+                for body in [
+                    serde_json::to_vec(&Kept { node: "node-b".into(), at_ms: 1 }).unwrap(),
+                    b"{not json".to_vec(),
+                    vec![b' '; KEPT_MARKER_BYTES_MAX as usize + 1],
+                    serde_json::to_vec(&Kept { node: "node-a".into(), at_ms: 1 }).unwrap(),
+                ] {
+                    let fake = Arc::new(Fake::default());
+                    fake.keeps.store(keeps, Ordering::SeqCst);
+                    let dir = a_dir();
+                    std::fs::write(dir.join(KEPT_MARKER), &body).unwrap();
+                    let engine = ContainerEngine::connect(fake.clone(), "node-a".into(), None, dir.clone()).await.unwrap();
+                    let valid = keeps && body.starts_with(b"{\"node\":\"node-a\"");
+                    assert_eq!(engine.adopting, valid, "keeps {keeps}, {:?}", String::from_utf8_lossy(&body[..body.len().min(30)]));
+                    assert_eq!(fake.reaped.lock().unwrap().len(), usize::from(!valid));
+                    assert!(!dir.join(KEPT_MARKER).exists(), "every marker is taken");
+                    if !keeps {
+                        engine.stop(true).await;
+                        assert_eq!(fake.reaped.lock().unwrap().len(), 2, "Docker's preserve stop reaps");
+                        assert!(!dir.join(KEPT_MARKER).exists());
+                    }
+                }
+            }
+        });
+    }
+
+    // Goal: an adopting start's sweep destroys every container of the node
+    // but those a cell has claimed and runs. Method: one claimed cell, the
+    // names the reap keeps.
+    #[test]
+    fn the_sweep_keeps_only_claimed_containers() {
+        rt().block_on(async {
+            let fake = Arc::new(Fake::default());
+            let engine = an_engine(&fake).await;
+            let cell = a_box();
+            let idle = Arc::new(CellContainer { scope: "Box:2".into(), name: container_name("node-a", "Box:2"), ..Arc::try_unwrap(a_box()).ok().unwrap() });
+            cell.state.lock().unwrap().running = true;
+            engine.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+            engine.cells.lock().unwrap().insert(idle.scope.clone(), idle);
+            engine.sweep_unclaimed().await;
+            assert_eq!(fake.reaped.lock().unwrap().last().unwrap(), &vec![cell.name.clone()]);
+        });
     }
 
     // Goal: a running container counts its cap until the engine reports

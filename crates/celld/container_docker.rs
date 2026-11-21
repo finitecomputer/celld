@@ -329,7 +329,7 @@ impl Backend for DockerBackend {
         "Docker"
     }
 
-    async fn reap(&self, node: &str) -> anyhow::Result<()> {
+    async fn reap(&self, node: &str, keep: &std::collections::HashSet<String>) -> anyhow::Result<()> {
         let filters = json!({ "label": [format!("celld.node={node}")] }).to_string();
         let reply = self
             .docker
@@ -348,7 +348,14 @@ impl Backend for DockerBackend {
             .await?;
         let list = reply.json()?;
         for entry in list.as_array().into_iter().flatten() {
-            if let Some(id) = entry.get("Id").and_then(Value::as_str) {
+            let kept = entry
+                .get("Names")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|name| keep.contains(name.trim_start_matches('/')));
+            if let (Some(id), false) = (entry.get("Id").and_then(Value::as_str), kept) {
                 let _ = self
                     .docker
                     .call("DELETE", &format!("/containers/{id}?force=true"), None)
