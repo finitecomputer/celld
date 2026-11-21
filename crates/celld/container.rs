@@ -220,18 +220,87 @@ pub fn request_keep() {
 /// fork: what a preserve stop that kept its containers leaves in the node's
 /// data directory (`shutdown`), for the same node's next start (`connect`).
 const KEPT_MARKER: &str = "containers-kept.json";
-/// The marker's ceiling: a node name and a time fit many times.
-const KEPT_MARKER_BYTES_MAX: u64 = 4096;
+/// The marker's ceiling: every kept container's intercepts fit in it.
+const KEPT_MARKER_BYTES_MAX: u64 = 4 << 20;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Kept {
     node: String,
     at_ms: u64,
+    /// Each kept container and what its intercepts dispatch to: on
+    /// Cloudflare a running container keeps its intercepts through its
+    /// Worker's restart, and the engine still holds their rules by index.
+    #[serde(default)]
+    containers: Vec<KeptContainer>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub(crate) struct KeptContainer {
+    name: String,
+    scope: String,
+    class: String,
+    intercepts: Vec<KeptIntercept>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct KeptIntercept {
+    scheme: String,
+    target: String,
+    script: String,
+    entrypoint: Option<String>,
+    /// The binding's props, base64.
+    props: String,
+}
+
+impl KeptContainer {
+    fn of(cell: &CellContainer) -> KeptContainer {
+        use base64::Engine as _;
+        let state = cell.state.lock().unwrap();
+        KeptContainer {
+            name: cell.name.clone(),
+            scope: cell.scope.clone(),
+            class: cell.spec.class_name.clone(),
+            intercepts: state
+                .intercepts
+                .iter()
+                .map(|i| KeptIntercept {
+                    scheme: i.rule.scheme.to_string(),
+                    target: i.rule.target.clone(),
+                    script: i.route.script.clone(),
+                    entrypoint: i.route.entrypoint.clone(),
+                    props: base64::engine::general_purpose::STANDARD.encode(&i.route.props),
+                })
+                .collect(),
+        }
+    }
+
+    /// Its intercepts again, in order (the engine names each by its index),
+    /// each to the live generation (0: the current one), as a container's
+    /// handler follows its Worker's deploy. One that does not read back
+    /// ends the list: an index after it would name the wrong one.
+    fn intercepts(&self) -> Vec<Intercept> {
+        use base64::Engine as _;
+        let mut out = Vec::with_capacity(self.intercepts.len());
+        for i in &self.intercepts {
+            let scheme = match i.scheme.as_str() {
+                "http" => "http",
+                "https" => "https",
+                _ => break,
+            };
+            let Ok(props) = base64::engine::general_purpose::STANDARD.decode(&i.props) else { break };
+            out.push(Intercept {
+                rule: InterceptRule { scheme, target: i.target.clone() },
+                route: ServiceRoute { generation: 0, script: i.script.clone(), entrypoint: i.entrypoint.clone(), props },
+            });
+        }
+        out
+    }
 }
 
 /// Writes the marker whole or not at all (a rename over a written file).
-fn write_kept(dir: &Path, node: &str, at_ms: u64) -> anyhow::Result<()> {
-    let body = serde_json::to_vec(&Kept { node: node.to_string(), at_ms })?;
+fn write_kept(dir: &Path, node: &str, at_ms: u64, containers: Vec<KeptContainer>) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(&Kept { node: node.to_string(), at_ms, containers })?;
+    anyhow::ensure!(body.len() as u64 <= KEPT_MARKER_BYTES_MAX, "the kept containers' marker is past its ceiling");
     let partial = dir.join(format!("{KEPT_MARKER}.partial"));
     std::fs::write(&partial, body)?;
     std::fs::rename(&partial, dir.join(KEPT_MARKER))?;
@@ -239,18 +308,18 @@ fn write_kept(dir: &Path, node: &str, at_ms: u64) -> anyhow::Result<()> {
 }
 
 /// Takes the marker (removed before it is read, so it is used once) and
-/// says whether it kept this node's containers. A marker of another node,
+/// answers the containers it kept for this node. A marker of another node,
 /// one past its ceiling or one that does not parse keeps nothing.
-fn take_kept(dir: &Path, node: &str) -> bool {
+fn take_kept(dir: &Path, node: &str) -> Option<Vec<KeptContainer>> {
     let path = dir.join(KEPT_MARKER);
-    let Ok(file) = std::fs::File::open(&path) else { return false };
+    let file = std::fs::File::open(&path).ok()?;
     let _ = std::fs::remove_file(&path);
     let mut body = Vec::new();
     use std::io::Read as _;
     if file.take(KEPT_MARKER_BYTES_MAX + 1).read_to_end(&mut body).is_err() || body.len() as u64 > KEPT_MARKER_BYTES_MAX {
-        return false;
+        return None;
     }
-    serde_json::from_slice::<Kept>(&body).is_ok_and(|kept| kept.node == node)
+    serde_json::from_slice::<Kept>(&body).ok().filter(|kept| kept.node == node).map(|kept| kept.containers)
 }
 
 /// Environment every container sees. The values mirror workerd's local
@@ -956,7 +1025,8 @@ impl ContainerEngine {
     /// `shutdown`'s work on a connected engine.
     async fn stop(&self, preserve: bool) {
         if preserve && self.backend.keeps_through_restart() {
-            match write_kept(&self.data_dir, &self.node, crate::ownership_store::now_ms()) {
+            let containers: Vec<KeptContainer> = self.cells.lock().unwrap().values().filter(|cell| cell.running()).map(|cell| KeptContainer::of(cell)).collect();
+            match write_kept(&self.data_dir, &self.node, crate::ownership_store::now_ms(), containers) {
                 Ok(()) => {
                     self.backend.detach();
                     self.backend.close();
@@ -1154,13 +1224,14 @@ impl ContainerEngine {
         bucket: Option<crate::bucket::Bucket>,
         data_dir: PathBuf,
     ) -> anyhow::Result<Self> {
-        let adopting = take_kept(&data_dir, &node) && backend.keeps_through_restart();
+        let kept = take_kept(&data_dir, &node).filter(|_| backend.keeps_through_restart());
+        let adopting = kept.is_some();
         if adopting {
             tracing::info!(event = "containers_adopting", node = %node, "this node's kept containers wait for their cells");
         } else {
             backend.reap(&node, &HashSet::new()).await?;
         }
-        Ok(Self {
+        let engine = Self {
             backend,
             node,
             bucket,
@@ -1168,7 +1239,40 @@ impl ContainerEngine {
             cells: Mutex::new(HashMap::new()),
             data_dir,
             adopting,
-        })
+        };
+        engine.restore(kept.unwrap_or_default(), spec);
+        Ok(engine)
+    }
+
+    /// fork: each kept container's handle again, with its intercepts, so
+    /// its requests reach its object's bindings before the object returns
+    /// (and its first request through them wakes it); the object's
+    /// `attach` then adopts the container on this handle. A container of a
+    /// class the deployment no longer has, or not this node's, is left to
+    /// the sweep.
+    fn restore(&self, kept: Vec<KeptContainer>, spec_of: impl Fn(&str) -> Option<Arc<ContainerSpec>>) {
+        let mut cells = self.cells.lock().unwrap();
+        for k in kept {
+            let Some(spec) = spec_of(&k.class) else { continue };
+            if k.name != container_name(&self.node, &k.scope) {
+                continue;
+            }
+            let state = CellState { intercepts: k.intercepts(), ..CellState::default() };
+            cells.insert(
+                k.scope.clone(),
+                Arc::new(CellContainer {
+                    scope: k.scope,
+                    name: k.name,
+                    spec,
+                    state: Mutex::new(state),
+                    processes: Mutex::new(Vec::new()),
+                    exit: watch::channel(None).0,
+                    outcomes: Mutex::new(BTreeMap::new()),
+                    up: watch::channel(0).0,
+                    intercepts_sent: tokio::sync::Mutex::new(()),
+                }),
+            );
+        }
     }
 
     /// fork: after an adopting start's window, destroys every container of
@@ -2271,10 +2375,10 @@ pub(crate) mod tests {
         rt().block_on(async {
             for keeps in [true, false] {
                 for body in [
-                    serde_json::to_vec(&Kept { node: "node-b".into(), at_ms: 1 }).unwrap(),
+                    serde_json::to_vec(&Kept { node: "node-b".into(), at_ms: 1, containers: vec![] }).unwrap(),
                     b"{not json".to_vec(),
                     vec![b' '; KEPT_MARKER_BYTES_MAX as usize + 1],
-                    serde_json::to_vec(&Kept { node: "node-a".into(), at_ms: 1 }).unwrap(),
+                    serde_json::to_vec(&Kept { node: "node-a".into(), at_ms: 1, containers: vec![] }).unwrap(),
                 ] {
                     let fake = Arc::new(Fake::default());
                     fake.keeps.store(keeps, Ordering::SeqCst);
@@ -2292,6 +2396,56 @@ pub(crate) mod tests {
                     }
                 }
             }
+        });
+    }
+
+    // Goal: a kept container's intercepts survive the restart: the marker
+    // carries them, the next start restores them on a handle of their own,
+    // so `intercept_route` answers each index as before (to the live
+    // generation) before the object returns, and its `attach` keeps them.
+    // An entry that does not read back cuts the list there: a later index
+    // would name the wrong intercept. Method: a running cell with two
+    // intercepts through a kept stop and an adopting start.
+    #[test]
+    fn a_kept_containers_intercepts_survive_the_restart() {
+        rt().block_on(async {
+            let fake = Arc::new(Fake::default());
+            fake.keeps.store(true, Ordering::SeqCst);
+            let dir = a_dir();
+            let first = ContainerEngine::connect(fake.clone(), "node-a".into(), None, dir.clone()).await.unwrap();
+            let cell = a_box();
+            {
+                let mut state = cell.state.lock().unwrap();
+                state.running = true;
+                state.intercepts = vec![
+                    Intercept { rule: http("api.internal"), route: ServiceRoute { generation: 7, script: "worker".into(), entrypoint: Some("Egress".into()), props: b"{\"id\":1}".to_vec() } },
+                    Intercept { rule: InterceptRule { scheme: "https", target: "models.internal".into() }, route: a_route() },
+                ];
+            }
+            first.cells.lock().unwrap().insert(cell.scope.clone(), cell.clone());
+            first.stop(true).await;
+            let mut kept: Kept = serde_json::from_slice(&std::fs::read(dir.join(KEPT_MARKER)).unwrap()).unwrap();
+            assert_eq!(kept.containers.len(), 1);
+            let second = ContainerEngine::connect(fake.clone(), "node-a".into(), None, dir.clone()).await.unwrap();
+            assert!(second.adopting);
+            second.restore(kept.containers.clone(), |_| Some(cell.spec.clone()));
+            let (route, scope, _) = second.intercept_route(&cell.name, 0).expect("intercept 0 restored");
+            assert_eq!(scope, cell.scope);
+            assert_eq!((route.generation, route.script.as_str(), route.entrypoint.as_deref(), route.props.as_slice()), (0, "worker", Some("Egress"), &b"{\"id\":1}"[..]));
+            assert!(second.intercept_route(&cell.name, 1).is_some());
+            assert!(second.intercept_route(&cell.name, 2).is_none());
+            assert!(!second.cell(&cell.scope).unwrap().running(), "claimed only when its object attaches");
+            // A damaged first entry restores nothing after it.
+            kept.containers[0].intercepts[0].scheme = "gopher".into();
+            let third = ContainerEngine::connect(fake.clone(), "node-a".into(), None, a_dir()).await.unwrap();
+            third.restore(kept.containers.clone(), |_| Some(cell.spec.clone()));
+            assert!(third.intercept_route(&cell.name, 0).is_none() && third.intercept_route(&cell.name, 1).is_none());
+            // Another node's name, or a class the deployment lacks, is left.
+            let fourth = ContainerEngine::connect(fake.clone(), "node-b".into(), None, a_dir()).await.unwrap();
+            fourth.restore(kept.containers.clone(), |_| Some(cell.spec.clone()));
+            assert!(fourth.cell(&cell.scope).is_none());
+            fourth.restore(kept.containers, |_| None);
+            assert!(fourth.cell(&cell.scope).is_none());
         });
     }
 
