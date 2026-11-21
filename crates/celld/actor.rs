@@ -474,6 +474,9 @@ pub enum Message {
     /// request shell has already stopped admission; this closes wake and
     /// service paths that do not pass through the HTTP gate.
     BeginPreserve,
+    /// The preserve drain has ended: refuse every further request, a Queue
+    /// broker's too, while the process seals its durability and exits.
+    EndPreserveDrain,
     /// The node adopted a new application generation. Resident cells on an
     /// older one move to it at a safe point, or by force after `max_age_ms`;
     /// cells of an eager class move at once.
@@ -2042,6 +2045,14 @@ pub struct Actor {
     timer_slots: TimerSlots<()>,
     started: bool,
     preserving: bool,
+    /// Set by `EndPreserveDrain`, after which a preserve refuses every request.
+    preserve_drain_ended: bool,
+}
+
+/// Whether `cell` is a Queue broker (`engine_api::queue_cell_scope`).
+fn is_queue_broker(cell: &str) -> bool {
+    cell.split_once(':')
+        .is_some_and(|(class, _)| class == crate::deploy::QUEUE_CLASS)
 }
 
 /// One handoff pipeline step whose dispatch-to-completion time is measured.
@@ -2617,6 +2628,7 @@ impl Actor {
             timer_slots: TimerSlots::default(),
             started: false,
             preserving: false,
+            preserve_drain_ended: false,
         })
     }
 
@@ -2771,9 +2783,31 @@ impl Actor {
                 self.preserving = true;
                 self.drive(Event::BeginPreserve, out);
             }
-            Message::Request { reply, .. } if self.preserving => {
+            // One exception while the drain runs: a Queue broker resident
+            // here. A send is how a fetch still answering hands work on (a
+            // charge, a job), and its producer rarely retries: refused, the
+            // message is gone. The broker takes it as before the drain and
+            // the preserved restart keeps it; a settlement from a batch
+            // still running lands the same way. It starts no work: the
+            // broker's dispatch alarm waits for the next process. A broker
+            // to activate, a handoff, and a request after the drain ended
+            // (`EndPreserveDrain`) are refused like every other cell's.
+            Message::Request {
+                cell,
+                capacity_handoff,
+                handoff_accept,
+                reply,
+                ..
+            } if self.preserving
+                && (self.preserve_drain_ended
+                    || capacity_handoff
+                    || handoff_accept.is_some()
+                    || !is_queue_broker(&cell)
+                    || !matches!(self.state.phase(&cell), Some(Phase::Resident { .. }))) =>
+            {
                 let _ = reply.send(Err(RequestError::NodeFenced));
             }
+            Message::EndPreserveDrain => self.preserve_drain_ended = true,
             Message::Request {
                 request,
                 cell,
