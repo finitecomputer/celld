@@ -2922,6 +2922,16 @@ async fn handle_internal(
             } else {
                 ShutdownMode::Handoff
             };
+            // fork: a restart of the same node that keeps its containers
+            // running for its next start (celld::container::shutdown).
+            if preserve_ownership
+                && request
+                    .uri()
+                    .query()
+                    .is_some_and(|query| query.split('&').any(|part| part == "containers=keep"))
+            {
+                celld::container::request_keep();
+            }
             let _ = shutdown.send(mode);
             response(StatusCode::OK, "{\"ok\":true}")
         }
@@ -5291,7 +5301,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 && core_drained
             {
                 containers_reaped = true;
-                before_process_deadline(handoff_deadline, celld::container::shutdown()).await;
+                before_process_deadline(handoff_deadline, celld::container::shutdown(true)).await;
                 continue;
             }
             celld::asyncrt::select! {
@@ -5495,8 +5505,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // shell.
     // The backstop for a handoff cut by its deadline: a cell left behind
     // must not leave its container running until the next start of this
-    // node reaps it. Idempotent after the preserve drain's own call.
-    before_process_deadline(process_deadline, celld::container::shutdown()).await;
+    // node reaps it. Idempotent after the preserve drain's own call, which
+    // keeps the containers where the engine can (fork: `shutdown`).
+    before_process_deadline(
+        process_deadline,
+        celld::container::shutdown(shutdown_mode == ShutdownMode::Preserve),
+    )
+    .await;
     let flush_connections = async {
         while drain_connections.next().await.is_some() {}
         while connections.next().await.is_some() {}

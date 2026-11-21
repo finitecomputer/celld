@@ -193,7 +193,7 @@ impl Backend for KrunBackend {
         "krun"
     }
 
-    async fn reap(&self, node: &str) -> anyhow::Result<()> {
+    async fn reap(&self, node: &str, keep: &std::collections::HashSet<String>) -> anyhow::Result<()> {
         let list = self
             .api
             .expect("GET", "/v1/containers", None, "list containers")
@@ -202,7 +202,7 @@ impl Backend for KrunBackend {
         let prefix = node_prefix(node);
         for entry in list.as_array().into_iter().flatten() {
             if let Some(name) = entry.get("name").and_then(Value::as_str) {
-                if name.starts_with(&prefix) {
+                if name.starts_with(&prefix) && !keep.contains(name) {
                     let _ = self
                         .api
                         .call("POST", &format!("/v1/containers/{name}/destroy"), Some(json!({})))
@@ -389,7 +389,11 @@ impl Backend for KrunBackend {
         let exit = watch::channel::<Option<Result<i64, String>>>(None).0;
         let exit_ = exit.clone();
         asyncrt::spawn(async move {
-            let result = pump(read, stdout_tx, stderr_tx).await;
+            let mut detach = DETACH.subscribe();
+            let result = tokio::select! {
+                result = pump(read, stdout_tx, stderr_tx) => result,
+                _ = detach.wait_for(|d| *d) => Err("the node stopped; the process may still run".to_string()),
+            };
             exit_.send_replace(Some(result));
         })
         .detach();
@@ -449,6 +453,16 @@ impl Backend for KrunBackend {
 
     fn close(&self) {
         let _ = std::fs::remove_file(&self.intercepts);
+    }
+
+    /// The engine runs its VMs apart from celld and holds them by name, so
+    /// the same node's next start finds each again (`attach`).
+    fn keeps_through_restart(&self) -> bool {
+        true
+    }
+
+    fn detach(&self) {
+        DETACH.send_replace(true);
     }
 
     fn follow_output(&self, name: &str, cell: &str, run: u64, from_now: bool) -> Option<crate::container::OutputEnd> {
@@ -852,6 +866,11 @@ impl ExecIo for KrunExec {
     }
 }
 
+/// fork: set once by a preserve stop that keeps the node's containers
+/// (`Backend::detach`): every port connection and exec stream celld holds
+/// into a container ends, the container left running.
+static DETACH: std::sync::LazyLock<watch::Sender<bool>> = std::sync::LazyLock::new(|| watch::channel(false).0);
+
 /// A loopback listener per port of one container, made on first use; each
 /// connection takes a socket from the engine's `ports.sock` and is spliced
 /// to it.
@@ -899,9 +918,13 @@ impl PortForwarder for Forwarder {
                     // A port nothing listens on yet: the connection closes,
                     // which `fetch` reports as not listening, and the
                     // containers library retries.
+                    let mut detach = DETACH.subscribe();
                     if let Ok(mut guest) = port_connect(&ports, &name, port).await {
                         let _ = client.set_nodelay(true);
-                        let _ = tokio::io::copy_bidirectional(&mut client, &mut guest).await;
+                        tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut client, &mut guest) => {}
+                            _ = detach.wait_for(|d| *d) => {}
+                        }
                     }
                 });
             }
