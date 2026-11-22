@@ -355,7 +355,8 @@ struct Live {
     pending: Mutex<Vec<Pending>>,
     next_ticket: AtomicU64,
     committed: tokio::sync::watch::Sender<u64>,
-    chain: tokio::sync::Mutex<Chain>,
+    /// Held by the commit's leader, on a task of its own (`commit`).
+    chain: Arc<tokio::sync::Mutex<Chain>>,
     poisoned: Mutex<Option<SealError>>,
     names: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -383,6 +384,8 @@ pub struct Core {
     key: MasterKey,
     records: RecordKey,
     live: tokio::sync::OnceCell<Arc<Live>>,
+    /// This store itself, for the commit's leader's task.
+    me: std::sync::Weak<Core>,
 }
 
 impl fmt::Debug for SealedStore {
@@ -407,7 +410,7 @@ impl SealedStore {
         key: MasterKey,
     ) -> SealedStore {
         let records = key.records();
-        SealedStore(Arc::new(Core { inner, inner_cas, counter, counter_path, root, key, records, live: tokio::sync::OnceCell::new() }))
+        SealedStore(Arc::new_cyclic(|me| Core { inner, inner_cas, counter, counter_path, root, key, records, live: tokio::sync::OnceCell::new(), me: me.clone() }))
     }
 }
 
@@ -651,8 +654,12 @@ impl Core {
 
     /// Returns once a commit including `ticket` has reached the counter. The
     /// first caller to find no commit running leads one for everything
-    /// queued; the others wait for it.
-    async fn commit(&self, live: &Live, ticket: u64) -> object_store::Result<()> {
+    /// queued; the others wait for it. The leader's work runs on a task of
+    /// its own: a caller that goes away mid-commit never cuts it short, so
+    /// a commit is never left between the counter and its journal record (a
+    /// record lost there was a hole every later start refused) or with the
+    /// counter written and the chain not told (a fenced store).
+    async fn commit(&self, live: &Arc<Live>, ticket: u64) -> object_store::Result<()> {
         let mut committed = live.committed.subscribe();
         loop {
             if *committed.borrow_and_update() >= ticket {
@@ -662,7 +669,7 @@ impl Core {
                 return Err(sealed_error(poison));
             }
             let chain = crate::asyncrt::select! {
-                chain = live.chain.lock() => Some(chain),
+                chain = live.chain.clone().lock_owned() => Some(chain),
                 changed = committed.changed() => {
                     let _ = changed;
                     None
@@ -672,12 +679,13 @@ impl Core {
                 if *committed.borrow_and_update() >= ticket {
                     return Ok(());
                 }
-                self.lead(live, chain).await?;
+                let (core, live) = (self.me.upgrade().expect("a store answering a call is alive"), live.clone());
+                crate::asyncrt::spawn(async move { core.lead(&live, chain).await }).await.map_err(|panic| generic(format!("the commit's leader: {panic}")))??;
             }
         }
     }
 
-    async fn lead(&self, live: &Live, mut chain: tokio::sync::MutexGuard<'_, Chain>) -> object_store::Result<()> {
+    async fn lead(&self, live: &Live, mut chain: tokio::sync::OwnedMutexGuard<Chain>) -> object_store::Result<()> {
         // The last batch's journal record, before the counter forgets it.
         self.persist_journal(&mut chain).await?;
         let drained: Vec<Pending> = {
@@ -714,6 +722,7 @@ impl Core {
         };
         chain.head = next;
         chain.token = token;
+        assert!(chain.journal_due.is_none(), "the last batch's record is in the bucket before the next commit");
         chain.journal_due = Some((next.seq, bytes));
         chain.since_snapshot += 1;
         live.committed.send_modify(|watermark| *watermark = (*watermark).max(last_ticket));
@@ -729,14 +738,14 @@ impl Core {
         Ok(())
     }
 
+    /// The last batch's journal record into the bucket. It stays due until
+    /// the bucket has it, so a write that fails, or is cut short, is written
+    /// by the next commit before its own.
     async fn persist_journal(&self, chain: &mut Chain) -> object_store::Result<()> {
-        if let Some((seq, bytes)) = chain.journal_due.take() {
-            let sealed = self.records.seal("journal", &bytes);
-            if let Err(error) = self.inner.put(&self.journal_path(seq), sealed.into()).await {
-                chain.journal_due = Some((seq, bytes));
-                return Err(error);
-            }
-        }
+        let Some((seq, bytes)) = chain.journal_due.as_ref() else { return Ok(()) };
+        let (path, sealed) = (self.journal_path(*seq), self.records.seal("journal", bytes));
+        self.inner.put(&path, sealed.into()).await?;
+        chain.journal_due = None;
         Ok(())
     }
 
@@ -868,7 +877,7 @@ impl Live {
             pending: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(0),
             committed: tokio::sync::watch::channel(0).0,
-            chain: tokio::sync::Mutex::new(chain),
+            chain: Arc::new(tokio::sync::Mutex::new(chain)),
             poisoned: Mutex::new(None),
             names: Mutex::new(HashMap::new()),
         }
