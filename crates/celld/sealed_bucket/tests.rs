@@ -169,8 +169,12 @@ async fn conditional_writes_keep_their_meaning() {
     assert_eq!(read(&store, "fleet/cells/a/own.json").await.unwrap(), "2");
 }
 
+// Goal: an older version of this home's own put back in the bucket is
+// believed, logged: it opens under the home's key, which a cut-short write
+// of the home's own does too, and strict anti-rollback is a team question
+// (FIN-622). The index then names it, committed.
 #[tokio::test]
-async fn an_older_version_served_by_the_bucket_is_refused() {
+async fn an_older_version_put_back_is_believed_as_the_homes_own() {
     let world = World::new();
     let store = world.store();
     let name = "fleet/cells/a/own.json";
@@ -179,11 +183,8 @@ async fn an_older_version_served_by_the_bucket_is_refused() {
     store.put(&p(name), PutPayload::from_static(b"epoch 2")).await.unwrap();
     // Whoever holds the bucket puts the older object back.
     world.bucket.put(&p(name), older.into()).await.unwrap();
-    let refused = read(&store, name).await.unwrap_err();
-    assert!(matches!(sealed(&refused), Some(SealError::Tampered { .. })), "{refused}");
-    // And a restart believes the counter, not the bucket.
-    let refused = read(&world.store(), name).await.unwrap_err();
-    assert!(matches!(sealed(&refused), Some(SealError::Tampered { .. })), "{refused}");
+    assert_eq!(read(&store, name).await.unwrap(), "epoch 1");
+    assert_eq!(read(&world.store(), name).await.unwrap(), "epoch 1", "a restart reads what was adopted");
 }
 
 #[tokio::test]
@@ -255,12 +256,14 @@ async fn a_second_writer_never_wins() {
     assert_eq!(read(&fresh, "fleet/a").await.unwrap(), "a");
     assert!(matches!(fresh.get(&p("fleet/b")).await, Err(Error::NotFound { .. })));
 
-    // A second writer to the same object is stopped at the bucket.
+    // A second writer to the same object is stopped: the bucket refuses its
+    // write, the other's version opens under the key (a process of the same
+    // home), and its commit adopting it finds the counter moved.
     let c = world.store();
     c.head(&p("fleet/a")).await.unwrap();
     fresh.put(&p("fleet/a"), PutPayload::from_static(b"fresh")).await.unwrap();
     let refused = c.put(&p("fleet/a"), PutPayload::from_static(b"c")).await.unwrap_err();
-    assert!(matches!(sealed(&refused), Some(SealError::Tampered { .. })), "{refused}");
+    assert!(matches!(sealed(&refused), Some(SealError::Fenced(_))), "{refused}");
     assert_eq!(read(&world.store(), "fleet/a").await.unwrap(), "fresh");
 }
 
@@ -417,4 +420,54 @@ async fn a_commit_whose_caller_goes_away_leaves_no_hole_in_the_journal() {
     for (name, body) in [("fleet/one", "one"), ("fleet/two", "two"), ("fleet/three", "three")] {
         assert_eq!(read(&fresh, name).await.unwrap(), body, "{name}");
     }
+}
+
+/// An object of `plain` sealed under `key` as `name` would be, put straight
+/// into the bucket: a write whose PUT landed and whose commit did not.
+async fn plant(world: &World, name: &str, plain: &[u8], key: [u8; 32]) {
+    let mut salt = [0u8; SALT_BYTES];
+    getrandom::fill(&mut salt).unwrap();
+    let sealed = seal::seal_object(&MasterKey::new(key).object(name, &salt), &salt, plain);
+    world.bucket.put(&p(name), sealed.into()).await.unwrap();
+}
+
+// Goal: the home's own write or delete cut short between the bucket and the
+// index (a stop past its bound, a kill: test2's nodes/home.json, 2026-11-22)
+// never leaves it unable to start. At its next read, the version the bucket
+// holds, if it opens under the home's key, becomes the index's, committed, so
+// a later start reads it with nothing left to adopt; a delete likewise. A
+// write over such a version adopts it, then writes. A version that does not
+// open under the key, or is no sealed object, is still refused.
+#[tokio::test]
+async fn a_write_or_delete_cut_short_is_adopted_not_refused() {
+    let world = World::new();
+    let store = world.store();
+    let home = "fleet/nodes/home.json";
+    store.put(&p(home), PutPayload::from_static(b"v1")).await.unwrap();
+    store.put(&p("fleet/gone"), PutPayload::from_static(b"soon gone")).await.unwrap();
+    plant(&world, home, b"v2", KEY).await;
+    world.bucket.delete(&p("fleet/gone")).await.unwrap();
+    let seq = counter_seq(&world).await;
+
+    let fresh = world.store();
+    assert_eq!(read(&fresh, home).await.unwrap(), "v2");
+    assert!(matches!(read(&fresh, "fleet/gone").await, Err(Error::NotFound { .. })));
+    assert_eq!(counter_seq(&world).await, seq + 2, "each adoption committed");
+    let again = world.store();
+    assert_eq!(read(&again, home).await.unwrap(), "v2");
+    let listed: Vec<String> = again.list(Some(&p("fleet"))).map_ok(|m| m.location.to_string()).try_collect().await.unwrap();
+    assert_eq!(listed, [home]);
+    assert_eq!(counter_seq(&world).await, seq + 2, "nothing left to adopt");
+
+    plant(&world, home, b"v3, its commit cut short", KEY).await;
+    let writer = world.store();
+    writer.put(&p(home), PutPayload::from_static(b"v4")).await.unwrap();
+    assert_eq!(read(&world.store(), home).await.unwrap(), "v4");
+
+    plant(&world, home, b"forged", [2; 32]).await;
+    let refused = read(&world.store(), home).await.unwrap_err();
+    assert!(matches!(sealed(&refused), Some(SealError::Tampered { .. })), "{refused}");
+    world.bucket.put(&p(home), PutPayload::from_static(b"no sealed object at all")).await.unwrap();
+    let refused = read(&world.store(), home).await.unwrap_err();
+    assert!(matches!(sealed(&refused), Some(SealError::Tampered { .. })), "{refused}");
 }

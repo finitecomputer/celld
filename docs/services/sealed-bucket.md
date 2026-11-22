@@ -19,7 +19,9 @@ an ordinary host, whoever reads the node's memory reads the key.
 | An object's attributes (content type, R2 custom metadata) | readable | in the sealed index, not on the object |
 | The deployment, ownership records, the peer secret | readable | sealed like everything else |
 | Object names, sizes and write times | visible | **still visible** |
-| An older object put back, or a write hidden | believed | refused |
+| An object's write or delete cut short (a stop past its bound, a kill) | n/a | adopted at its next read, logged |
+| An older object of the home's own put back | believed | believed, logged (anti-rollback: a team question, FIN-622) |
+| A commit hidden, or the bucket rolled back whole | believed | refused |
 | A second node writing the same bucket | can win | fenced; it writes nothing more |
 
 Names stay plain: a listing and a range read need them. They say which
@@ -66,6 +68,27 @@ already has a file can tell whether a fragment stores it.
   index holds, and every commit on the counter's last ETag. A second
   process loses one of the two, and then refuses every further call,
   reads included, since its index is stale.
+
+## A home's own interrupted work
+
+A home must never be left unable to start by its own crash, its own stop or
+its own write cut short. An object's write is its PUT to the bucket, then
+its commit (the index's entry, the counter); a delete is the reverse order.
+A stop or a kill between the two leaves the bucket holding a version the
+index never named, or none. The next read of that name finds the bucket's
+version and checks it: a sealed object whose header's salt and whose first
+and last chunks open under the home's key for that name is the home's own,
+and it is adopted, committed and logged (`sealed_bucket_adopted_version`);
+a missing one is the delete, likewise (`sealed_bucket_adopted_delete`). Its
+attributes went with its commit, so the last ones the index held stand. A
+write that finds such a version in its way adopts it, then writes. A version
+that does not open under the key is refused, as before: only the key's
+holder writes a version that opens. `celld seal-bucket check` reads every
+object, so it adopts them too, and counts them.
+
+A commit's leader runs on a task of its own, and a commit's journal record
+stays due until the bucket has it, so no caller that goes away leaves a
+hole in the journal.
 
 ## Configuration
 
@@ -116,6 +139,9 @@ only once the node has served from the sealed form.
 
 ## What it does not protect
 
+- **An older version of an object put back.** It opens under the key, as
+  the home's own write cut short does, so it is believed (and logged). The
+  counter still refuses a commit hidden or the whole bucket rolled back.
 - **A holder of both buckets.** The provider, or the administrators of a
   project that holds both the fleet bucket and the counter, can roll both
   back to an earlier moment together, and a start then believes the
