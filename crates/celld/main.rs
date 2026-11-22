@@ -3801,10 +3801,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // The shared fleet sample's interval: the balancing interval, or the
     // format gate's when balancing is off. Every reader of the sample, the
     // balancing tick, placement and recruitment, judges freshness by it.
+    // A node with balancing off may sample less often
+    // (CELLD_FLEET_SAMPLE_MS): a single node's fleet is itself, so each
+    // sample is a bucket write that tells no one anything new, and the
+    // format gate judges a view at the instant it was taken.
     let fleet_sample_ms = if rebalance_interval_ms > 0 {
         rebalance_interval_ms
     } else {
-        FORMAT_GATE_SAMPLE_MS
+        celld::env_vars::positive::<u64>("CELLD_FLEET_SAMPLE_MS")?.unwrap_or(FORMAT_GATE_SAMPLE_MS)
     };
     let max_releases = celld::env_vars::positive::<usize>("CELLD_RELEASES")?
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RELEASES);

@@ -265,6 +265,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_TOKIO_THREADS",
         "CELLD_TTL_MS",
         "CELLD_WAKER_TICK_MS",
+        "CELLD_FLEET_SAMPLE_MS",
     ] {
         positive::<u64>(name)?;
     }
