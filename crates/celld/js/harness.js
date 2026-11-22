@@ -1767,15 +1767,22 @@ class DurableObjectStorage {
   }
   async put(k, val, options) {
     this._assertTransactionActive("put");
-    // `allowUnconfirmed`: written after every put queued before it, and
-    // waited on by no gate while it trails (storage.rs `put_unconfirmed`).
-    // A put in a transaction, or of many keys, keeps the default.
+    // `allowUnconfirmed`: written now, in this turn, after every put queued
+    // before it, and waited on by no gate while it trails (storage.rs
+    // `put_unconfirmed`). A put of many keys, or one made while any
+    // transaction is open (its commit is what a gate waits on), keeps the
+    // default. So does a value only the default path can store (a stub).
+    const root = this._transactionRoot;
     if (options != null && options.allowUnconfirmed === true &&
-        typeof k === "string" && !this._transactionControl) {
-      await Promise.resolve();
-      if (!this._flushPendingPuts()) return;
-      __storage_put_unconfirmed(this._scope, k, val);
-      return;
+        typeof k === "string" && !this._transactionControl &&
+        root._activeSyncTransaction === null && root._activeTransaction === null &&
+        this._flushPendingPuts()) {
+      try {
+        __storage_put_unconfirmed(this._scope, k, val);
+        return;
+      } catch (_) {
+        // The default path below stores it, or throws the same error.
+      }
     }
     if (typeof k === "string") {
       try {

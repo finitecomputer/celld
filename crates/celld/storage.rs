@@ -89,6 +89,11 @@ struct OpenCell {
     /// read-only answer reports what it observed only above it, and a reader
     /// on a cell no handler has written asks for no proof.
     published_position: Option<u64>,
+    /// Its trailing run of writes made with `allowUnconfirmed` (Cloudflare's
+    /// option: a write the object's outgoing messages need not wait for):
+    /// the position before the run's first and after its last
+    /// (`put_unconfirmed`). It goes with the connection.
+    unconfirmed: Option<(u64, u64)>,
 }
 
 enum StorageBacking {
@@ -530,6 +535,11 @@ mod unconfirmed_tests {
         assert!(after > confirmed, "a confirmed put after them is waited on, and they with it");
         super::put_unconfirmed(scope, "count", &value(5)).unwrap();
         assert_eq!(super::write_position(scope).unwrap(), Some(after), "a later run floors to the confirmed write before it");
+        // the run goes with the connection: a reopened cell waits for all of it
+        super::close(scope);
+        super::open(scope, dir.join("cell.sqlite").to_str().unwrap()).unwrap();
+        let reopened = super::with(scope, |c| super::fingerprint(scope, c));
+        assert_eq!(super::write_position(scope).unwrap(), reopened, "a reopened cell has no trailing run");
         super::close(scope);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -912,6 +922,7 @@ fn finish_open(
                 replicated_wake,
                 backing,
                 published_position: None,
+                unconfirmed: None,
             },
         )
     });
@@ -936,7 +947,6 @@ pub(crate) fn embedded_facets(root: &str) -> Vec<String> {
 /// Drop `scope`'s connection (evict) so the replicator can release the
 /// file.
 pub fn close(scope: &str) {
-    unconfirmed(|runs| runs.borrow_mut().remove(scope));
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
@@ -1352,44 +1362,39 @@ pub fn write_position(scope: &str) -> anyhow::Result<Option<u64>> {
     .transpose()?;
     // the cell's trailing writes made with `allowUnconfirmed` are none a gate
     // waits on: while nothing has written since, its position is the one
-    // before them
-    Ok(at.map(|position| {
-        unconfirmed(|runs| match runs.borrow().get(scope) {
-            Some(&(before, after)) if after == position => before,
-            _ => position,
-        })
+    // before them. A later write of any other kind moves the position past
+    // the run's end, and every gate waits for all of it again, in the WAL's
+    // order.
+    let run = dbs(|d| d.borrow().get(scope).and_then(|cell| cell.unconfirmed));
+    Ok(at.map(|position| match run {
+        Some((before, after)) if after == position => before,
+        _ => position,
     }))
-}
-
-thread_local! {
-    /// Per cell, its trailing run of writes made with `allowUnconfirmed`
-    /// (Cloudflare's option: a write the object's outgoing messages need not
-    /// wait for): the position before the run's first and after its last.
-    /// A later write of any other kind moves the position past the run's
-    /// end, and every gate waits for all of it again, in the WAL's order.
-    static UNCONFIRMED: RefCell<HashMap<String, (u64, u64)>> = RefCell::new(HashMap::new());
-}
-
-fn unconfirmed<R>(f: impl FnOnce(&RefCell<HashMap<String, (u64, u64)>>) -> R) -> R {
-    UNCONFIRMED.with(f)
 }
 
 /// `put` with `allowUnconfirmed`: written now, as `put_serialized` writes,
 /// and kept out of every gate's position while it trails (`write_position`).
+/// The run grows only by what this connection wrote: when another
+/// connection's commit (the data version) or a schema change (the cookie)
+/// lands between the two samples, there is no run, and every gate waits for
+/// everything, as for any write.
 pub fn put_unconfirmed(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()> {
-    let raw = |scope: &str| with(scope, |c| fingerprint(scope, c));
-    let before = raw(scope);
+    let parts = |scope: &str| with(scope, |c| (total_changes(c), data_version(c), schema_cookie(scope, c)));
+    let before = parts(scope);
     put_serialized(scope, key, value)?;
-    if let (Some(before), Some(after)) = (before, raw(scope)) {
-        unconfirmed(|runs| {
-            let mut runs = runs.borrow_mut();
-            let start = match runs.get(scope) {
-                Some(&(start, end)) if end == before => start,
-                _ => before,
+    let after = parts(scope);
+    let run = match (before, after) {
+        (Some((tc0, dv0, sc0)), Some((tc1, dv1, sc1))) if dv0 == dv1 && sc0 == sc1 && tc1 > tc0 => Some((tc0 + dv0 + sc0, tc1 + dv1 + sc1)),
+        _ => None,
+    };
+    dbs(|d| {
+        if let Some(cell) = d.borrow_mut().get_mut(scope) {
+            cell.unconfirmed = match (run, cell.unconfirmed) {
+                (Some((start, end)), Some((first, last))) if last == start => Some((first, end)),
+                (run, _) => run,
             };
-            runs.insert(scope.to_string(), (start, after));
-        });
-    }
+        }
+    });
     Ok(())
 }
 
