@@ -542,7 +542,7 @@ impl Core {
         if entries.len() > ENTRIES_MAX {
             return Err(sealed_error(SealError::Refused(format!("the index holds {} objects, past {ENTRIES_MAX}", entries.len()))));
         }
-        let journal_due = (target.seq > 0).then(|| (target.seq, last_batch));
+        let journal_due = (target.seq > 0).then_some((target.seq, last_batch));
         Ok(Live::new(entries, Chain { head: target, token, journal_due, since_snapshot: 0 }))
     }
 

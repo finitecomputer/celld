@@ -56,6 +56,12 @@ already has a file can tell whether a fragment stores it.
   the counter's exact hash. A bucket rolled back, a journal record hidden,
   or a counter removed while the bucket holds sealed history all refuse
   the start.
+- **Every client of the bucket.** The node's bucket and its cells'
+  replication (their SQLite pages, `cells/<cell>/ltx/…`) share one sealed
+  store per bucket and prefix in the process; a node with
+  `CELLD_BUCKET_SEAL` set whose replication finds no sealed store refuses
+  to start rather than write a page in the clear. Another program writing
+  the same bucket (not celld) is not sealed by this.
 - **Two writers.** Every object write is conditional on the version the
   index holds, and every commit on the counter's last ETag. A second
   process loses one of the two, and then refuses every further call,

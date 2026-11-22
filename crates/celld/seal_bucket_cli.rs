@@ -3,7 +3,8 @@
 #![allow(clippy::disallowed_methods)]
 
 //! `celld seal-bucket`: move a fleet bucket into its sealed form, and check
-//! a sealed one. Both take the sealed bucket's key and counter from
+//! a sealed one (what they say goes to stderr, as every celld command's
+//! words do). Both take the sealed bucket's key and counter from
 //! `CELLD_BUCKET_SEAL`, as a node does, and need no node: run them with the
 //! node stopped.
 //!
@@ -14,6 +15,7 @@
 //! once marked it does nothing.
 
 use crate::bucket::{split_spec, Bucket};
+use crate::note;
 use anyhow::{bail, Context as _};
 use bytes::Bytes;
 use futures_util::{StreamExt as _, TryStreamExt as _};
@@ -83,7 +85,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         }
         "check" => check(&flags.bucket.context("check needs --bucket")?, &region, flags.endpoint.as_deref()).await,
         "" | "help" | "--help" | "-h" => {
-            println!("{HELP}");
+            note!("{HELP}");
             Ok(())
         }
         other => bail!("celld seal-bucket: unknown action {other}\n\n{HELP}"),
@@ -148,7 +150,7 @@ async fn migrate(from: &str, to: &str, region: &str, endpoint: Option<&str>) -> 
     let (plain_root, sealed_root) = (plain.path_of(""), sealed.path_of(""));
     let mark = sealed.path_of(MARK);
     if sealed.store.head(&mark).await.is_ok() {
-        println!("{to} is sealed already ({MARK} is there): nothing to do");
+        note!("{to} is sealed already ({MARK} is there): nothing to do");
         return Ok(());
     }
     // The sealed form may sit inside the plain bucket: it is not copied.
@@ -164,13 +166,13 @@ async fn migrate(from: &str, to: &str, region: &str, endpoint: Option<&str>) -> 
         .collect();
     let have: BTreeMap<Path, u64> = listing(&sealed.store, &sealed_root).await?.into_iter().map(|m| (m.location, m.size)).collect();
     let todo: Vec<&(ObjectMeta, Path)> = sources.iter().filter(|(meta, target)| have.get(target) != Some(&meta.size)).collect();
-    println!("{} objects in {from}; {} to copy into {to}", sources.len(), todo.len());
+    note!("{} objects in {from}; {} to copy into {to}", sources.len(), todo.len());
     let copied: Vec<()> = futures_util::stream::iter(todo)
         .map(|(meta, target)| copy(&plain.store, &sealed.store, meta, target))
         .buffer_unordered(COPIES)
         .try_collect()
         .await?;
-    println!("copied {}", copied.len());
+    note!("copied {}", copied.len());
 
     // Every object, read back from both and compared.
     let mut bytes = 0u64;
@@ -188,7 +190,7 @@ async fn migrate(from: &str, to: &str, region: &str, endpoint: Option<&str>) -> 
     }
     let record = serde_json::json!({ "objects": sources.len(), "bytes": bytes, "from": from_name, "at_ms": crate::asyncrt::wall_ms() });
     sealed.store.put(&mark, Bytes::from(record.to_string()).into()).await?;
-    println!("sealed: {} objects, {bytes} bytes, each read back and equal to its plain copy; the plain objects are untouched", sources.len());
+    note!("sealed: {} objects, {bytes} bytes, each read back and equal to its plain copy; the plain objects are untouched", sources.len());
     Ok(())
 }
 
@@ -206,6 +208,6 @@ async fn check(spec: &str, region: &str, endpoint: Option<&str>) -> anyhow::Resu
     }
     let (_, name, prefix) = split_spec(spec);
     let head = crate::sealed_bucket::registered(name, &prefix).context("the bucket opened unsealed")?.commit_head().await?;
-    println!("{spec}: {objects} objects, {bytes} bytes, every one opened under the index's version; the counter is at commit {}", head.seq);
+    note!("{spec}: {objects} objects, {bytes} bytes, every one opened under the index's version; the counter is at commit {}", head.seq);
     Ok(())
 }

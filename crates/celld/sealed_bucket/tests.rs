@@ -294,7 +294,7 @@ async fn snapshots_bound_a_start_and_drop_the_old_journal() {
     assert!(journal.len() as u64 <= SNAPSHOT_EVERY + 5, "{} journal records left", journal.len());
     let fresh = world.store();
     for k in 0..7 {
-        let last = (0..commits).filter(|i| i % 7 == k).last().unwrap();
+        let last = (0..commits).rfind(|i| i % 7 == k).unwrap();
         assert_eq!(read(&fresh, &format!("fleet/k{k}")).await.unwrap(), format!("v{last}"));
     }
 }
