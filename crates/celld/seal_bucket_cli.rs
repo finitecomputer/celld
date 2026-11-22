@@ -41,6 +41,8 @@ starts so (`nodes/`: the node records a start reads first).";
 pub const MARK: &str = "seal-migrated.json";
 /// Objects copied at once.
 const COPIES: usize = 8;
+/// Objects a check reads at once.
+const CHECKS: usize = 16;
 /// An object read whole to copy it, at most; a larger one streams.
 const WHOLE_BYTES_MAX: u64 = 64 << 20;
 /// A streamed copy's parts.
@@ -198,34 +200,67 @@ async fn migrate(from: &str, to: &str, region: &str, endpoint: Option<&str>) -> 
     Ok(())
 }
 
+/// What one object's check found: its bytes read, and whether its read
+/// adopted another version (or its delete) than the listing's.
+enum Checked {
+    Read { bytes: u64, adopted: bool },
+    /// A delete of the home's own cut short, adopted: the object is gone.
+    Deleted,
+}
+
+/// Reads `meta`'s object whole, as a node would (adopting the home's own
+/// write or delete cut short, sealed_bucket.rs `adopt`), and checks its size
+/// against the index's entry after the read.
+async fn check_one(store: &Arc<dyn ObjectStore>, meta: &ObjectMeta) -> anyhow::Result<Checked> {
+    let got = match store.get(&meta.location).await {
+        Ok(got) => got,
+        Err(object_store::Error::NotFound { .. }) => return Ok(Checked::Deleted),
+        Err(error) => return Err(error).with_context(|| format!("read {}", meta.location)),
+    };
+    let mut stream = got.into_stream();
+    let mut bytes = 0u64;
+    while let Some(chunk) = stream.next().await {
+        bytes += chunk.with_context(|| format!("read {}", meta.location))?.len() as u64;
+    }
+    let now = match store.head(&meta.location).await {
+        Ok(now) => now,
+        Err(object_store::Error::NotFound { .. }) => return Ok(Checked::Deleted),
+        Err(error) => return Err(error).with_context(|| format!("head {}", meta.location)),
+    };
+    if bytes != now.size {
+        bail!("{} reads {bytes} bytes, its index says {}", meta.location, now.size);
+    }
+    Ok(Checked::Read { bytes, adopted: (now.size, &now.e_tag) != (meta.size, &meta.e_tag) })
+}
+
 async fn check(spec: &str, region: &str, endpoint: Option<&str>, only: Option<&str>) -> anyhow::Result<()> {
     let bucket = crate::fleet::bucket_client(spec, endpoint, region)?;
     let root = bucket.path_of("");
     let only = only.map(|o| bucket.path_of(o).to_string());
-    let (mut objects, mut bytes, mut adopted) = (0u64, 0u64, 0u64);
     let all = listing(&bucket.store, &root).await?;
-    for meta in all.into_iter().filter(|m| only.as_deref().is_none_or(|o| m.location.as_ref().starts_with(o))) {
-        let (_, n) = digest(&bucket.store, &meta.location).await?;
-        // A read adopts the home's own version cut short (sealed_bucket.rs,
-        // `adopt`): the index's entry may be another after it.
-        let now = match bucket.store.head(&meta.location).await {
-            Ok(now) => Some(now),
-            Err(object_store::Error::NotFound { .. }) => None,
-            Err(error) => return Err(error).with_context(|| format!("head {}", meta.location)),
-        };
-        if now.as_ref().map(|m| (m.size, &m.e_tag)) != Some((meta.size, &meta.e_tag)) {
-            adopted += 1;
-        }
-        if let Some(now) = &now {
-            if n != now.size {
-                bail!("{} reads {n} bytes, its index says {}", meta.location, now.size);
+    let wanted: Vec<ObjectMeta> = all.into_iter().filter(|m| only.as_deref().is_none_or(|o| m.location.as_ref().starts_with(o))).collect();
+    let store = bucket.store.clone();
+    let checked: Vec<Checked> = futures_util::stream::iter(wanted)
+        .map(|meta| {
+            let store = store.clone();
+            async move { check_one(&store, &meta).await }
+        })
+        .buffer_unordered(CHECKS)
+        .try_collect()
+        .await?;
+    let (mut objects, mut bytes, mut adopted, mut deleted) = (0u64, 0u64, 0u64, 0u64);
+    for c in checked {
+        match c {
+            Checked::Read { bytes: n, adopted: a } => {
+                objects += 1;
+                bytes += n;
+                adopted += a as u64;
             }
+            Checked::Deleted => deleted += 1,
         }
-        objects += 1;
-        bytes += n;
     }
     let (_, name, prefix) = split_spec(spec);
     let head = crate::sealed_bucket::registered(name, &prefix).context("the bucket opened unsealed")?.commit_head().await?;
-    note!("{spec}: {objects} objects, {bytes} bytes, every one opened under the index's version ({adopted} adopted: the home's own writes cut short); the counter is at commit {}", head.seq);
+    note!("{spec}: {objects} objects, {bytes} bytes, every one opened under the index's version ({adopted} adopted and {deleted} deletes adopted: the home's own work cut short); the counter is at commit {}", head.seq);
     Ok(())
 }
