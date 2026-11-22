@@ -1765,8 +1765,18 @@ class DurableObjectStorage {
         __storage_get(this._scope, k, __storedSentinel));
     });
   }
-  async put(k, val) {
+  async put(k, val, options) {
     this._assertTransactionActive("put");
+    // `allowUnconfirmed`: written after every put queued before it, and
+    // waited on by no gate while it trails (storage.rs `put_unconfirmed`).
+    // A put in a transaction, or of many keys, keeps the default.
+    if (options != null && options.allowUnconfirmed === true &&
+        typeof k === "string" && !this._transactionControl) {
+      await Promise.resolve();
+      if (!this._flushPendingPuts()) return;
+      __storage_put_unconfirmed(this._scope, k, val);
+      return;
+    }
     if (typeof k === "string") {
       try {
         __storage_queue_put(this._scope, k, val);

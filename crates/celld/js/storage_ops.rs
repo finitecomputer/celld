@@ -67,6 +67,23 @@ pub(super) fn op_storage_put(
         throw_storage_error(scope, "put", error);
     }
 }
+/// `__storage_put_unconfirmed(cell, key, value)`: `put(key, value,
+/// { allowUnconfirmed: true })`, written now and waited on by no gate
+/// (`storage::put_unconfirmed`).
+pub(super) fn op_storage_put_unconfirmed(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let s = args.get(0).to_rust_string_lossy(scope);
+    let k = args.get(1).to_rust_string_lossy(scope);
+    let Some(value) = serialize_storage_value(scope, args.get(2)) else {
+        return;
+    };
+    if let Err(error) = storage::put_unconfirmed(&s, &k, &value) {
+        throw_storage_error(scope, "put", error);
+    }
+}
 pub(super) fn op_storage_put_many(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

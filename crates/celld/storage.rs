@@ -502,6 +502,39 @@ fn valid_sql_boolean(value: &str) -> bool {
     )
 }
 
+// Goal: a put made with `allowUnconfirmed` is waited on by no gate while
+// it trails: the write position stays where it was before it (and before a
+// run of them); a write of any other kind after it moves the position past
+// them all, so a gate then waits for every one of them, in the WAL's order;
+// a run after that is floored to that write, never below it.
+#[cfg(test)]
+mod unconfirmed_tests {
+    #[test]
+    fn an_unconfirmed_put_is_waited_on_by_no_gate_while_it_trails() {
+        let dir = std::env::temp_dir().join(format!("celld-unconfirmed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scope = "Test:unconfirmed";
+        // one turn's cells, as a turn installs them
+        let cells = super::Cells::default();
+        let _turn = cells.install();
+        super::open(scope, dir.join("cell.sqlite").to_str().unwrap()).unwrap();
+        let value = |n: u8| vec![0xff, 0x0f, b'I', n * 2];
+        super::put_serialized(scope, "a", &value(1)).unwrap();
+        let confirmed = super::write_position(scope).unwrap().unwrap();
+        super::put_unconfirmed(scope, "count", &value(2)).unwrap();
+        assert_eq!(super::write_position(scope).unwrap(), Some(confirmed), "an unconfirmed put trails");
+        super::put_unconfirmed(scope, "count", &value(3)).unwrap();
+        assert_eq!(super::write_position(scope).unwrap(), Some(confirmed), "a run of them trails");
+        super::put_serialized(scope, "b", &value(4)).unwrap();
+        let after = super::write_position(scope).unwrap().unwrap();
+        assert!(after > confirmed, "a confirmed put after them is waited on, and they with it");
+        super::put_unconfirmed(scope, "count", &value(5)).unwrap();
+        assert_eq!(super::write_position(scope).unwrap(), Some(after), "a later run floors to the confirmed write before it");
+        super::close(scope);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_STORAGE_TESTS"));
@@ -903,6 +936,7 @@ pub(crate) fn embedded_facets(root: &str) -> Vec<String> {
 /// Drop `scope`'s connection (evict) so the replicator can release the
 /// file.
 pub fn close(scope: &str) {
+    unconfirmed(|runs| runs.borrow_mut().remove(scope));
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
@@ -1311,11 +1345,52 @@ fn schema_version(connection: &Connection) -> u64 {
 /// into a "writer" whose held frames were silently lost. `None` when the scope
 /// has no open connection (a Worker with no Durable Object storage).
 pub fn write_position(scope: &str) -> anyhow::Result<Option<u64>> {
-    with(scope, |c| {
+    let at = with(scope, |c| -> anyhow::Result<u64> {
         ensure_no_unfinished_write_cursor(c)?;
         Ok(fingerprint(scope, c))
     })
-    .transpose()
+    .transpose()?;
+    // the cell's trailing writes made with `allowUnconfirmed` are none a gate
+    // waits on: while nothing has written since, its position is the one
+    // before them
+    Ok(at.map(|position| {
+        unconfirmed(|runs| match runs.borrow().get(scope) {
+            Some(&(before, after)) if after == position => before,
+            _ => position,
+        })
+    }))
+}
+
+thread_local! {
+    /// Per cell, its trailing run of writes made with `allowUnconfirmed`
+    /// (Cloudflare's option: a write the object's outgoing messages need not
+    /// wait for): the position before the run's first and after its last.
+    /// A later write of any other kind moves the position past the run's
+    /// end, and every gate waits for all of it again, in the WAL's order.
+    static UNCONFIRMED: RefCell<HashMap<String, (u64, u64)>> = RefCell::new(HashMap::new());
+}
+
+fn unconfirmed<R>(f: impl FnOnce(&RefCell<HashMap<String, (u64, u64)>>) -> R) -> R {
+    UNCONFIRMED.with(f)
+}
+
+/// `put` with `allowUnconfirmed`: written now, as `put_serialized` writes,
+/// and kept out of every gate's position while it trails (`write_position`).
+pub fn put_unconfirmed(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()> {
+    let raw = |scope: &str| with(scope, |c| fingerprint(scope, c));
+    let before = raw(scope);
+    put_serialized(scope, key, value)?;
+    if let (Some(before), Some(after)) = (before, raw(scope)) {
+        unconfirmed(|runs| {
+            let mut runs = runs.borrow_mut();
+            let start = match runs.get(scope) {
+                Some(&(start, end)) if end == before => start,
+                _ => before,
+            };
+            runs.insert(scope.to_string(), (start, after));
+        });
+    }
+    Ok(())
 }
 
 fn fingerprint(scope: &str, connection: &Connection) -> u64 {
