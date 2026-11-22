@@ -197,17 +197,29 @@ async fn migrate(from: &str, to: &str, region: &str, endpoint: Option<&str>) -> 
 async fn check(spec: &str, region: &str, endpoint: Option<&str>) -> anyhow::Result<()> {
     let bucket = crate::fleet::bucket_client(spec, endpoint, region)?;
     let root = bucket.path_of("");
-    let (mut objects, mut bytes) = (0u64, 0u64);
+    let (mut objects, mut bytes, mut adopted) = (0u64, 0u64, 0u64);
     for meta in listing(&bucket.store, &root).await? {
         let (_, n) = digest(&bucket.store, &meta.location).await?;
-        if n != meta.size {
-            bail!("{} reads {n} bytes, its index says {}", meta.location, meta.size);
+        // A read adopts the home's own version cut short (sealed_bucket.rs,
+        // `adopt`): the index's entry may be another after it.
+        let now = match bucket.store.head(&meta.location).await {
+            Ok(now) => Some(now),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(error) => return Err(error).with_context(|| format!("head {}", meta.location)),
+        };
+        if now.as_ref().map(|m| (m.size, &m.e_tag)) != Some((meta.size, &meta.e_tag)) {
+            adopted += 1;
+        }
+        if let Some(now) = &now {
+            if n != now.size {
+                bail!("{} reads {n} bytes, its index says {}", meta.location, now.size);
+            }
         }
         objects += 1;
         bytes += n;
     }
     let (_, name, prefix) = split_spec(spec);
     let head = crate::sealed_bucket::registered(name, &prefix).context("the bucket opened unsealed")?.commit_head().await?;
-    note!("{spec}: {objects} objects, {bytes} bytes, every one opened under the index's version; the counter is at commit {}", head.seq);
+    note!("{spec}: {objects} objects, {bytes} bytes, every one opened under the index's version ({adopted} adopted: the home's own writes cut short); the counter is at commit {}", head.seq);
     Ok(())
 }

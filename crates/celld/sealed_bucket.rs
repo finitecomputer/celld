@@ -592,22 +592,40 @@ impl Core {
         let attributes = encode_attributes(attributes)?;
         let mut salt = [0u8; SALT_BYTES];
         getrandom::fill(&mut salt).expect("OS random source unavailable");
-        let sealed = seal::seal_object(&self.key.object(&name, &salt), &salt, &plain);
+        let sealed = Bytes::from(seal::seal_object(&self.key.object(&name, &salt), &salt, &plain));
         // Every write is conditional on the version the index holds, so a
-        // second writer's object cannot silently replace this one's.
-        let bucket_mode = match &prev {
-            Some(prev) => PutMode::Update(UpdateVersion { e_tag: prev.etag.clone(), version: prev.version.clone() }),
-            None => PutMode::Create,
-        };
-        let result = match self.inner_cas.put_opts(location, sealed.into(), PutOptions::from(bucket_mode)).await {
-            Ok(result) => result,
-            Err(Error::AlreadyExists { .. } | Error::Precondition { .. }) => {
-                return Err(self.poison(live, SealError::Tampered { name, why: "the bucket's version is not the index's: another writer, or a rewrite".into() }));
+        // second writer's object cannot silently replace this one's. One the
+        // bucket holds in its place that opens under this home's key is the
+        // home's own write cut short (`adopt`): adopted, then written over.
+        let mut prev = prev;
+        let mut adopted = false;
+        // Bounded: one adoption, then a second conditional write.
+        let result = loop {
+            let bucket_mode = match &prev {
+                Some(prev) => PutMode::Update(UpdateVersion { e_tag: prev.etag.clone(), version: prev.version.clone() }),
+                None => PutMode::Create,
+            };
+            match self.inner_cas.put_opts(location, sealed.clone().into(), PutOptions::from(bucket_mode)).await {
+                Ok(result) => break result,
+                Err(Error::AlreadyExists { .. } | Error::Precondition { .. }) if !adopted => {
+                    adopted = true;
+                    prev = self.adopt(live, &name, prev.as_ref()).await?;
+                    match (&mode, &prev) {
+                        (PutMode::Create, Some(_)) => return Err(Error::AlreadyExists { path: name, source: "the object already exists".into() }),
+                        (PutMode::Update(version), current) if current.as_ref().and_then(|c| c.etag.as_deref()) != version.e_tag.as_deref() || current.is_none() => {
+                            return Err(Error::Precondition { path: name, source: "the ETag does not match".into() })
+                        }
+                        _ => {}
+                    }
+                }
+                Err(Error::AlreadyExists { .. } | Error::Precondition { .. }) => {
+                    return Err(self.poison(live, SealError::Tampered { name, why: "the bucket's version is not the index's: another writer, or a rewrite".into() }));
+                }
+                Err(error) => match self.reconcile(location, &salt).await {
+                    Some(result) => break result,
+                    None => return Err(error),
+                },
             }
-            Err(error) => match self.reconcile(location, &salt).await {
-                Some(result) => result,
-                None => return Err(error),
-            },
         };
         let entry = Entry {
             salt: seal::b64(&salt),
@@ -630,6 +648,83 @@ impl Core {
         let (e_tag, version) = (result.meta.e_tag.clone(), result.meta.version.clone());
         let header = result.bytes().await.ok()?;
         (seal::salt_of(&header).ok()? == *salt).then_some(PutResult { e_tag, version })
+    }
+
+    /// The bucket's version of `name` when the index names another (`stale`),
+    /// or none: the home's own write cut short between its object's PUT and
+    /// its commit (a stop past its bound, a kill), or its delete cut short
+    /// likewise, which no start must refuse. A version that opens under this
+    /// home's key (`authentic`) becomes the index's, and a missing one is the
+    /// delete; either is committed and logged loudly. A version that does not
+    /// open is no write of this home's: refused, as before. An older version
+    /// of the home's own put back is believed the same way: strict
+    /// anti-rollback is a team question (FIN-622).
+    async fn adopt(&self, live: &Arc<Live>, name: &str, stale: Option<&Entry>) -> object_store::Result<Option<Entry>> {
+        let location = Path::from(name);
+        let meta = match self.inner.head(&location).await {
+            Ok(meta) => Some(meta),
+            Err(Error::NotFound { .. }) => None,
+            Err(error) => return Err(error),
+        };
+        let (change, adopted) = match meta {
+            None => {
+                let Some(stale) = stale else { return Ok(None) };
+                tracing::warn!(event = "sealed_bucket_adopted_delete", name, size = stale.size, "the bucket no longer holds an object the index named: this home's own delete cut short, committed");
+                (Change::Delete { name: name.to_string() }, None)
+            }
+            Some(meta) => {
+                if meta.e_tag.is_some() && stale.is_some_and(|s| s.etag == meta.e_tag) {
+                    return Ok(stale.cloned());
+                }
+                let Some((salt, size)) = self.authentic(&location, name, &meta).await? else {
+                    return Err(sealed_error(SealError::Tampered { name: name.to_string(), why: "the bucket's version is not the index's, and it does not open under this home's key".into() }));
+                };
+                let entry = Entry {
+                    salt: seal::b64(&salt),
+                    size,
+                    etag: meta.e_tag.clone(),
+                    version: meta.version.clone(),
+                    modified_ms: meta.last_modified.timestamp_millis(),
+                    // An adopted version's attributes went with its commit: its
+                    // last ones stand.
+                    attributes: stale.map(|s| s.attributes.clone()).unwrap_or_default(),
+                };
+                tracing::warn!(event = "sealed_bucket_adopted_version", name, size, had = stale.is_some(), "the bucket holds a version of this home's own that the index never committed (a write cut short): adopted and committed");
+                (Change::Put { name: name.to_string(), entry: entry.clone() }, Some(entry))
+            }
+        };
+        let ticket = self.stage(live, change, stale.cloned());
+        self.commit(live, ticket).await?;
+        Ok(adopted)
+    }
+
+    /// Whether the bucket's version `meta` of `name` is this home's: a sealed
+    /// object's size, its header's salt, and its first and last chunks
+    /// opening under the home's key for that name (every chunk opens again
+    /// as it is read). Its salt and plaintext size, or none.
+    async fn authentic(&self, location: &Path, name: &str, meta: &ObjectMeta) -> object_store::Result<Option<([u8; SALT_BYTES], u64)>> {
+        let Some(plain) = seal::plain_len(meta.size) else { return Ok(None) };
+        let read = |range: std::ops::Range<u64>| {
+            let options = GetOptions { range: Some(GetRange::Bounded(range)), if_match: meta.e_tag.clone(), version: meta.version.clone(), ..GetOptions::default() };
+            async move { self.inner.get_opts(location, options).await?.bytes().await }
+        };
+        let header = read(0..seal::HEADER_BYTES).await?;
+        let Ok(salt) = seal::salt_of(&header) else { return Ok(None) };
+        let key = self.key.object(name, &salt);
+        let count = seal::chunk_count(plain);
+        let mut chunks = vec![0];
+        if count > 1 {
+            chunks.push(count - 1);
+        }
+        for index in chunks {
+            let start = seal::HEADER_BYTES + index * seal::SEALED_CHUNK_BYTES;
+            let end = (start + seal::SEALED_CHUNK_BYTES).min(meta.size);
+            let sealed = read(start..end).await?;
+            if key.open_chunk(index, index == count - 1, &sealed).is_err() {
+                return Ok(None);
+            }
+        }
+        Ok(Some((salt, plain)))
     }
 
     /// Applies `change` to the index this process reads, and queues it for
@@ -815,16 +910,22 @@ impl Core {
             };
             let result = match self.inner.get_opts(location, fetch).await {
                 Ok(result) => result,
-                Err(error @ (Error::Precondition { .. } | Error::NotFound { .. })) => {
+                Err(Error::Precondition { .. } | Error::NotFound { .. }) => {
                     let moved = live.entries.lock().expect("index").get(&name) != Some(&entry);
                     if moved {
                         continue;
                     }
-                    let why = match error {
-                        Error::NotFound { .. } => "the bucket lost it",
-                        _ => "its ETag is not the index's",
-                    };
-                    return Err(sealed_error(SealError::Tampered { name, why: why.into() }));
+                    // The bucket holds another version, or none: the home's own
+                    // write or delete cut short is adopted (`adopt`), under the
+                    // name's lock, so no write of this process races it.
+                    let _lock = self.name_lock(live, &name).await;
+                    if live.entries.lock().expect("index").get(&name) != Some(&entry) {
+                        continue;
+                    }
+                    match self.adopt(live, &name, Some(&entry)).await? {
+                        Some(_) => continue,
+                        None => return Err(not_found(&name)),
+                    }
                 }
                 Err(error) => return Err(error),
             };
