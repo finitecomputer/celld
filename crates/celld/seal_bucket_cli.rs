@@ -29,10 +29,12 @@ const HELP: &str = "celld seal-bucket: a fleet bucket's sealed form
 
 USAGE:
   celld seal-bucket migrate --from s3://NAME[/PREFIX] --to s3://NAME/PREFIX [--region R] [--endpoint URL]
-  celld seal-bucket check --bucket s3://NAME/PREFIX [--region R] [--endpoint URL]
+  celld seal-bucket check --bucket s3://NAME/PREFIX [--only KEY-PREFIX] [--region R] [--endpoint URL]
 
 CELLD_BUCKET_SEAL names the sealed bucket's configuration (its key and its
-counter). Credentials for the buckets come from the environment, as for a node.";
+counter). Credentials for the buckets come from the environment, as for a node.
+`check --only` reads only the objects whose key, under the bucket's prefix,
+starts so (`nodes/`: the node records a start reads first).";
 
 /// The name `migrate` marks a finished migration with, at the sealed
 /// bucket's prefix. celld reads no such object.
@@ -50,12 +52,13 @@ struct Flags {
     bucket: Option<String>,
     region: Option<String>,
     endpoint: Option<String>,
+    only: Option<String>,
 }
 
 fn parse(arguments: Vec<String>) -> anyhow::Result<(String, Flags)> {
     let mut arguments = arguments.into_iter();
     let action = arguments.next().unwrap_or_default();
-    let mut flags = Flags { from: None, to: None, bucket: None, region: None, endpoint: None };
+    let mut flags = Flags { from: None, to: None, bucket: None, region: None, endpoint: None, only: None };
     while let Some(flag) = arguments.next() {
         let mut value = || arguments.next().with_context(|| format!("{flag} takes a value"));
         match flag.as_str() {
@@ -64,6 +67,7 @@ fn parse(arguments: Vec<String>) -> anyhow::Result<(String, Flags)> {
             "--bucket" => flags.bucket = Some(value()?),
             "--region" => flags.region = Some(value()?),
             "--endpoint" => flags.endpoint = Some(value()?),
+            "--only" => flags.only = Some(value()?),
             other => bail!("celld seal-bucket: unknown flag {other}\n\n{HELP}"),
         }
     }
@@ -83,7 +87,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             let to = flags.to.context("migrate needs --to")?;
             migrate(&from, &to, &region, flags.endpoint.as_deref()).await
         }
-        "check" => check(&flags.bucket.context("check needs --bucket")?, &region, flags.endpoint.as_deref()).await,
+        "check" => check(&flags.bucket.context("check needs --bucket")?, &region, flags.endpoint.as_deref(), flags.only.as_deref()).await,
         "" | "help" | "--help" | "-h" => {
             note!("{HELP}");
             Ok(())
@@ -194,11 +198,13 @@ async fn migrate(from: &str, to: &str, region: &str, endpoint: Option<&str>) -> 
     Ok(())
 }
 
-async fn check(spec: &str, region: &str, endpoint: Option<&str>) -> anyhow::Result<()> {
+async fn check(spec: &str, region: &str, endpoint: Option<&str>, only: Option<&str>) -> anyhow::Result<()> {
     let bucket = crate::fleet::bucket_client(spec, endpoint, region)?;
     let root = bucket.path_of("");
+    let only = only.map(|o| bucket.path_of(o).to_string());
     let (mut objects, mut bytes, mut adopted) = (0u64, 0u64, 0u64);
-    for meta in listing(&bucket.store, &root).await? {
+    let all = listing(&bucket.store, &root).await?;
+    for meta in all.into_iter().filter(|m| only.as_deref().is_none_or(|o| m.location.as_ref().starts_with(o))) {
         let (_, n) = digest(&bucket.store, &meta.location).await?;
         // A read adopts the home's own version cut short (sealed_bucket.rs,
         // `adopt`): the index's entry may be another after it.
