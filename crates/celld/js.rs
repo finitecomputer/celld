@@ -2574,7 +2574,17 @@ fn admission_refusal_forced(_state: &HeapLimitState) -> bool {
 }
 
 type SerializedPut = (String, Vec<u8>);
-type PendingPuts = HashMap<String, Vec<SerializedPut>>;
+type PendingPuts = HashMap<String, QueuedPuts>;
+
+/// A cell's puts queued for its next flush, and whether any of them was
+/// made without `allowUnconfirmed`. A flush of only unconfirmed ones is
+/// waited on by no gate while it trails (storage.rs `put_many_unconfirmed`);
+/// one with any other put among them is waited on as any write.
+#[derive(Default)]
+struct QueuedPuts {
+    puts: Vec<SerializedPut>,
+    confirmed: bool,
+}
 
 /// One Fetcher route transferred from a Worker Loader parent into its child.
 /// The generation and the complete target travel together, so a loaded Worker
@@ -7049,7 +7059,7 @@ ops! { OP_NAMES, install_op_functions,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
         "__storage_put" => storage_ops::op_storage_put,
-        "__storage_put_unconfirmed" => storage_ops::op_storage_put_unconfirmed,
+        "__storage_queue_put_unconfirmed" => storage_ops::op_storage_queue_put_unconfirmed,
         "__storage_put_many" => storage_ops::op_storage_put_many,
         "__storage_queue_put" => storage_ops::op_storage_queue_put,
         "__storage_queue_put_many" => storage_ops::op_storage_queue_put_many,

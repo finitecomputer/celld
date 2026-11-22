@@ -92,7 +92,7 @@ struct OpenCell {
     /// Its trailing run of writes made with `allowUnconfirmed` (Cloudflare's
     /// option: a write the object's outgoing messages need not wait for):
     /// the position before the run's first and after its last
-    /// (`put_unconfirmed`). It goes with the connection.
+    /// (`put_many_unconfirmed`). It goes with the connection.
     unconfirmed: Option<(u64, u64)>,
 }
 
@@ -526,14 +526,14 @@ mod unconfirmed_tests {
         let value = |n: u8| vec![0xff, 0x0f, b'I', n * 2];
         super::put_serialized(scope, "a", &value(1)).unwrap();
         let confirmed = super::write_position(scope).unwrap().unwrap();
-        super::put_unconfirmed(scope, "count", &value(2)).unwrap();
+        super::put_many_unconfirmed(scope, &[("count".to_string(), value(2))]).unwrap();
         assert_eq!(super::write_position(scope).unwrap(), Some(confirmed), "an unconfirmed put trails");
-        super::put_unconfirmed(scope, "count", &value(3)).unwrap();
+        super::put_many_unconfirmed(scope, &[("count".to_string(), value(3))]).unwrap();
         assert_eq!(super::write_position(scope).unwrap(), Some(confirmed), "a run of them trails");
         super::put_serialized(scope, "b", &value(4)).unwrap();
         let after = super::write_position(scope).unwrap().unwrap();
         assert!(after > confirmed, "a confirmed put after them is waited on, and they with it");
-        super::put_unconfirmed(scope, "count", &value(5)).unwrap();
+        super::put_many_unconfirmed(scope, &[("count".to_string(), value(5))]).unwrap();
         assert_eq!(super::write_position(scope).unwrap(), Some(after), "a later run floors to the confirmed write before it");
         // the run goes with the connection: a reopened cell waits for all of it
         super::close(scope);
@@ -1372,16 +1372,17 @@ pub fn write_position(scope: &str) -> anyhow::Result<Option<u64>> {
     }))
 }
 
-/// `put` with `allowUnconfirmed`: written now, as `put_serialized` writes,
-/// and kept out of every gate's position while it trails (`write_position`).
+/// Puts made with `allowUnconfirmed` (a flush of the queue that holds only
+/// them): written as `put_many_serialized` writes, and kept out of every
+/// gate's position while they trail (`write_position`).
 /// The run grows only by what this connection wrote: when another
 /// connection's commit (the data version) or a schema change (the cookie)
 /// lands between the two samples, there is no run, and every gate waits for
 /// everything, as for any write.
-pub fn put_unconfirmed(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()> {
+pub fn put_many_unconfirmed(scope: &str, entries: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
     let parts = |scope: &str| with(scope, |c| (total_changes(c), data_version(c), schema_cookie(scope, c)));
     let before = parts(scope);
-    put_serialized(scope, key, value)?;
+    put_many_serialized(scope, entries)?;
     let after = parts(scope);
     let run = match (before, after) {
         (Some((tc0, dv0, sc0)), Some((tc1, dv1, sc1))) if dv0 == dv1 && sc0 == sc1 && tc1 > tc0 => Some((tc0 + dv0 + sc0, tc1 + dv1 + sc1)),

@@ -67,23 +67,6 @@ pub(super) fn op_storage_put(
         throw_storage_error(scope, "put", error);
     }
 }
-/// `__storage_put_unconfirmed(cell, key, value)`: `put(key, value,
-/// { allowUnconfirmed: true })`, written now and waited on by no gate
-/// (`storage::put_unconfirmed`).
-pub(super) fn op_storage_put_unconfirmed(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let s = args.get(0).to_rust_string_lossy(scope);
-    let k = args.get(1).to_rust_string_lossy(scope);
-    let Some(value) = serialize_storage_value(scope, args.get(2)) else {
-        return;
-    };
-    if let Err(error) = storage::put_unconfirmed(&s, &k, &value) {
-        throw_storage_error(scope, "put", error);
-    }
-}
 pub(super) fn op_storage_put_many(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -163,13 +146,31 @@ pub(super) fn actor_runtime_state(scope: &mut v8::PinScope) -> Arc<ActorRuntimeS
 }
 
 fn queue_serialized_puts(scope: &mut v8::PinScope, cell: String, entries: Vec<(String, Vec<u8>)>) {
-    actor_runtime_state(scope)
-        .pending_puts
-        .lock()
-        .expect("pending puts lock poisoned")
-        .entry(cell)
-        .or_default()
-        .extend(entries);
+    queue_puts(scope, cell, entries, true);
+}
+
+fn queue_puts(scope: &mut v8::PinScope, cell: String, entries: Vec<(String, Vec<u8>)>, confirmed: bool) {
+    let state = actor_runtime_state(scope);
+    let mut pending = state.pending_puts.lock().expect("pending puts lock poisoned");
+    let queued = pending.entry(cell).or_default();
+    queued.confirmed |= confirmed;
+    queued.puts.extend(entries);
+}
+
+/// `__storage_queue_put_unconfirmed(cell, key, value)`: `put(key, value,
+/// { allowUnconfirmed: true })`, queued as every put is, in the same order;
+/// only its flush differs (`flush_pending_puts`).
+pub(super) fn op_storage_queue_put_unconfirmed(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let key = args.get(1).to_rust_string_lossy(scope);
+    let Some(value) = serialize_storage_value(scope, args.get(2)) else {
+        return;
+    };
+    queue_puts(scope, cell, vec![(key, value)], false);
 }
 
 pub(super) fn op_storage_queue_put(
@@ -230,16 +231,20 @@ pub(super) fn op_storage_flush_pending_puts(
 }
 
 fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String> {
-    let entries = actor_runtime_state(scope)
+    let queued = actor_runtime_state(scope)
         .pending_puts
         .lock()
         .expect("pending puts lock poisoned")
         .remove(cell)
         .unwrap_or_default();
-    if entries.is_empty() {
+    if queued.puts.is_empty() {
         return Ok(());
     }
-    storage::put_many_serialized(cell, &entries).map_err(|error| error.to_string())
+    let written = match queued.confirmed {
+        true => storage::put_many_serialized(cell, &queued.puts),
+        false => storage::put_many_unconfirmed(cell, &queued.puts),
+    };
+    written.map_err(|error| error.to_string())
 }
 
 /// `storage.sync()`: resolve once every write the cell committed before the
