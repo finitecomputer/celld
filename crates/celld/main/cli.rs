@@ -358,6 +358,9 @@ TUNING:
                                   (default: 120000; 0 disables)
   CELLD_REBALANCE_INTERVAL_MS     Ownership balancing sample interval
                                   (default: 5000; 0 disables)
+  CELLD_FLEET_SAMPLE_MS           With balancing off, the fleet sample's
+                                  interval (default: 5000): a single node
+                                  can take it far longer
   CELLD_PLACEMENT_WEIGHT          Relative ownership share (default: the
                                   CPU count)
   CELLD_IDLE_EVICT_S              Idle-cell eviction age (disabled unless set)
