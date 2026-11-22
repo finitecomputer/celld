@@ -11,6 +11,8 @@ struct World {
 
 impl World {
     fn new() -> World {
+        // A commit's leader runs on a task of the process's runtime.
+        crate::container::tests::rt();
         World { bucket: Arc::new(InMemory::new()), counter: Arc::new(InMemory::new()) }
     }
 
@@ -339,4 +341,80 @@ fn a_configuration_is_checked_whole() {
     assert!(Config::parse(not_s3).is_err());
     let extra = br#"{"key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","more":1,"counter":{"bucket":"s3://c","name":"h","region":"r","access_key_id":"a","secret_access_key":"s"}}"#;
     assert!(Config::parse(extra).is_err());
+}
+
+/// The bucket, its journal records' writes held while `hold` says so: a
+/// commit's leader then waits there, past its counter's write.
+#[derive(Debug)]
+struct Gated {
+    inner: Arc<InMemory>,
+    hold: tokio::sync::watch::Receiver<bool>,
+}
+
+impl fmt::Display for Gated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Gated({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for Gated {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, options: PutOptions) -> object_store::Result<PutResult> {
+        if location.as_ref().contains("/journal/") {
+            let mut hold = self.hold.clone();
+            while *hold.borrow_and_update() {
+                if hold.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+        self.inner.put_opts(location, payload, options).await
+    }
+    async fn put_multipart_opts(&self, location: &Path, options: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+// Goal: a commit whose caller goes away while its journal record is on its
+// way (the counter written, the record's write not answered) leaves no hole
+// in the journal: the next start reads every commit. A process that went on
+// past such a hole made a bucket every later start refused (a test home,
+// 2026-11-22: "the journal's commit 30711 is gone"). Method: the bucket
+// holds journal writes; a put's caller gives up while its record's write is
+// held; the hold lifts, another put commits; a fresh store reads all three.
+#[tokio::test]
+async fn a_commit_whose_caller_goes_away_leaves_no_hole_in_the_journal() {
+    let world = World::new();
+    let (hold, held) = tokio::sync::watch::channel(false);
+    let bucket: Arc<dyn ObjectStore> = Arc::new(Gated { inner: world.bucket.clone(), hold: held });
+    let store = SealedStore::new(bucket.clone(), bucket, world.counter.clone(), Path::from("homes/test"), root_of("fleet/"), MasterKey::new(KEY));
+    store.put(&p("fleet/one"), PutPayload::from_static(b"one")).await.unwrap();
+    hold.send_replace(true);
+    let gave_up = crate::asyncrt::timeout(std::time::Duration::from_millis(300), store.put(&p("fleet/two"), PutPayload::from_static(b"two"))).await;
+    assert!(gave_up.is_err(), "its caller gave up first");
+    assert_eq!(counter_seq(&world).await, 2, "its commit reached the counter");
+    hold.send_replace(false);
+    store.put(&p("fleet/three"), PutPayload::from_static(b"three")).await.unwrap();
+    let fresh = world.store();
+    for (name, body) in [("fleet/one", "one"), ("fleet/two", "two"), ("fleet/three", "three")] {
+        assert_eq!(read(&fresh, name).await.unwrap(), body, "{name}");
+    }
 }
