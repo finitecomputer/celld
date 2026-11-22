@@ -1765,8 +1765,31 @@ class DurableObjectStorage {
         __storage_get(this._scope, k, __storedSentinel));
     });
   }
-  async put(k, val) {
+  async put(k, val, options) {
     this._assertTransactionActive("put");
+    // `allowUnconfirmed`: queued as every put is, so it lands in the same
+    // order as a default put would; only its flush is waited on by no gate
+    // while it trails (storage.rs `put_many_unconfirmed`). A put of many
+    // keys, or one made while any transaction is open (its commit is what a
+    // gate waits on), keeps the default. So does a value only the default
+    // path can store (a stub).
+    const root = this._transactionRoot;
+    if (options != null && options.allowUnconfirmed === true &&
+        typeof k === "string" && !this._transactionControl &&
+        root._activeSyncTransaction === null && root._activeTransaction === null) {
+      let queued = true;
+      try {
+        __storage_queue_put_unconfirmed(this._scope, k, val);
+      } catch (_) {
+        // the default path below stores it, or throws the same error
+        queued = false;
+      }
+      if (queued) {
+        await Promise.resolve();
+        this._flushPendingPuts();
+        return;
+      }
+    }
     if (typeof k === "string") {
       try {
         __storage_queue_put(this._scope, k, val);
