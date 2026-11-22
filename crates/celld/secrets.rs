@@ -169,7 +169,7 @@ fn origin(addr: &str) -> bool {
 /// Reads `path`, at most `max` bytes, refusing one any but its owner may
 /// read or write: it holds secrets.
 #[allow(clippy::disallowed_methods)] // The operator's configuration file, not node storage.
-fn owner_only(path: &Path, max: u64, what: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn owner_only(path: &Path, max: u64, what: &str) -> anyhow::Result<Vec<u8>> {
     use std::io::Read as _;
     let file = std::fs::File::open(path).with_context(|| format!("{what} {}", path.display()))?;
     let meta = file.metadata().with_context(|| format!("{what} {}", path.display()))?;
