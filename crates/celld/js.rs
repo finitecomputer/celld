@@ -2705,9 +2705,10 @@ impl ActorRuntimeState {
 /// a continuation of an older one enqueues is dropped, as every such op was
 /// before this record.
 const ENDED_CELLS_MAX: usize = 4096;
-/// How many more it remembers of those that enqueued an op unable to keep
-/// them alive, such as a container's `monitor()`, which a later event settles
-/// perhaps much later, so a long run of other events does not push them out.
+/// How many more it remembers of those that ended with an op still pending
+/// that could not keep them alive, such as a container's `monitor()`, which
+/// a later event settles perhaps much later, so a long run of other events
+/// does not push them out.
 const ENDED_HOLDING_CELLS_MAX: usize = 4096;
 
 /// The cells of ended cell events (`ActorRuntimeState::ended_cells`): each
@@ -4031,6 +4032,9 @@ impl InFlight {
     /// isolate lives. A request that drives itself has to purge them on its
     /// own way out.
     pub fn abandon(&mut self) {
+        // its cell remembered while its context still resolves, so no later
+        // event finds it neither alive nor remembered (`hand_op`)
+        self.context.ended(!self.unrefed_ops.is_empty());
         self.context.seal_wait_until();
         self.io_context_ops.clear();
         self.unrefed_ops.clear();
@@ -4110,7 +4114,6 @@ impl InFlight {
         }
         if lifetime == asyncrt::OpLifetime::Unrefed {
             self.unrefed_ops.insert(id);
-            self.context.held_unrefed.store(true, Ordering::Relaxed);
         }
         (id, future)
     }
@@ -11378,10 +11381,10 @@ pub struct IoContext {
     /// current wait obsolete.
     handed_wake: tokio::sync::Notify,
     /// The cell of a cell event (`start_cell_event`), remembered once it ends
-    /// (`ActorRuntimeState::ended_cells`).
+    /// (`ActorRuntimeState::ended_cells`, `ended`).
     cell: OnceLock<Arc<str>>,
-    /// Whether this event enqueued an op unable to keep it alive.
-    held_unrefed: AtomicBool,
+    /// Whether its cell is remembered already (`ended`).
+    cell_remembered: AtomicBool,
     /// Set by the reaction `watch_handler_settlement` puts on a cell event's
     /// handler promise, in whichever turn settles it.
     ///
@@ -11580,7 +11583,7 @@ impl IoContext {
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
             cell: OnceLock::new(),
-            held_unrefed: AtomicBool::new(false),
+            cell_remembered: AtomicBool::new(false),
             handler_settled: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: limits.and_then(|limits| limits.sub_requests),
@@ -11615,7 +11618,7 @@ impl IoContext {
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
             cell: OnceLock::new(),
-            held_unrefed: AtomicBool::new(false),
+            cell_remembered: AtomicBool::new(false),
             handler_settled: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: runtime_state
@@ -11645,6 +11648,26 @@ impl IoContext {
 
     /// Take an op that another event's turn enqueued for this event.
     ///
+    /// This cell event has ended (its driver's `abandon`): its cell is
+    /// remembered, once, for an op that one of its continuations enqueues
+    /// later. `holding`: it ended with an op pending that could not keep it
+    /// alive, which a later event settles.
+    fn ended(&self, holding: bool) {
+        if let Some((id, runtime_state)) = &self.continuation {
+            if let Some(runtime_state) = runtime_state.upgrade() {
+                self.remember_cell(&runtime_state, *id, holding);
+            }
+        }
+    }
+
+    fn remember_cell(&self, runtime_state: &ActorRuntimeState, id: u64, holding: bool) {
+        if let Some(cell) = self.cell.get() {
+            if !self.cell_remembered.swap(true, Ordering::Relaxed) {
+                runtime_state.ended_cells.lock().unwrap().ended(id, cell.clone(), holding);
+            }
+        }
+    }
+
     /// A closed mailbox refuses, and hands the op back: this event will never
     /// drive it, so the caller drives it or drops its resolver.
     fn hand_op(
@@ -12076,9 +12099,7 @@ impl Drop for IoContext {
         if let Some((id, runtime_state)) = &self.continuation {
             if let Some(runtime_state) = runtime_state.upgrade() {
                 runtime_state.io_contexts.lock().unwrap().remove(id);
-                if let Some(cell) = self.cell.get() {
-                    runtime_state.ended_cells.lock().unwrap().ended(*id, cell.clone(), self.held_unrefed.load(Ordering::Relaxed));
-                }
+                self.remember_cell(&runtime_state, *id, false);
             }
         }
         if let Some(payload) = first_panic {

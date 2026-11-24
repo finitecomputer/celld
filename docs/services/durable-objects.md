@@ -71,9 +71,12 @@ message can cancel work that an earlier handler awaits. A hibernatable socket
 delivers frames in send order across WebSocket handlers and RPC methods.
 
 A promise chain outlives the event that started it, as in workerd, where an
-object's requests share one I/O context. When a later event settles a promise
-that an ended event chained on, such as a container's `monitor()` after its
-exit, the chain's timers, calls, and storage run in the later event.
+object's requests share one I/O context. When a later event of the same object
+settles a promise that an ended event chained on, such as a container's
+`monitor()` after its exit, the chain's timers, calls, and storage run in the
+later event. An isolate remembers which object each of its last 4096 ended
+events was, and 4096 more that ended with a `monitor()` pending. A chain from
+an older event stops at its next await.
 
 A cell keeps no in-memory state across an eviction, so the constructor runs
 again at the next event. Ownership can also move when a node stops or drains,
