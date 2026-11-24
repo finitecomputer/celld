@@ -51,7 +51,10 @@ checked against v0.6.3 (2026-10-22).
   `upstream-issues/dev-self-fence.md`, 2026-11-11) fenced the node
   ("SELF-FENCE: node lease not renewed within
   TTL", exit 3), taking the whole dev stack down. No setting lengthens the
-  lease. Seen on v0.6.3, 2026-10-22.
+  lease. Seen on v0.6.3, 2026-10-22. On a busy node the renewal also waits
+  for the node's own writes: the leases share SQLite's one writer with
+  every LTX, R2 and deployment write (same file, 2026-11-24). Fixed on
+  this fork: the leases have a database of their own (PR #25).
 - **An alarm more than about two years ahead panics the node.** In any
   object, `await ctx.storage.setAlarm(Date.UTC(2100, 0, 1))` stops
   `celld dev` at once: `thread 'celld-core' panicked at

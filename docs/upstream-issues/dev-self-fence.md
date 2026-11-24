@@ -59,4 +59,40 @@ stack stops.
     could take a longer TTL;
   - the dev lease could live outside the shared SQLite file.
 
-  `celld dev` offers no setting for its lease today.
+  `celld dev` offers no setting for its lease today. The second is now
+  on this fork, for the busy node below.
+
+## A busy node: the renewal waits for the node's own writes
+
+Seen 2026-11-24 in fragment's e2e on this fork's `selfhost` (da094d8),
+with computers in krun microVMs: one fence in 40 minutes, while other
+builds shared the disk.
+
+- **Writers waited and readers did not.** Five renewals in a row timed
+  out (19:33:22 to 19:33:29, at 2.5 s and then at shrinking bounds) and
+  the node fenced. Halfway through, a read of the fleet sample in the
+  same file answered in 3 ms. Worker requests waited 4 to 12 s, and LTX
+  durability proofs timed out.
+- **One writer per database.** Every write to the store is a `BEGIN
+  IMMEDIATE` and a `synchronous=FULL` commit, so it keeps SQLite's write
+  lock through its fsync. The leases shared the file with every LTX, R2
+  and deployment write, so a renewal waited for each write ahead of it.
+  SQLite's busy handler is no queue: a waiter sleeps up to 100 ms between
+  tries and loses the lock to writers that come back sooner.
+- **Measured.** `lanes.py` emulates the store on this disk: writer
+  threads put LTX-sized objects back to back (some of them large), a
+  renewal every 3.33 s, 40 s a run. The renewal's own statements and
+  commit took under 30 ms in every run; the rest was the wait.
+
+  | writers | lease | lock wait, slowest | renewal p90 | renewal, slowest |
+  |---|---|---|---|---|
+  | 16, 5% at 8 MiB | among the objects | 1429 ms | 1335 ms | 1437 ms |
+  | 16, 5% at 8 MiB | its own file | 0 | 24 ms | 27 ms |
+  | 4, 2% at 4 MiB, beside a celld release build | among the objects | 1130 ms | 229 ms | 1157 ms |
+  | 4, 2% at 4 MiB, beside a celld release build | its own file | 0 | 22 ms | 39 ms |
+
+- **Fixed on this fork.** The leases (`nodes/`) have their own database,
+  `leases.sqlite3` beside `objects.sqlite3`, so a renewal waits only for
+  another lease write. A store from before moves its leases over when it
+  opens. This does not help the idle node above: there the renewal's own
+  commit waits on the file system.

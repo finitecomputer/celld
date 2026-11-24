@@ -7,6 +7,15 @@
 //! transaction that a directory of files cannot: a conditional update checks
 //! its ETag and installs the new object in one commit. This backend is local to
 //! one development machine. It is not a shared-filesystem production mode.
+//!
+//! fork: the node leases (`nodes/`) live in a database of their own beside the
+//! objects. SQLite admits one writer per database, and every write here is a
+//! commit that waits on the disk, so a renewal in the shared file queued
+//! behind every LTX, R2 and deployment write the node made. On a busy disk
+//! that wait outran the renewal's bound, and the node fenced itself
+//! (docs/upstream-issues/dev-self-fence.md). A fleet keeps the same lane apart
+//! with a client of its own (`fleet::lease_bucket_client_with_credentials`),
+//! and its object store never makes one key's write wait for another's.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -31,9 +40,21 @@ use std::time::{Duration, SystemTime};
 
 const STORE: &str = "celld development store";
 
+/// The key space of the node leases, `nodes/{node}.json`.
+const LEASES: &str = "nodes/";
+
+/// The first key past [`LEASES`] in byte order: `0` follows `/`.
+const LEASES_END: &str = "nodes0";
+
+/// The leases' database, beside the objects' one.
+const LEASE_DATABASE: &str = "leases.sqlite3";
+
 #[derive(Clone, Debug)]
 pub(crate) struct LocalStore {
+    /// Every object outside [`LEASES`].
     database: PathBuf,
+    /// The objects in [`LEASES`].
+    leases: PathBuf,
 }
 
 #[derive(Debug)]
@@ -54,40 +75,99 @@ struct StoredAttribute {
 }
 
 impl LocalStore {
+    /// The store whose objects live in `database`, and whose leases live in
+    /// [`LEASE_DATABASE`] beside it.
     pub(crate) fn open(database: impl AsRef<FsPath>) -> object_store::Result<Self> {
         let database = database.as_ref().to_path_buf();
-        let store = Self { database };
-        let connection = store.connect()?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(db_error)?;
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS objects (
-                   key TEXT PRIMARY KEY,
-                   body BLOB NOT NULL,
-                   etag INTEGER NOT NULL,
-                   modified_ms INTEGER NOT NULL,
-                   attributes TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS store_sequence (
-                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                   next_etag INTEGER NOT NULL
-                 );
-                 INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);",
-            )
-            .map_err(db_error)?;
+        let leases = database.with_file_name(LEASE_DATABASE);
+        let store = Self { database, leases };
+        for database in [&store.database, &store.leases] {
+            create_schema(&connect(database)?)?;
+        }
+        store.move_leases_from_objects()?;
         Ok(store)
     }
 
-    fn connect(&self) -> object_store::Result<Connection> {
-        let connection = Connection::open(&self.database).map_err(db_error)?;
-        configure_connection(&connection)?;
-        Ok(connection)
+    /// The database that holds `key`.
+    fn database_of(&self, key: &str) -> &FsPath {
+        if key.starts_with(LEASES) {
+            &self.leases
+        } else {
+            &self.database
+        }
+    }
+
+    /// Moves the leases a celld before the split kept among the objects into
+    /// their own database. A move cut short finishes at the next open: a
+    /// lease already in its own database wins, and a copy among the objects
+    /// is deleted only after the leases' commit, and only as it was copied.
+    fn move_leases_from_objects(&self) -> object_store::Result<()> {
+        let objects = connect(&self.database)?;
+        let mut statement = objects
+            .prepare(
+                "SELECT key, body, etag, modified_ms, attributes FROM objects
+                 WHERE key >= ?1 AND key < ?2",
+            )
+            .map_err(db_error)?;
+        let moved = statement
+            .query_map([LEASES, LEASES_END], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        drop(statement);
+        if moved.is_empty() {
+            return Ok(());
+        }
+        let next_etag: i64 = objects
+            .query_row(
+                "SELECT next_etag FROM store_sequence WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        let mut leases = connect(&self.leases)?;
+        let transaction = leases
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        for (key, body, etag, modified_ms, attributes) in &moved {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO objects(key, body, etag, modified_ms, attributes)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![key, body, etag, modified_ms, attributes],
+                )
+                .map_err(db_error)?;
+        }
+        // A holder of an ETag the objects' sequence issued must never match a
+        // later version, so the leases' sequence goes on above it.
+        transaction
+            .execute(
+                "UPDATE store_sequence SET next_etag = max(next_etag, ?1) WHERE singleton = 1",
+                [next_etag],
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+        for (key, _, etag, _, _) in &moved {
+            objects
+                .execute(
+                    "DELETE FROM objects WHERE key = ?1 AND etag = ?2",
+                    params![key, etag],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(())
     }
 
     fn read(&self, key: &str) -> object_store::Result<StoredObject> {
-        self.connect()?
+        connect(self.database_of(key))?
             .query_row(
                 "SELECT key, body, etag, modified_ms, attributes, length(body)
                  FROM objects WHERE key = ?1",
@@ -118,33 +198,24 @@ impl LocalStore {
     /// prefix are one run of the primary key's index (BINARY order is byte
     /// order), so the scan starts at `prefix` and stops at the first key past
     /// it. The callers still filter as before.
+    ///
+    /// Each database is read only when its key space can hold `prefix`: a
+    /// prefix inside [`LEASES`] names no other object, and one that does not
+    /// lead into it names no lease.
     fn metadata(&self, prefix: &str) -> object_store::Result<Vec<StoredObject>> {
-        let connection = self.connect()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
-                 FROM objects WHERE key >= ?1 ORDER BY key",
-            )
-            .map_err(db_error)?;
-        let rows = statement
-            .query_map([prefix], |row| {
-                Ok(StoredObject {
-                    key: row.get(0)?,
-                    body: row.get(1)?,
-                    size: row.get(5)?,
-                    etag: row.get(2)?,
-                    modified_ms: row.get(3)?,
-                    attributes: row.get(4)?,
-                })
-            })
-            .map_err(db_error)?;
-        let mut objects = Vec::new();
-        for row in rows {
-            let object = row.map_err(db_error)?;
-            if !object.key.starts_with(prefix) {
-                break;
-            }
-            objects.push(object);
+        let in_leases = prefix.starts_with(LEASES);
+        let mut objects = if in_leases {
+            Vec::new()
+        } else {
+            metadata_in(&self.database, prefix)?
+        };
+        if in_leases || LEASES.starts_with(prefix) {
+            // A lease that a celld before the split wrote among the objects
+            // after the move is not one this store reads, so no listing shows
+            // it either.
+            objects.retain(|object| !object.key.starts_with(LEASES));
+            objects.extend(metadata_in(&self.leases, prefix)?);
+            objects.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         }
         Ok(objects)
     }
@@ -157,7 +228,7 @@ impl LocalStore {
     ) -> object_store::Result<PutResult> {
         let attributes = encode_attributes(&options.attributes)?;
         let modified_ms = crate::asyncrt::wall_ms();
-        let mut connection = self.connect()?;
+        let mut connection = connect(self.database_of(&key))?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
@@ -223,6 +294,66 @@ impl LocalStore {
         )?;
         Ok(())
     }
+}
+
+fn create_schema(connection: &Connection) -> object_store::Result<()> {
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(db_error)?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS objects (
+               key TEXT PRIMARY KEY,
+               body BLOB NOT NULL,
+               etag INTEGER NOT NULL,
+               modified_ms INTEGER NOT NULL,
+               attributes TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS store_sequence (
+               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+               next_etag INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);",
+        )
+        .map_err(db_error)
+}
+
+fn connect(database: &FsPath) -> object_store::Result<Connection> {
+    let connection = Connection::open(database).map_err(db_error)?;
+    configure_connection(&connection)?;
+    Ok(connection)
+}
+
+/// [`LocalStore::metadata`] in one of its databases.
+fn metadata_in(database: &FsPath, prefix: &str) -> object_store::Result<Vec<StoredObject>> {
+    let connection = connect(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
+             FROM objects WHERE key >= ?1 ORDER BY key",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([prefix], |row| {
+            Ok(StoredObject {
+                key: row.get(0)?,
+                body: row.get(1)?,
+                size: row.get(5)?,
+                etag: row.get(2)?,
+                modified_ms: row.get(3)?,
+                attributes: row.get(4)?,
+            })
+        })
+        .map_err(db_error)?;
+    let mut objects = Vec::new();
+    for row in rows {
+        let object = row.map_err(db_error)?;
+        if !object.key.starts_with(prefix) {
+            break;
+        }
+        objects.push(object);
+    }
+    Ok(objects)
 }
 
 fn configure_connection(connection: &Connection) -> object_store::Result<()> {
@@ -302,9 +433,8 @@ impl ObjectStore for LocalStore {
         let store = self.clone();
         let key = location.to_string();
         crate::asyncrt::blocking(move || {
-            store
-                .connect()?
-                .execute("DELETE FROM objects WHERE key = ?1", [key])
+            connect(store.database_of(&key))?
+                .execute("DELETE FROM objects WHERE key = ?1", [&key])
                 .map_err(db_error)?;
             Ok(())
         })
@@ -655,5 +785,142 @@ mod prefix_tests {
             .unwrap();
         assert_eq!(keys(&second.result.objects), ["cells/a/ltx/e1/3", top]);
         assert_eq!(second.page_token, None);
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use crate::bucket::Bucket;
+
+    /// The longest the core lets one renewal take (`actor::effects`: half
+    /// the remaining authority, at most 2.5 s).
+    const RENEWAL_BOUND: Duration = Duration::from_millis(2_500);
+
+    const LEASE: &str = "nodes/dev-1.json";
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        crate::container::tests::rt().block_on(future)
+    }
+
+    /// A renewal does not wait for the node's other writes. SQLite admits one
+    /// writer per database, and a write keeps it until its commit is on disk,
+    /// on a busy disk for seconds. Here another write holds the objects'
+    /// database past a renewal's bound. With the leases among the objects the
+    /// renewal waited behind it and timed out, and five such misses in a row
+    /// fenced the node (fragment's krun e2e, 2026-11-24).
+    #[test]
+    fn a_renewal_does_not_wait_for_another_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("objects.sqlite3");
+        let bucket = Bucket::open_dev(&database).unwrap();
+        let token = block_on(bucket.put_cas(LEASE, b"{\"expires_ms\":1}".to_vec(), None))
+            .unwrap()
+            .unwrap();
+
+        // The node's LTX shipper, its write not yet committed.
+        let mut other = Connection::open(&database).unwrap();
+        let held = other
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        held.execute(
+            "INSERT INTO objects(key, body, etag, modified_ms, attributes)
+             VALUES ('cells/a/ltx/1', x'00', 0, 0, '[]')",
+            [],
+        )
+        .unwrap();
+
+        let renewed = block_on(crate::asyncrt::timeout(
+            RENEWAL_BOUND,
+            bucket.put_cas(LEASE, b"{\"expires_ms\":2}".to_vec(), Some(&token)),
+        ));
+        held.commit().unwrap();
+        let renewed = renewed
+            .expect("the renewal waited past its bound for another write to commit")
+            .unwrap();
+        assert!(renewed.is_some(), "the renewal's compare-and-swap was refused");
+    }
+
+    /// The leases keep their compare-and-swap across processes. Of two stores
+    /// on one state directory (a node and the next one), a lease is created
+    /// once, and of two renewals from one version, the second is refused.
+    #[test]
+    fn two_stores_change_a_lease_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("objects.sqlite3");
+        let first = Bucket::open_dev(&database).unwrap();
+        let second = Bucket::open_dev(&database).unwrap();
+
+        let token = block_on(first.put_cas(LEASE, b"first".to_vec(), None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            block_on(second.put_cas(LEASE, b"second".to_vec(), None)).unwrap(),
+            None
+        );
+        assert!(block_on(first.put_cas(LEASE, b"renewed".to_vec(), Some(&token)))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            block_on(second.put_cas(LEASE, b"stale".to_vec(), Some(&token))).unwrap(),
+            None
+        );
+        let (body, _) = block_on(second.get(LEASE)).unwrap().unwrap();
+        assert_eq!(&body[..], b"renewed");
+    }
+
+    /// A state directory from before the split keeps its leases: each moves
+    /// to its own database with its version, so its holder's next renewal
+    /// applies, and every version after it is new. The other objects stay,
+    /// and a listing still reads both.
+    #[test]
+    fn a_store_from_before_the_split_keeps_its_leases() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("objects.sqlite3");
+        {
+            let connection = Connection::open(&database).unwrap();
+            create_schema(&connection).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO objects(key, body, etag, modified_ms, attributes)
+                     VALUES ('nodes/dev-1.json', x'7b7d', 7, 0, '[]'),
+                            ('cells/a/ltx/1', x'00', 8, 0, '[]');
+                     UPDATE store_sequence SET next_etag = 9;",
+                )
+                .unwrap();
+        }
+
+        let bucket = Bucket::open_dev(&database).unwrap();
+        let (body, token) = block_on(bucket.get(LEASE)).unwrap().unwrap();
+        assert_eq!((&body[..], token.as_str()), (&b"{}"[..], "7"));
+        let renewed = block_on(bucket.put_cas(LEASE, b"{}".to_vec(), Some("7")))
+            .unwrap()
+            .unwrap();
+        assert!(renewed.parse::<i64>().unwrap() >= 9, "version {renewed} was issued before");
+
+        let objects = Connection::open(&database).unwrap();
+        let left: i64 = objects
+            .query_row(
+                "SELECT count(*) FROM objects WHERE key >= ?1 AND key < ?2",
+                [LEASES, LEASES_END],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "a lease stayed among the objects");
+
+        let store = LocalStore::open(&database).unwrap();
+        let keys = |prefix| -> Vec<String> {
+            store
+                .metadata(prefix)
+                .unwrap()
+                .into_iter()
+                .map(|object| object.key)
+                .collect()
+        };
+        assert_eq!(keys(""), ["cells/a/ltx/1", LEASE]);
+        assert_eq!(keys("nodes"), [LEASE]);
+        assert_eq!(keys("cells/"), ["cells/a/ltx/1"]);
+        let (_, token) = block_on(bucket.get(LEASE)).unwrap().unwrap();
+        assert_eq!(token, renewed, "opening again changed the lease");
     }
 }
