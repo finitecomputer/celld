@@ -559,7 +559,7 @@ mod tests {
         assert_eq!((store.order.len(), store.expiry.len()), (store.len(), store.len()));
 
         assert!(store.put(key("https://a/big"), body(10), 1_000, None, 0));
-        assert!(!store.put(key("https://a/big"), body(4 * 1000), 1_000, None, 0), "larger than the store");
+        assert!(!store.put(key("https://a/big"), body(3 * one as usize), 1_000, None, 0), "larger than the store");
         assert!(store.get(&key("https://a/big"), 1).is_none(), "and the older one is gone");
 
         let mut none = Store::new(0);
