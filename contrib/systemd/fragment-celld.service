@@ -3,7 +3,7 @@
 # are off are off; install.sh installs it.
 [Unit]
 Description=celld, the Workers runtime of a self-hosted Fragment
-Documentation=https://github.com/futurepaul/celld/blob/selfhost/contrib/systemd/README.md
+Documentation=https://github.com/finitecomputer/celld/blob/selfhost/contrib/systemd/README.md
 Wants=network-online.target
 After=network-online.target sandcastle-engine.service
 

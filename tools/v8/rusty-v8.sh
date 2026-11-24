@@ -23,14 +23,14 @@
 #
 # Environment: CELLD_V8_WORK (default ~/.cache/celld-v8), CELLD_V8_JOBS
 # (default 16; other work shares the box), CELLD_V8_REPO (default
-# futurepaul/celld), CELLD_TARGET_DIR (celld's target dir for verify),
+# finitecomputer/celld), CELLD_TARGET_DIR (celld's target dir for verify),
 # CELLD_V8_TARGET (above), CELLD_V8_DENO_COMMIT (build: the
 # denoland/v8 commit whose tree the patched V8 must equal, default the head of
 # its lkgr branch; a second target names the first's, as the branch moves on).
 set -euo pipefail
 
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-REPO=${CELLD_V8_REPO:-futurepaul/celld}
+REPO=${CELLD_V8_REPO:-finitecomputer/celld}
 WORK=${CELLD_V8_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/celld-v8}
 JOBS=${CELLD_V8_JOBS:-16}
 CHROMIUM_V8=https://chromium.googlesource.com/v8/v8
