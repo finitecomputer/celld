@@ -223,9 +223,10 @@ impl Docker {
     }
 
     /// fork: `post_octets` with a body read from `body` as it arrives and
-    /// sent chunked, never whole in memory: a `docker save` of an image of
-    /// several GB, piped to the krun engine's `POST /v1/images/load`, which
-    /// writes the body to a file as it comes. A read error fails the call.
+    /// sent chunked, never whole in memory: an image of several GB, from
+    /// the krun engine's image builder (`krun_build`) to its
+    /// `POST /v1/images/load`, which writes the body to a file as it comes.
+    /// A read error fails the call.
     pub async fn post_stream(
         &self,
         path: &str,

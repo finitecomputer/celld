@@ -65,10 +65,24 @@ image rides with every deployment that has a container.
 
 `celld deploy` builds and pulls for `linux/amd64`, as Wrangler does.
 `CELLD_CONTAINER_PLATFORM` selects another platform. `celld dev` builds for the
-local machine and keeps the image in the local engine. A krun engine never reads
-Docker's store, so on one `celld dev` loads each image it built into the engine
-when the engine lacks it, under the content reference a node starts it by, the
-`docker save` piped to the engine as it is written.
+local machine and keeps the image in the local engine.
+
+On the krun engine, `celld dev` needs no Docker: it builds each image with
+BuildKit (`moby/buildkit` v0.35.1, pinned by digest) in a microVM of that
+engine, and the engine loads it from there. The VM lives while the deploy
+builds, its context sent in as a tar less what `.dockerignore` leaves out.
+BuildKit's cache is on the engine's data disk `celld-buildkit-64g`, 64 GiB,
+collected to at most 44 GB when each deploy's builds end and trimmed so the
+engine's file shrinks with it; `DELETE /v1/data/celld-buildkit-64g` on the
+engine resets it. An image's name is `celld-image:<config digest>`, built with
+`SOURCE_DATE_EPOCH=0` so that the same layers make the same name: an unchanged
+image exports nothing, and a changed one is exported once, checked against its
+name, and loaded. The builder is one VM per engine, `celld-builder`, since the
+engine refuses a second VM of a running name but not a second VM on a disk: a
+second deploy waits for the first, and a builder whose `celld` has gone is
+destroyed. A pulled reference
+builds as `FROM <reference>`. `celld deploy` still builds with the `docker`
+CLI: the bucket's tar is Docker's `save`.
 
 The container runs on the node that owns the cell. Each node that serves a
 container class needs a Docker or Podman daemon. celld uses the Unix socket

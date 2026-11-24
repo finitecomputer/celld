@@ -139,6 +139,10 @@ sha2 = "0.10"
 # policy. Pin the audited C amalgamation exactly.
 sqlite-vec = "=0.1.9"
 subtle = "2"
+# fork: the build context the krun engine's image builder unpacks
+# (crates/celld/build_context.rs); no xattrs, which BuildKit's client
+# does not send either.
+tar = { version = "0.4.46", default-features = false }
 tempfile = "3"
 thiserror = "2"
 # `stats` makes `stats.allocated` and `stats.resident` readable. The pressure

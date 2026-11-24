@@ -583,7 +583,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
              (or CELLD_BUCKET)"
         );
     }
-    let built = deploy::build(&options)?;
+    let built = deploy::build(&options).await?;
     built.report();
     let mut out = Output::new(if options.json {
         Format::Json

@@ -619,7 +619,7 @@ fn gzipped(modules: &[(String, Vec<u8>)]) -> usize {
     encoder.finish().map(|out| out.len()).unwrap_or_default()
 }
 
-pub fn build(options: &Options) -> anyhow::Result<Built> {
+pub async fn build(options: &Options) -> anyhow::Result<Built> {
     let config_path = resolve_config(options.config.clone())?;
     let root = config_path
         .parent()
@@ -640,25 +640,14 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     // `ctx.container` that never runs, and builds, pulls and saves no image:
     // `ctx.container.images` is empty there.
     let runs_containers = crate::container::runs_containers();
+    let mut builder = ImageBuilder::for_build(options.local_images);
+    let resolved = resolve_declared(&project.containers, &root, platform.as_deref(), runs_containers, &mut builder).await;
+    // The builder's VM goes whether or not a build failed.
+    let finished = builder.finish().await;
+    let resolved = resolved?;
+    finished?;
     let mut container_specs: Vec<ContainerSpec> = Vec::new();
-    for decl in &project.containers {
-        let image = decl
-            .image
-            .as_deref()
-            .filter(|_| runs_containers)
-            .map(|image| resolve_image(&root, image, platform.as_deref()))
-            .transpose()?;
-        let images = decl
-            .images
-            .iter()
-            .filter(|_| runs_containers)
-            .map(|(name, image)| {
-                Ok((
-                    name.clone(),
-                    resolve_named_image(&root, image, platform.as_deref())?,
-                ))
-            })
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    for (decl, (image, images)) in project.containers.iter().zip(resolved) {
         container_specs.push(ContainerSpec {
             class_name: decl.class_name.clone(),
             image,
@@ -870,6 +859,78 @@ fn run_engine(args: &[&str], what: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// fork: what builds a deployment's images: Docker's CLI, as upstream; or,
+/// for a dev node on the krun engine (`celld dev` with
+/// `CELLD_CONTAINER_ENGINE=krun:<socket>`), BuildKit in a microVM of that
+/// engine, which loads each image into it (`krun_build`), so the machine
+/// needs no Docker. A fleet deploy saves each image's tar to the bucket,
+/// which only Docker's build writes here.
+enum ImageBuilder {
+    Docker,
+    Krun(crate::krun_build::Builder),
+}
+
+impl ImageBuilder {
+    fn for_build(local_images: bool) -> Self {
+        match crate::container::EngineChoice::parse(std::env::var("CELLD_CONTAINER_ENGINE").ok().as_deref()) {
+            Ok(crate::container::EngineChoice::Krun(socket)) if local_images => {
+                Self::Krun(crate::krun_build::Builder::new(&socket))
+            }
+            _ => Self::Docker,
+        }
+    }
+
+    async fn finish(self) -> anyhow::Result<()> {
+        match self {
+            Self::Docker => Ok(()),
+            Self::Krun(builder) => builder.finish().await,
+        }
+    }
+
+    async fn build(&mut self, label: &str, spec: &crate::krun_build::Spec) -> anyhow::Result<String> {
+        match self {
+            Self::Docker => content_reference(&docker_build(spec)?),
+            Self::Krun(builder) => builder.build(label, spec).await,
+        }
+    }
+
+    async fn pull(&mut self, image: &str, platform: Option<&str>) -> anyhow::Result<String> {
+        if let Some(resolved) = already_resolved(image) {
+            return Ok(resolved);
+        }
+        match self {
+            Self::Docker => docker_pull(image, platform),
+            Self::Krun(builder) => builder.pull(image, platform).await,
+        }
+    }
+}
+
+/// Each container class's images, resolved (`resolve_image`,
+/// `resolve_named_image`): none for nodes that run no container.
+async fn resolve_declared(
+    containers: &[ContainerDecl],
+    root: &Path,
+    platform: Option<&str>,
+    runs_containers: bool,
+    builder: &mut ImageBuilder,
+) -> anyhow::Result<Vec<(Option<String>, BTreeMap<String, String>)>> {
+    let mut resolved = Vec::with_capacity(containers.len());
+    for decl in containers {
+        let mut image = None;
+        let mut images = BTreeMap::new();
+        if runs_containers {
+            if let Some(declared) = &decl.image {
+                image = Some(resolve_image(root, declared, platform, builder).await?);
+            }
+            for (name, declared) in &decl.images {
+                images.insert(name.clone(), resolve_named_image(root, name, declared, platform, builder).await?);
+            }
+        }
+        resolved.push((image, images));
+    }
+    Ok(resolved)
+}
+
 /// The fleet reference of the image a `containers[].image` names: build
 /// the Dockerfile, or pull the reference, then tag the result by its
 /// content. A platform pins the build and the pull to the nodes'
@@ -882,49 +943,50 @@ fn run_engine(args: &[&str], what: &str) -> anyhow::Result<String> {
 /// bucket. The layer digests and the image config are stable across such
 /// builds, so their hash names the image everywhere: in the manifest, in
 /// the bucket key, and as the tag every engine holds it under.
-fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Result<String> {
+async fn resolve_image(
+    root: &Path,
+    image: &str,
+    platform: Option<&str>,
+    builder: &mut ImageBuilder,
+) -> anyhow::Result<String> {
     if let Some(resolved) = already_resolved(image) {
         return Ok(resolved);
     }
     if is_dockerfile(root, image) {
-        let id = build_image(root, image, None, &BTreeMap::new(), platform)?;
-        return content_reference(&id);
+        let spec = build_spec(root, image, None, &BTreeMap::new(), platform);
+        return builder.build(image, &spec).await;
     }
-    pull_image(image, platform)
+    builder.pull(image, platform).await
 }
 
 /// One named image of `containers[].images`.
-fn resolve_named_image(
+async fn resolve_named_image(
     root: &Path,
+    name: &str,
     image: &ImageDecl,
     platform: Option<&str>,
+    builder: &mut ImageBuilder,
 ) -> anyhow::Result<String> {
     match (&image.dockerfile, &image.image) {
         (Some(dockerfile), None) => {
-            let id = build_image(
-                root,
-                dockerfile,
-                image.build_context.as_deref(),
-                &image.build_vars,
-                platform,
-            )?;
-            content_reference(&id)
+            let spec = build_spec(root, dockerfile, image.build_context.as_deref(), &image.build_vars, platform);
+            builder.build(name, &spec).await
         }
-        (None, Some(reference)) => pull_image(reference, platform),
+        (None, Some(reference)) => builder.pull(reference, platform).await,
         _ => bail!("a named image is one of `dockerfile` and `image`"),
     }
 }
 
-/// `docker build` of `dockerfile` (relative to the project) in `context`
+/// The build of `dockerfile` (relative to the project) in `context`
 /// (relative to the project; the Dockerfile's directory by default), with
-/// `vars` as build arguments; the built image's id.
-fn build_image(
+/// `vars` as build arguments.
+fn build_spec(
     root: &Path,
     dockerfile: &str,
     context: Option<&str>,
     vars: &BTreeMap<String, String>,
     platform: Option<&str>,
-) -> anyhow::Result<String> {
+) -> crate::krun_build::Spec {
     let path = root.join(dockerfile);
     let context = match context {
         Some(context) => root.join(context),
@@ -934,14 +996,25 @@ fn build_image(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| root.to_path_buf()),
     };
-    let path = path.display().to_string();
-    let context = context.display().to_string();
-    let build_args: Vec<String> = vars
+    crate::krun_build::Spec {
+        dockerfile: path,
+        context,
+        vars: vars.clone(),
+        platform: platform.map(str::to_string),
+    }
+}
+
+/// `docker build` of `spec`; the built image's id.
+fn docker_build(spec: &crate::krun_build::Spec) -> anyhow::Result<String> {
+    let path = spec.dockerfile.display().to_string();
+    let context = spec.context.display().to_string();
+    let build_args: Vec<String> = spec
+        .vars
         .iter()
         .flat_map(|(name, value)| ["--build-arg".to_string(), format!("{name}={value}")])
         .collect();
     let mut args = vec!["build", "-q"];
-    if let Some(platform) = platform {
+    if let Some(platform) = &spec.platform {
         args.extend(["--platform", platform]);
     }
     args.extend(build_args.iter().map(String::as_str));
@@ -951,10 +1024,7 @@ fn build_image(
 
 /// An image reference pulled (unless already held for this machine) and
 /// named by its content.
-fn pull_image(image: &str, platform: Option<&str>) -> anyhow::Result<String> {
-    if let Some(resolved) = already_resolved(image) {
-        return Ok(resolved);
-    }
+fn docker_pull(image: &str, platform: Option<&str>) -> anyhow::Result<String> {
     let platform_args = platform
         .map(|platform| vec!["--platform", platform])
         .unwrap_or_default();
@@ -1009,7 +1079,10 @@ fn resolve_fence_image(platform: Option<&str>) -> anyhow::Result<String> {
     let context = tempfile::tempdir().context("fence image build context")?;
     std::fs::write(context.path().join("Dockerfile"), FENCE_DOCKERFILE)
         .context("write fence Dockerfile")?;
-    resolve_image(context.path(), "Dockerfile", platform).context("build the celld-fence image")
+    let spec = build_spec(context.path(), "Dockerfile", None, &BTreeMap::new(), platform);
+    docker_build(&spec)
+        .and_then(|id| content_reference(&id))
+        .context("build the celld-fence image")
 }
 
 /// Save the image to the bucket under its content key unless it is there.

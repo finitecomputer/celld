@@ -39,6 +39,8 @@ mod asyncrt_contract_tests {
     include!(env!("CELLD_INTERNAL_ASYNCRT_TESTS"));
 }
 pub mod bucket;
+// fork: an image's build context as a tar, for the krun engine's builder
+mod build_context;
 pub mod cell_cli;
 pub mod cell_dispatch;
 mod cell_host;
@@ -68,6 +70,8 @@ pub mod fault {
 pub(crate) mod facet_streams;
 pub mod fleet;
 pub mod generation;
+// fork: images built with BuildKit in a microVM of the krun engine
+mod krun_build;
 pub mod host_channels;
 pub mod host_services;
 pub mod http_streams;
