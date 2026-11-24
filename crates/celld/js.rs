@@ -7291,16 +7291,21 @@ fn op_cache_put(
     let Some(body) = view_bytes(args.get(5)) else {
         return loader_throw(scope, "cache: the body is not a typed array");
     };
-    let kept = match crate::cache_api::keep_for(status, &headers, crate::asyncrt::wall_ms()) {
-        crate::cache_api::Keep::For { ttl_ms, headers } => {
+    // both clocks read before the lock: a wait for it spends no lifetime
+    let (wall, now) = (crate::asyncrt::wall_ms(), crate::asyncrt::mono_ms());
+    let kept = match crate::cache_api::keep_for(status, &headers, wall) {
+        crate::cache_api::Keep::For { ttl_ms, headers, age_s } => {
             let stored = crate::cache_api::Stored { status, status_text, headers, body };
             let mut store = crate::cache_api::node().lock().expect("cache store lock poisoned");
-            store.put(key, stored, ttl_ms, crate::asyncrt::mono_ms())
+            store.put(key, stored, ttl_ms, age_s, now)
         }
-        // a put that keeps nothing still replaces what the URL held
-        crate::cache_api::Keep::Not(_) => {
-            let mut store = crate::cache_api::node().lock().expect("cache store lock poisoned");
-            store.delete(&key, crate::asyncrt::mono_ms());
+        // a put that keeps nothing still replaces what the URL held, but a
+        // 304's says the stored representation holds
+        crate::cache_api::Keep::Not(why) => {
+            if why.replaces() {
+                let mut store = crate::cache_api::node().lock().expect("cache store lock poisoned");
+                store.delete(&key, now);
+            }
             false
         }
     };
@@ -7317,14 +7322,24 @@ fn op_cache_match(
     let Some(key) = cache_key(scope, &args) else {
         return;
     };
+    let now = crate::asyncrt::mono_ms();
     let found = crate::cache_api::node()
         .lock()
         .expect("cache store lock poisoned")
-        .get(&key, crate::asyncrt::mono_ms());
-    let Some(stored) = found else {
+        .get(&key, now);
+    let Some(crate::cache_api::Hit { stored, age_s }) = found else {
         return;
     };
-    let headers = serde_json::to_string(&stored.headers).expect("headers serialize");
+    // a response that arrived with an `Age` leaves with its age now
+    let headers: Vec<(&str, std::borrow::Cow<str>)> = stored
+        .headers
+        .iter()
+        .map(|(name, value)| match age_s {
+            Some(age) if name.eq_ignore_ascii_case("age") => (name.as_str(), age.to_string().into()),
+            _ => (name.as_str(), value.as_str().into()),
+        })
+        .collect();
+    let headers = serde_json::to_string(&headers).expect("headers serialize");
     let values = [
         v8::Integer::new_from_unsigned(scope, u32::from(stored.status)).into(),
         v8::String::new(scope, &stored.status_text).unwrap().into(),

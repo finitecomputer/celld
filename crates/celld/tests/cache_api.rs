@@ -23,7 +23,7 @@ const seen = async (found) => found === undefined
   : { hit: true, status: found.status, body: await found.text(), type: found.headers.get("content-type"), mine: found.headers.get("x-mine"), cookie: found.headers.get("set-cookie") };
 
 const put = async (cache, k, status, headers) => {
-  await cache.put(KEY(k), new Response(status === 204 ? null : "body of " + k, { status, headers: { "content-type": "text/plain", ...headers } }));
+  await cache.put(KEY(k), new Response(status === 204 || status === 304 ? null : "body of " + k, { status, headers: { "content-type": "text/plain", ...headers } }));
 };
 
 // A Durable Object puts, so its isolate is not the stateless one that
@@ -71,6 +71,13 @@ export default {
         return Response.json({
           plain: await seen(await caches.default.match(new Request(KEY(k), { method: "POST" }))),
           ignoring: await seen(await caches.default.match(new Request(KEY(k), { method: "POST" }), { ignoreMethod: true })),
+        });
+      case "/match-partial":
+        return Response.json({
+          range: await seen(await caches.default.match(new Request(KEY(k), { headers: { range: "bytes=0-1" } }))),
+          etag: await seen(await caches.default.match(new Request(KEY(k), { headers: { "if-none-match": "\"x\"" } }))),
+          since: await seen(await caches.default.match(new Request(KEY(k), { headers: { "if-modified-since": "Sun, 09 Sep 2001 01:46:40 GMT" } }))),
+          whole: await seen(await caches.default.match(new Request(KEY(k)))),
         });
       case "/delete":
         return Response.json(await caches.default.delete(KEY(k)));
@@ -142,8 +149,10 @@ fn a_put_is_matched_across_the_nodes_isolates() {
 // Cache-Control, or a status's default; nothing for no-store, private,
 // no-cache, max-age=0, a Set-Cookie, or a status with no default; a
 // private=Set-Cookie response kept without its cookie; a put that keeps
-// nothing replaces what the URL held. A match or delete of a non-GET
-// request considers it only with ignoreMethod.
+// nothing replaces what the URL held, but a 304 replaces nothing. A match
+// or delete of a non-GET request considers it only with ignoreMethod; a
+// range or conditional request misses. The key is the URL less its
+// fragment.
 #[test]
 fn a_put_keeps_what_cloudflare_keeps() {
     let dir = tempfile::tempdir().unwrap();
@@ -180,6 +189,25 @@ fn a_put_keeps_what_cloudflare_keeps() {
     dev.get("/put?k=post&cc=max-age%3D60").unwrap();
     let got = dev.json("/match-post?k=post").0;
     assert_eq!((got["plain"]["hit"].as_bool(), got["ignoring"]["hit"].as_bool()), (Some(false), Some(true)), "{got}");
+
+    // a 304 validates what the URL holds and replaces nothing
+    dev.get("/put?k=validated&cc=max-age%3D60").unwrap();
+    dev.get("/put?k=validated&status=304&cc=max-age%3D60").unwrap();
+    assert_eq!((hit(&dev, "validated")["status"].as_u64(), hit(&dev, "validated")["body"].as_str()), (Some(200), Some("body of validated")));
+
+    // a range or a conditional request misses (Cloudflare's 206 and 304 are not answered); the plain one hits
+    let got = dev.json("/match-partial?k=validated").0;
+    assert_eq!(
+        [&got["range"]["hit"], &got["etag"]["hit"], &got["since"]["hit"], &got["whole"]["hit"]],
+        [false, false, false, true],
+        "{got}"
+    );
+
+    // the URL is the key as written, less its fragment: a bare `?` is another URL
+    dev.get("/put?k=report%3F&cc=max-age%3D60").unwrap();
+    assert_eq!((hit(&dev, "report")["hit"].as_bool(), hit(&dev, "report%3F")["hit"].as_bool()), (Some(false), Some(true)));
+    dev.get("/put?k=frag%23one&cc=max-age%3D60").unwrap();
+    assert_eq!(hit(&dev, "frag%23two")["hit"], true, "the fragment is not part of it");
 }
 
 // Goal: a named cache keeps its own entries apart from the default's, and

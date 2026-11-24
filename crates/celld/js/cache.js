@@ -26,14 +26,25 @@
       throw new TypeError(
         "Invalid URL. Cache API keys must be fully-qualified, valid URLs.");
     }
-    parsed.hash = "";
+    // cut at the serialized fragment, which keeps the rest as it is: a bare
+    // `?` stays, and is another URL
+    const href = parsed.href;
+    const hash = href.indexOf("#");
     const method = request instanceof Request ? request.method : "GET";
-    return { url: parsed.href, method };
+    const headers = request instanceof Request ? request.headers : null;
+    return { url: hash < 0 ? href : href.slice(0, hash), method, headers };
   };
 
   // A match or delete considers only a GET, unless `ignoreMethod`.
   const considered = (key, options) =>
     key.method === "GET" || Boolean(options && options.ignoreMethod);
+
+  // Cloudflare answers these from the cache with a 206 or a 304; the node
+  // answers neither, so it misses, and the Worker's own path answers them
+  // as it did when every match missed.
+  const partOrCondition = ["range", "if-none-match", "if-modified-since"];
+  const whole = (key) =>
+    key.headers === null || !partOrCondition.some((h) => key.headers.has(h));
 
   class Cache {
     constructor(token = undefined, name = null) {
@@ -77,7 +88,7 @@
 
     async match(request, options = undefined) {
       const key = asKey(request);
-      if (!considered(key, options)) return undefined;
+      if (!considered(key, options) || !whole(key)) return undefined;
       const found = __cache_match(this[kName], key.url);
       if (found === undefined) return undefined;
       const [status, statusText, headers, body] = found;
