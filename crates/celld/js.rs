@@ -2602,6 +2602,10 @@ struct ActorRuntimeState {
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
+    /// The cell of each cell event that ended, by continuation id, so an op
+    /// one of its continuations enqueues later goes to an event of that same
+    /// cell, never another's (`InFlight::hand_op`).
+    ended_cells: Mutex<EndedCells>,
     /// WebSocket captures that received a frame in the current isolate turn.
     /// Weak references record every continuation context without extending
     /// an event's lifetime merely to flush its output.
@@ -2689,6 +2693,45 @@ impl ActorRuntimeState {
             contexts.remove(&id);
         }
         context
+    }
+
+    /// The cell of ended cell event `id`, while it is remembered.
+    fn ended_cell(&self, id: u64) -> Option<Arc<str>> {
+        self.ended_cells.lock().unwrap().cells.get(&id).cloned()
+    }
+}
+
+/// How many ended cell events an isolate remembers the cell of. An op that
+/// a continuation of an older one enqueues is dropped, as every such op was
+/// before this record.
+const ENDED_CELLS_MAX: usize = 4096;
+/// How many more it remembers of those that enqueued an op unable to keep
+/// them alive, such as a container's `monitor()`, which a later event settles
+/// perhaps much later, so a long run of other events does not push them out.
+const ENDED_HOLDING_CELLS_MAX: usize = 4096;
+
+/// The cells of ended cell events (`ActorRuntimeState::ended_cells`): each
+/// kind kept to its bound, the oldest let go first.
+#[derive(Default)]
+struct EndedCells {
+    cells: HashMap<u64, Arc<str>>,
+    recent: std::collections::VecDeque<u64>,
+    holding: std::collections::VecDeque<u64>,
+}
+
+impl EndedCells {
+    fn ended(&mut self, id: u64, cell: Arc<str>, holding: bool) {
+        let (order, max) = if holding {
+            (&mut self.holding, ENDED_HOLDING_CELLS_MAX)
+        } else {
+            (&mut self.recent, ENDED_CELLS_MAX)
+        };
+        order.push_back(id);
+        let gone = if order.len() > max { order.pop_front() } else { None };
+        self.cells.insert(id, cell);
+        if let Some(gone) = gone {
+            self.cells.remove(&gone);
+        }
     }
 }
 
@@ -4024,14 +4067,16 @@ impl InFlight {
     /// The owner's driver polls it, so the owner's retirement decides when it
     /// is cancelled and this event's retirement cannot take it away.
     ///
-    /// An owner that is already gone left a continuation that this event's
-    /// turn ran: a later event let its promise go (a container's exit heard
-    /// by `monitor()`, a resolver the object kept). On a Durable Object that
-    /// continuation's I/O is the object's, as in workerd, where an actor's
-    /// requests share one I/O context, so this event drives the op as its own
-    /// and answers it (`Some`). Elsewhere a stateless request's continuation
-    /// ended with its request, so its resolver goes with the op, exactly as
-    /// `abandon` drops this event's own.
+    /// An owner that is already gone, or retiring, left a continuation that
+    /// this event's turn ran: a later event let its promise go (a container's
+    /// exit heard by `monitor()`, a resolver the object kept). When this event
+    /// is of the owner's own cell, that continuation's I/O is the object's, as
+    /// in workerd, where an actor's requests share one I/O context, so this
+    /// event drives the op as its own and answers it (`Some`); its writes and
+    /// effects are that cell's, gated as this event's are. Otherwise (another
+    /// cell's continuation, a stateless request's, or an owner too old to be
+    /// remembered) its resolver goes with the op, exactly as `abandon` drops
+    /// this event's own.
     fn hand_op(
         &mut self,
         owner: u64,
@@ -4042,11 +4087,14 @@ impl InFlight {
         // One branch for both refusals — an owner that is already gone, and
         // one whose mailbox closed while this turn ran. Splitting them let the
         // second forget to drop the resolver, which is the whole defect.
-        let refused = match self.runtime_state.io_context(owner) {
-            Some(context) => context.hand_op(id, future, lifetime).err(),
-            None => Some(future),
-        }?;
-        if self.scope.is_some() {
+        let (refused, cell) = match self.runtime_state.io_context(owner) {
+            Some(context) => match context.hand_op(id, future, lifetime) {
+                Ok(()) => return None,
+                Err(future) => (future, context.cell.get().cloned()),
+            },
+            None => (future, self.runtime_state.ended_cell(owner)),
+        };
+        if cell.is_some() && cell.as_deref() == self.scope.as_deref() {
             return Some(self.own_op(id, refused, lifetime));
         }
         self.runtime_state.promises.lock().unwrap().remove(&id);
@@ -4062,6 +4110,7 @@ impl InFlight {
         }
         if lifetime == asyncrt::OpLifetime::Unrefed {
             self.unrefed_ops.insert(id);
+            self.context.held_unrefed.store(true, Ordering::Relaxed);
         }
         (id, future)
     }
@@ -5328,6 +5377,7 @@ fn start_cell_event<'s>(
 ) -> Begun {
     let runtime_state = actor_runtime_state(tc);
     let context = IoContext::tracked(&runtime_state);
+    let _ = context.cell.set(Arc::from(scope));
     if let Some(stream_id) = body_stream_id {
         context.own_body_stream(stream_id);
     }
@@ -11327,6 +11377,11 @@ pub struct IoContext {
     /// starts, or `handler_settled` is set. Each change can make the driver's
     /// current wait obsolete.
     handed_wake: tokio::sync::Notify,
+    /// The cell of a cell event (`start_cell_event`), remembered once it ends
+    /// (`ActorRuntimeState::ended_cells`).
+    cell: OnceLock<Arc<str>>,
+    /// Whether this event enqueued an op unable to keep it alive.
+    held_unrefed: AtomicBool,
     /// Set by the reaction `watch_handler_settlement` puts on a cell event's
     /// handler promise, in whichever turn settles it.
     ///
@@ -11524,6 +11579,8 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            cell: OnceLock::new(),
+            held_unrefed: AtomicBool::new(false),
             handler_settled: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: limits.and_then(|limits| limits.sub_requests),
@@ -11557,6 +11614,8 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            cell: OnceLock::new(),
+            held_unrefed: AtomicBool::new(false),
             handler_settled: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: runtime_state
@@ -12017,6 +12076,9 @@ impl Drop for IoContext {
         if let Some((id, runtime_state)) = &self.continuation {
             if let Some(runtime_state) = runtime_state.upgrade() {
                 runtime_state.io_contexts.lock().unwrap().remove(id);
+                if let Some(cell) = self.cell.get() {
+                    runtime_state.ended_cells.lock().unwrap().ended(*id, cell.clone(), self.held_unrefed.load(Ordering::Relaxed));
+                }
             }
         }
         if let Some(payload) = first_panic {
@@ -13037,5 +13099,33 @@ mod v8_pin_tests {
     #[test]
     fn celld_links_the_pinned_v8() {
         assert_eq!(v8::V8::get_version(), super::V8_VERSION);
+    }
+}
+
+#[cfg(test)]
+mod ended_cells_tests {
+    use super::{EndedCells, ENDED_CELLS_MAX, ENDED_HOLDING_CELLS_MAX};
+    use std::sync::Arc;
+
+    // Goal: an ended event's cell is remembered within its kind's bound, the
+    // oldest of that kind let go first, and a run of events that hold
+    // nothing never pushes out one that held a `monitor()`.
+    #[test]
+    fn ended_cells_keep_each_kind_to_its_bound() {
+        let mut ended = EndedCells::default();
+        let cell: Arc<str> = Arc::from("Door:1");
+        ended.ended(1, cell.clone(), true);
+        for id in 2..(ENDED_CELLS_MAX as u64 + 3) {
+            ended.ended(id, Arc::from("Door:2"), false);
+        }
+        assert_eq!(ended.cells.get(&1), Some(&cell), "a holding event outlives others");
+        assert!(!ended.cells.contains_key(&2), "the oldest of the others is let go");
+        assert!(ended.cells.contains_key(&(ENDED_CELLS_MAX as u64 + 2)), "the newest is kept");
+        assert_eq!(ended.cells.len(), ENDED_CELLS_MAX + 1);
+        for id in 0..ENDED_HOLDING_CELLS_MAX as u64 {
+            ended.ended(1_000_000 + id, Arc::from("Door:3"), true);
+        }
+        assert!(!ended.cells.contains_key(&1), "a holding event goes once its own kind is full");
+        assert_eq!(ended.cells.len(), ENDED_CELLS_MAX + ENDED_HOLDING_CELLS_MAX);
     }
 }
