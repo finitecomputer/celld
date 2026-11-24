@@ -3602,6 +3602,8 @@ mod cross_script_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("wrangler.json"), config.to_string()).unwrap();
         std::fs::write(dir.path().join("index.js"), "export default { fetch() { return new Response('x'); } };").unwrap();
+        std::fs::create_dir(dir.path().join("public")).unwrap();
+        std::fs::write(dir.path().join("public/a.txt"), "a").unwrap();
         build(&Options {
             config: Some(dir.path().join("wrangler.json")),
             bucket: None,
@@ -3686,7 +3688,7 @@ mod cross_script_tests {
                 json!({
                     "name": "binder",
                     "compatibility_date": "2026-01-01",
-                    "assets": { "directory": "." },
+                    "assets": { "directory": "public" },
                     "durable_objects": { "bindings": [{ "name": "C", "class_name": "Counter", "script_name": "owner" }] }
                 }),
                 "an asset-only project cannot declare Worker bindings",
