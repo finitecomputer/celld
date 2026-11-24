@@ -3477,6 +3477,10 @@ pub struct InFlight {
     /// these operations loses detached timers and subrequests, and a handler
     /// whose caller hung up stops at its next await.
     keeps_cell_io: bool,
+    /// A Durable Object handler whose caller hung up and that has not
+    /// settled: the handler budget still bounds it (`remaining`), as it bounds
+    /// one whose caller waits, and its ops go when it runs out (`time_out`).
+    hung_up: bool,
     /// Ops this request is waiting on, so a completion can be attributed to
     /// the request whose context must be current while its continuation runs.
     ops: std::collections::HashSet<u64>,
@@ -3875,19 +3879,24 @@ impl InFlight {
         }
     }
 
-    /// How long this handler may still run, or `None` once it has answered.
+    /// How long this handler may still run, or `None` once it has answered
+    /// (or, its caller gone, once it has settled).
     ///
     /// The budget bounds the *response*, not the request: `waitUntil` work
     /// continues after the client has been served and is not charged for the
     /// time the handler already spent.
     pub fn remaining(&self, budget: Duration) -> Option<Duration> {
-        self.reply
-            .is_some()
+        (self.reply.is_some() || self.hung_up)
             .then(|| budget.saturating_sub(self.started.elapsed()))
     }
 
-    /// Give up on a handler that will not settle.
+    /// Give up on a handler that will not settle. One whose caller hung up
+    /// keeps its ops no longer, so they go as a waited-on handler's do.
     pub fn time_out(&mut self, budget: Duration) {
+        if self.hung_up {
+            self.hung_up = false;
+            self.keeps_cell_io = false;
+        }
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
     }
 
@@ -4813,6 +4822,7 @@ fn begin<'s>(
                 gated_reply: None,
                 background: None,
                 keeps_cell_io: false,
+                hung_up: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -4907,6 +4917,7 @@ fn begin_entrypoint_rpc(
                 gated_reply: None,
                 background: None,
                 keeps_cell_io: false,
+                hung_up: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5146,6 +5157,7 @@ fn begin_queue(
                 gated_reply: None,
                 background: None,
                 keeps_cell_io: false,
+                hung_up: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5382,6 +5394,7 @@ fn start_cell_event<'s>(
                 gated_reply: None,
                 background: None,
                 keeps_cell_io: false,
+                hung_up: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5437,6 +5450,7 @@ fn start_cell_event<'s>(
                     gated_reply,
                     background,
                     keeps_cell_io: false,
+                    hung_up: false,
                     ops: std::collections::HashSet::new(),
                     io_context_ops: std::collections::HashSet::new(),
                     unrefed_ops: std::collections::HashSet::new(),
@@ -5874,6 +5888,7 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
     // (`keeps_cell_io`). Not at shutdown: the object leaves the process.
     if !shutdown && entry.scope.is_some() {
         entry.keeps_cell_io = true;
+        entry.hung_up = true;
     }
     // A cancelled stateless handler with no waitUntil work has nothing left
     // to drive. Drop its host ops now, so their guards cancel routed work.
@@ -5892,6 +5907,11 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
 /// Answer a request whose handler promise has settled, and retire its
 /// `waitUntil` work once that settles too.
 fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
+    // A handler whose caller hung up has ended: what it left running is the
+    // object's, as a completed handler's is, past the handler budget.
+    if entry.hung_up && !matches!(v8::Local::new(tc, &entry.promise).state(), v8::PromiseState::Pending) {
+        entry.hung_up = false;
+    }
     if entry.reply.is_some() {
         let promise = v8::Local::new(tc, &entry.promise);
         match promise.state() {

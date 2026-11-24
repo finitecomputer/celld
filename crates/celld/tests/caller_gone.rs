@@ -30,9 +30,17 @@ export class Saver {
       await this.ctx.storage.put("done", true);
       return new Response("done");
     }
+    if (url.searchParams.has("forever")) {
+      // counts every 100 ms and never answers
+      for (let n = 1; ; n++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await this.ctx.storage.put("count", n);
+      }
+    }
     return Response.json({
       began: (await this.ctx.storage.get("began")) ?? false,
       done: (await this.ctx.storage.get("done")) ?? false,
+      count: (await this.ctx.storage.get("count")) ?? 0,
     });
   }
 }
@@ -74,4 +82,28 @@ fn a_durable_objects_handler_runs_on_after_its_caller_hangs_up() {
     // its waits end and its write lands, with no caller left to answer
     let seen = until(&dev, Duration::from_secs(15), |seen| seen["done"] == true);
     assert_eq!(seen["done"], true, "the handler ran on after its caller hung up:\n{}", dev.output());
+}
+
+/// The handler budget, in seconds, for the test of a handler that never ends.
+const BUDGET_S: u64 = 3;
+
+#[test]
+fn a_handler_whose_caller_hung_up_still_ends_at_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path(), WORKER, &[("SAVER", "Saver")]);
+    let dev = Dev::start_with(dir.path(), &[("CELLD_HANDLER_BUDGET_S", &BUDGET_S.to_string())]);
+
+    let mut caller = TcpStream::connect(("127.0.0.1", dev.port)).unwrap();
+    write!(caller, "GET /?forever HTTP/1.0\r\nhost: 127.0.0.1\r\n\r\n").unwrap();
+    let counting = until(&dev, Duration::from_secs(20), |seen| seen["count"].as_u64().is_some_and(|n| n > 0));
+    assert!(counting["count"].as_u64().is_some_and(|n| n > 0), "it counts:\n{}", dev.output());
+    caller.shutdown(Shutdown::Both).unwrap();
+    drop(caller);
+
+    // past its budget it counts no more, as a handler whose caller waits
+    std::thread::sleep(Duration::from_secs(BUDGET_S + 2));
+    let (first, _) = dev.json("/");
+    std::thread::sleep(Duration::from_secs(1));
+    let (then, _) = dev.json("/");
+    assert_eq!(first["count"], then["count"], "the handler ended at its budget:\n{}", dev.output());
 }
