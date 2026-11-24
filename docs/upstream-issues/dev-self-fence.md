@@ -94,5 +94,7 @@ builds shared the disk.
 - **Fixed on this fork.** The leases (`nodes/`) have their own database,
   `leases.sqlite3` beside `objects.sqlite3`, so a renewal waits only for
   another lease write. A store from before moves its leases over when it
-  opens. This does not help the idle node above: there the renewal's own
-  commit waits on the file system.
+  opens, once, and from then on refuses a lease write among the objects:
+  a celld from before the split, on the same project, fails to take a
+  lease rather than hold one beside this one. This does not help the idle
+  node above: there the renewal's own commit waits on the file system.

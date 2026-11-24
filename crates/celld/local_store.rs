@@ -49,6 +49,20 @@ const LEASES_END: &str = "nodes0";
 /// The leases' database, beside the objects' one.
 const LEASE_DATABASE: &str = "leases.sqlite3";
 
+/// Triggers that make the objects' database refuse a lease write, from a
+/// celld before the split: its every lease write is an upsert, which fires
+/// both. A delete stays allowed.
+fn freeze_leases() -> String {
+    let refuse = "SELECT RAISE(ABORT, 'this state directory keeps its node leases in \
+                  leases.sqlite3, which a celld from before that change does not read')";
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS lease_moved_insert BEFORE INSERT ON objects
+           WHEN NEW.key >= '{LEASES}' AND NEW.key < '{LEASES_END}' BEGIN {refuse}; END;
+         CREATE TRIGGER IF NOT EXISTS lease_moved_update BEFORE UPDATE ON objects
+           WHEN NEW.key >= '{LEASES}' AND NEW.key < '{LEASES_END}' BEGIN {refuse}; END;"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct LocalStore {
     /// Every object outside [`LEASES`].
@@ -81,9 +95,17 @@ impl LocalStore {
         let database = database.as_ref().to_path_buf();
         let leases = database.with_file_name(LEASE_DATABASE);
         let store = Self { database, leases };
-        for database in [&store.database, &store.leases] {
-            create_schema(&connect(database)?)?;
-        }
+        create_schema(&connect(&store.database)?)?;
+        let leases = connect(&store.leases)?;
+        create_schema(&leases)?;
+        leases
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS lease_move (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+                 );",
+            )
+            .map_err(db_error)?;
+        drop(leases);
         store.move_leases_from_objects()?;
         Ok(store)
     }
@@ -98,68 +120,92 @@ impl LocalStore {
     }
 
     /// Moves the leases a celld before the split kept among the objects into
-    /// their own database. A move cut short finishes at the next open: a
-    /// lease already in its own database wins, and a copy among the objects
-    /// is deleted only after the leases' commit, and only as it was copied.
+    /// their own database, once.
+    ///
+    /// 1. Freeze them: [`freeze_leases`] makes the objects' database refuse a
+    ///    lease write. A celld from before the split on the same state
+    ///    directory then fails its lease (it does not start, or it fences)
+    ///    rather than holding one this store no longer reads. A lease it held
+    ///    is copied with its expiry, so the next holder waits it out.
+    /// 2. Publish them in one commit with the record of the move, under the
+    ///    leases' write lock. A later opener finds the record and copies
+    ///    nothing, so a lease retired since never returns. The leases'
+    ///    sequence starts above every ETag the objects' sequence issued,
+    ///    deleted leases' included.
+    /// 3. Delete the frozen copies. A move cut short repeats only this.
     fn move_leases_from_objects(&self) -> object_store::Result<()> {
         let objects = connect(&self.database)?;
-        let mut statement = objects
-            .prepare(
-                "SELECT key, body, etag, modified_ms, attributes FROM objects
-                 WHERE key >= ?1 AND key < ?2",
-            )
-            .map_err(db_error)?;
-        let moved = statement
-            .query_map([LEASES, LEASES_END], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .map_err(db_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(db_error)?;
-        drop(statement);
-        if moved.is_empty() {
-            return Ok(());
-        }
-        let next_etag: i64 = objects
-            .query_row(
-                "SELECT next_etag FROM store_sequence WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(db_error)?;
+        objects.execute_batch(&freeze_leases()).map_err(db_error)?;
         let mut leases = connect(&self.leases)?;
         let transaction = leases
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
-        for (key, body, etag, modified_ms, attributes) in &moved {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO objects(key, body, etag, modified_ms, attributes)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![key, body, etag, modified_ms, attributes],
+        let moved: bool = transaction
+            .query_row("SELECT EXISTS (SELECT 1 FROM lease_move)", [], |row| {
+                row.get(0)
+            })
+            .map_err(db_error)?;
+        if !moved {
+            let mut statement = objects
+                .prepare(
+                    "SELECT key, body, etag, modified_ms, attributes FROM objects
+                     WHERE key >= ?1 AND key < ?2",
                 )
                 .map_err(db_error)?;
+            let frozen = statement
+                .query_map([LEASES, LEASES_END], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(db_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_error)?;
+            for (key, body, etag, modified_ms, attributes) in &frozen {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO objects(key, body, etag, modified_ms, attributes)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![key, body, etag, modified_ms, attributes],
+                    )
+                    .map_err(db_error)?;
+            }
+            let next_etag: i64 = objects
+                .query_row(
+                    "SELECT next_etag FROM store_sequence WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            transaction
+                .execute(
+                    "UPDATE store_sequence SET next_etag = max(next_etag, ?1) WHERE singleton = 1",
+                    [next_etag],
+                )
+                .map_err(db_error)?;
+            transaction
+                .execute("INSERT INTO lease_move(singleton) VALUES (1)", [])
+                .map_err(db_error)?;
         }
-        // A holder of an ETag the objects' sequence issued must never match a
-        // later version, so the leases' sequence goes on above it.
-        transaction
-            .execute(
-                "UPDATE store_sequence SET next_etag = max(next_etag, ?1) WHERE singleton = 1",
-                [next_etag],
+        transaction.commit().map_err(db_error)?;
+        // Read first: a delete takes the objects' write lock even when it
+        // matches nothing, and every open would wait for it.
+        let left: bool = objects
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM objects WHERE key >= ?1 AND key < ?2)",
+                [LEASES, LEASES_END],
+                |row| row.get(0),
             )
             .map_err(db_error)?;
-        transaction.commit().map_err(db_error)?;
-        for (key, _, etag, _, _) in &moved {
+        if left {
             objects
                 .execute(
-                    "DELETE FROM objects WHERE key = ?1 AND etag = ?2",
-                    params![key, etag],
+                    "DELETE FROM objects WHERE key >= ?1 AND key < ?2",
+                    [LEASES, LEASES_END],
                 )
                 .map_err(db_error)?;
         }
@@ -867,6 +913,91 @@ mod lease_tests {
         );
         let (body, _) = block_on(second.get(LEASE)).unwrap().unwrap();
         assert_eq!(&body[..], b"renewed");
+    }
+
+    /// A celld from before the split takes no lease on a state directory this
+    /// one has opened. It would write the lease among the objects, where this
+    /// store no longer reads one, and two nodes would hold the same lease.
+    /// Its lease write (the upsert of its `put_sync`) is refused instead.
+    #[test]
+    fn a_celld_from_before_the_split_takes_no_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("objects.sqlite3");
+        LocalStore::open(&database).unwrap();
+
+        let older = Connection::open(&database).unwrap();
+        let upsert = "INSERT INTO objects(key, body, etag, modified_ms, attributes)
+                      VALUES (?1, x'7b7d', 1, 0, '[]')
+                      ON CONFLICT(key) DO UPDATE SET body = excluded.body, etag = excluded.etag";
+        let refused = older
+            .execute(upsert, [LEASE])
+            .expect_err("a celld from before the split wrote a lease among the objects");
+        assert!(refused.to_string().contains("leases.sqlite3"), "{refused}");
+        older.execute(upsert, ["cells/a/ltx/1"]).unwrap();
+    }
+
+    /// A lease retired after the move stays retired. Here a move was cut
+    /// short after its commit, leaving the lease's copy among the objects,
+    /// and the lease was retired since. Opening again must not publish the
+    /// copy, with its old version, a second time.
+    #[test]
+    fn a_lease_retired_after_the_move_stays_retired() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("objects.sqlite3");
+        {
+            let objects = Connection::open(&database).unwrap();
+            create_schema(&objects).unwrap();
+            objects
+                .execute(
+                    "INSERT INTO objects(key, body, etag, modified_ms, attributes)
+                     VALUES (?1, x'7b7d', 5, 0, '[]')",
+                    [LEASE],
+                )
+                .unwrap();
+            let leases = Connection::open(directory.path().join(LEASE_DATABASE)).unwrap();
+            create_schema(&leases).unwrap();
+            leases
+                .execute_batch(
+                    "CREATE TABLE lease_move (singleton INTEGER PRIMARY KEY CHECK (singleton = 1));
+                     INSERT INTO lease_move(singleton) VALUES (1);
+                     UPDATE store_sequence SET next_etag = 9;",
+                )
+                .unwrap();
+        }
+
+        let bucket = Bucket::open_dev(&database).unwrap();
+        assert_eq!(block_on(bucket.get(LEASE)).unwrap(), None, "the retired lease came back");
+        let objects = Connection::open(&database).unwrap();
+        let left: i64 = objects
+            .query_row(
+                "SELECT count(*) FROM objects WHERE key >= ?1 AND key < ?2",
+                [LEASES, LEASES_END],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "the cut-short move's copy stayed among the objects");
+    }
+
+    /// The leases' versions start above every version the objects' sequence
+    /// issued, also when no lease is left to move: a lease deleted before the
+    /// split had versions too, and a holder of one must never match.
+    #[test]
+    fn lease_versions_start_above_the_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("objects.sqlite3");
+        {
+            let objects = Connection::open(&database).unwrap();
+            create_schema(&objects).unwrap();
+            objects
+                .execute("UPDATE store_sequence SET next_etag = 9", [])
+                .unwrap();
+        }
+
+        let bucket = Bucket::open_dev(&database).unwrap();
+        let created = block_on(bucket.put_cas(LEASE, b"{}".to_vec(), None))
+            .unwrap()
+            .unwrap();
+        assert!(created.parse::<i64>().unwrap() >= 9, "version {created} was issued before");
     }
 
     /// A state directory from before the split keeps its leases: each moves
