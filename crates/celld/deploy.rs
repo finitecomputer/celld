@@ -19,7 +19,8 @@ use crate::protocol::{
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
     FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_SECRETS_STORE_V1, FEATURE_SERVICE_STAND_INS_V1, FEATURE_SQLITE_VEC_V1,
+    FEATURE_DURABLE_OBJECT_SCRIPT_NAME_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SERVICE_STAND_INS_V1,
+    FEATURE_SQLITE_VEC_V1,
     FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -345,6 +346,8 @@ struct Project {
     /// Set when `main` is a `.py` file: the Python behavior its
     /// compatibility date and flags select.
     python: Option<python::PythonCompat>,
+    /// fork: a `durable_objects` binding names another script's class.
+    binds_other_scripts_objects: bool,
 }
 
 /// The two Wrangler bundling knobs that celld forwards to esbuild.
@@ -551,9 +554,10 @@ impl Built {
                         let sqlite = self.manifest.sqlite_classes.iter().any(|c| c == class);
                         Some((
                             format!("env.{name} ({class})"),
-                            match sqlite {
-                                true => "Durable Object (SQLite)".to_string(),
-                                false => "Durable Object".to_string(),
+                            match binding.get("script_name").and_then(Value::as_str) {
+                                Some(owner) => format!("Durable Object (defined in {owner})"),
+                                None if sqlite => "Durable Object (SQLite)".to_string(),
+                                None => "Durable Object".to_string(),
                             },
                         ))
                     }
@@ -821,6 +825,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if project.stand_ins.services > 0 {
                 features.push(FEATURE_SERVICE_STAND_INS_V1.to_string());
+            }
+            if project.binds_other_scripts_objects {
+                features.push(FEATURE_DURABLE_OBJECT_SCRIPT_NAME_V1.to_string());
             }
             features
         },
@@ -1569,6 +1576,12 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     // written by the control plane describe a deployment the same way.
     let mut bindings = Vec::new();
     let mut do_classes = Vec::new();
+    // fork: the classes this script binds from another script (`script_name`),
+    // each with the script that declares it. Their objects are that script's:
+    // this one hosts none and never runs their code, so they stay out of
+    // `do_classes`, and the node resolves each owner when it loads the
+    // deployment (`generation::check_cross_script_classes`).
+    let mut cross_script: BTreeMap<String, String> = BTreeMap::new();
     for binding in object
         .get("durable_objects")
         .and_then(|value| value.get("bindings"))
@@ -1584,12 +1597,63 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .get("class_name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("durable object binding {name} has no `class_name`"))?;
-        do_classes.push(class_name.to_string());
+        let owner = match binding.get("script_name") {
+            None => None,
+            // Wrangler's own name for the script: its own class, as on Cloudflare.
+            Some(Value::String(owner)) if *owner == script_name => None,
+            Some(Value::String(owner)) if valid_script_name(owner) => Some(owner.clone()),
+            Some(Value::String(owner)) => bail!(
+                "durable object binding {name} names script {owner:?}, which is not a script \
+                 name: 1 to {MAX_SCRIPT_NAME_BYTES} bytes of lowercase ASCII letters, digits, \
+                 or internal hyphens"
+            ),
+            Some(_) => bail!("durable object binding {name} `script_name` must be a string"),
+        };
+        let Some(owner) = owner else {
+            do_classes.push(class_name.to_string());
+            bindings.push(json!({
+                "type": "durable_object_namespace",
+                "name": name,
+                "class_name": class_name,
+            }));
+            continue;
+        };
+        // A cell is addressed by its class alone (`{class}:{id}`), so one
+        // deployment has one script per class name.
+        if let Some(other) = cross_script.insert(class_name.to_string(), owner.clone()) {
+            if other != owner {
+                bail!(
+                    "durable object class {class_name} is bound from both script {other:?} and \
+                     script {owner:?}; celld addresses an object by its class, so one deployment \
+                     declares each class name once"
+                );
+            }
+        }
         bindings.push(json!({
             "type": "durable_object_namespace",
             "name": name,
             "class_name": class_name,
+            "script_name": owner,
         }));
+    }
+    if let Some((class, owner)) = cross_script
+        .iter()
+        .find(|(class, _)| do_classes.contains(*class))
+    {
+        bail!(
+            "durable object class {class} is bound both as this Worker's own and from script \
+             {owner:?}; celld addresses an object by its class, so one deployment declares each \
+             class name once"
+        );
+    }
+    if let Some((class, owner)) = cross_script
+        .iter()
+        .find(|(class, _)| sqlite_classes.contains(*class))
+    {
+        bail!(
+            "`migrations` names {class}, which this Worker binds from script {owner:?}; that \
+             script's migrations declare its objects"
+        );
     }
     let services = match object.get("services") {
         None => &[][..],
@@ -1637,7 +1701,11 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     // any `d1_databases`: the harness registers its own `__D1Database` class
     // in every isolate, so a durable_objects binding naming it would silently
     // resolve to the D1 database cell instead of the user's class.
-    if let Some(class) = do_classes.iter().find(|class| is_reserved_class(class)) {
+    if let Some(class) = do_classes
+        .iter()
+        .chain(cross_script.keys())
+        .find(|class| is_reserved_class(class))
+    {
         bail!("`{class}` is a runtime class; rename the Durable Object class");
     }
     for database in d1_databases {
@@ -2186,6 +2254,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         stand_ins,
         containers,
         python,
+        binds_other_scripts_objects: !cross_script.is_empty(),
     })
 }
 
@@ -3520,5 +3589,102 @@ mod stand_in_tests {
             .map(|i| json!({ "binding": format!("S{i}"), "store_id": "s", "secret_name": format!("s{i}") }))
             .collect();
         assert!(read(json!({ "secrets_store_secrets": many })).unwrap_err().to_string().contains("more than 128"));
+    }
+}
+
+// fork: a `durable_objects` binding whose `script_name` names another script.
+#[cfg(test)]
+mod cross_script_tests {
+    use super::*;
+
+    fn build_config(config: Value) -> anyhow::Result<Built> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("wrangler.json"), config.to_string()).unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default { fetch() { return new Response('x'); } };").unwrap();
+        build(&Options {
+            config: Some(dir.path().join("wrangler.json")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: true,
+            json: false,
+            vars: VarOverrides::default(),
+            local_images: true,
+            named: false,
+        })
+    }
+
+    fn binder(bindings: Value) -> Value {
+        json!({
+            "name": "binder",
+            "main": "index.js",
+            "compatibility_date": "2026-01-01",
+            "no_bundle": true,
+            "durable_objects": { "bindings": bindings }
+        })
+    }
+
+    // Goal: a binding to another script's class is that script's, in
+    // Wrangler's upload metadata, and not this script's own class; the
+    // deployment requires the feature, so a node that predates it refuses
+    // it; naming the script's own name is its own class, as on Cloudflare.
+    // Each config celld cannot address unambiguously is refused, saying why.
+    // Replay: built twice, the same.
+    #[test]
+    fn another_scripts_class_is_bound_not_declared() {
+        let config = binder(json!([
+            { "name": "COUNTER", "class_name": "Counter", "script_name": "owner" },
+            { "name": "AGAIN", "class_name": "Counter", "script_name": "owner" },
+            { "name": "MINE", "class_name": "Mine", "script_name": "binder" }
+        ]));
+        for _ in 0..2 {
+            let built = build_config(config.clone()).unwrap();
+            assert_eq!(built.manifest.do_classes, ["Mine"]);
+            assert!(
+                built.manifest.required_features.iter().any(|f| f == FEATURE_DURABLE_OBJECT_SCRIPT_NAME_V1),
+                "{:?}",
+                built.manifest.required_features
+            );
+            assert_eq!(
+                built.manifest.raw_metadata["bindings"],
+                json!([
+                    { "type": "durable_object_namespace", "name": "COUNTER", "class_name": "Counter", "script_name": "owner" },
+                    { "type": "durable_object_namespace", "name": "AGAIN", "class_name": "Counter", "script_name": "owner" },
+                    { "type": "durable_object_namespace", "name": "MINE", "class_name": "Mine" }
+                ])
+            );
+            assert!(built.bindings().contains(&("env.COUNTER (Counter)".to_string(), "Durable Object (defined in owner)".to_string())));
+        }
+        let own = build_config(binder(json!([{ "name": "MINE", "class_name": "Mine" }]))).unwrap();
+        assert!(!own.manifest.required_features.iter().any(|f| f == FEATURE_DURABLE_OBJECT_SCRIPT_NAME_V1));
+        assert!(crate::protocol::validate_required_features(&[FEATURE_DURABLE_OBJECT_SCRIPT_NAME_V1.to_string()]).is_ok());
+
+        let mut migrated = binder(json!([{ "name": "C", "class_name": "Counter", "script_name": "owner" }]));
+        migrated["migrations"] = json!([{ "tag": "v1", "new_sqlite_classes": ["Counter"] }]);
+        let refused = [
+            (binder(json!([{ "name": "C", "class_name": "Counter", "script_name": 7 }])), "`script_name` must be a string"),
+            (binder(json!([{ "name": "C", "class_name": "Counter", "script_name": "Not_A_Script" }])), "which is not a script name"),
+            (binder(json!([{ "name": "C", "class_name": "Counter", "script_name": "" }])), "which is not a script name"),
+            (
+                binder(json!([
+                    { "name": "C", "class_name": "Counter", "script_name": "owner" },
+                    { "name": "D", "class_name": "Counter", "script_name": "other" }
+                ])),
+                "bound from both script \"owner\" and script \"other\"",
+            ),
+            (
+                binder(json!([
+                    { "name": "C", "class_name": "Counter", "script_name": "owner" },
+                    { "name": "D", "class_name": "Counter" }
+                ])),
+                "bound both as this Worker's own and from script \"owner\"",
+            ),
+            (migrated, "`migrations` names Counter, which this Worker binds from script \"owner\""),
+            (binder(json!([{ "name": "C", "class_name": D1_CLASS, "script_name": "owner" }])), "is a runtime class"),
+        ];
+        for (config, says) in refused {
+            let e = format!("{:#}", build_config(config).err().expect("refused"));
+            assert!(e.contains(says), "{says:?} in {e:?}");
+        }
     }
 }

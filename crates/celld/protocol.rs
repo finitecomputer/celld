@@ -76,6 +76,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_PYTHON_WORKERS_V1,
     FEATURE_SECRETS_STORE_V1,
     FEATURE_SERVICE_STAND_INS_V1,
+    FEATURE_DURABLE_OBJECT_SCRIPT_NAME_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -132,6 +133,13 @@ pub const FEATURE_SECRETS_STORE_V1: &str = "secrets-store-v1";
 /// them would build an `env` missing the binding (or, for `ai`, refuse the
 /// deployment at load).
 pub const FEATURE_SERVICE_STAND_INS_V1: &str = "service-stand-ins-v1";
+
+/// fork: a deployment with a `durable_objects` binding whose `script_name`
+/// names another script, so its calls reach that script's objects. A node
+/// without it would read the binding as this script's own class, hosting a
+/// second copy of the owner's objects under another namespace (or refusing
+/// to start, the class exported twice), so it must refuse the deployment.
+pub const FEATURE_DURABLE_OBJECT_SCRIPT_NAME_V1: &str = "durable-object-script-name-v1";
 
 pub const QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION: u32 = 1;
 

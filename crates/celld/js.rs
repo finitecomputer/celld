@@ -1968,6 +1968,11 @@ pub struct WorkerConfig {
     origin: WorkerOrigin,
     do_classes: Vec<String>,
     bindings: Vec<(String, String)>,
+    /// fork: the Durable Object classes a binding of this script names in
+    /// another script (`script_name`), as (class, owning script). The
+    /// binding's ids derive from the owner's namespace key, so it reaches
+    /// the owner's objects; this script registers none of these classes.
+    cross_script_classes: Vec<(String, String)>,
     /// `r2_buckets`: (environment name, bucket name). The bucket name is
     /// the key space the binding owns inside the fleet bucket; see [[r2]].
     r2_bindings: Vec<(String, String)>,
@@ -2136,6 +2141,7 @@ impl WorkerConfig {
             origin: WorkerOrigin::Deployment,
             do_classes,
             bindings,
+            cross_script_classes: Vec::new(),
             r2_bindings,
             d1_bindings,
             kv_bindings,
@@ -2165,6 +2171,13 @@ impl WorkerConfig {
 
     pub fn with_containers(mut self, containers: Vec<crate::container::ContainerSpec>) -> Self {
         self.containers = containers;
+        self
+    }
+
+    /// fork: the classes this script binds from other scripts, as (class,
+    /// owning script); the generation has checked each owner declares its class.
+    pub fn with_cross_script_classes(mut self, classes: Vec<(String, String)>) -> Self {
+        self.cross_script_classes = classes;
         self
     }
 
@@ -6191,7 +6204,7 @@ impl Worker {
                     .ok_or_else(|| anyhow!("DO class {cn} not exported"))?;
                 register_class(scope, cn, cls)?;
             }
-            inject_namespace_keys(scope, script_name, do_classes)?;
+            inject_namespace_keys(scope, script_name, do_classes, &config.cross_script_classes)?;
             inject_crons(scope, &config.crons)?;
             inject_workflows(scope, script_name, &config.workflow_bindings)?;
             inject_containers(scope, &config.containers)?;

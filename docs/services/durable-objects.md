@@ -107,6 +107,10 @@ stopped.
   `namespace.jurisdiction()` throw.
 - The key of a namespace contains the script name, so a rename of the script
   changes every id that `idFromName()` derives.
+- A binding with `script_name` reaches the objects of that script, as on
+  Cloudflare, and its ids derive from that script's key. The node must also
+  run that script (see [Bindings](../cloudflare-compat.md#durable-objects-of-another-script)),
+  and one deployment has one class of each name.
 - A `migrations` entry accepts `tag` and `new_sqlite_classes` only. A class
   rename, a class delete, and a class transfer stop the deployment.
 - A Durable Object event keeps pending I/O active after the handler returns, so
