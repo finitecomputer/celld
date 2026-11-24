@@ -3470,10 +3470,13 @@ pub struct InFlight {
     /// request stays in flight until it settles, as the single-request loop
     /// keeps driving it.
     background: Option<v8::Global<v8::Promise>>,
-    /// A successfully completed Durable Object event keeps every referenced
-    /// native operation alive. Workerd does not require `waitUntil` for this
-    /// I/O, so dropping these operations loses detached timers and subrequests.
-    completed_cell_event: bool,
+    /// A Durable Object event that completed successfully, or whose caller
+    /// hung up, keeps every referenced native operation alive. Workerd does
+    /// not require `waitUntil` for this I/O: an actor's work is the object's,
+    /// not the request's, and runs on until the actor shuts down. Dropping
+    /// these operations loses detached timers and subrequests, and a handler
+    /// whose caller hung up stops at its next await.
+    keeps_cell_io: bool,
     /// Ops this request is waiting on, so a completion can be attributed to
     /// the request whose context must be current while its continuation runs.
     ops: std::collections::HashSet<u64>,
@@ -3530,7 +3533,7 @@ impl InFlight {
                 reply.fail_with_arm_gates(anyhow!(error), self.context.take_arm_gates());
             return;
         }
-        self.completed_cell_event = self.scope.is_some();
+        self.keeps_cell_io = self.scope.is_some();
         let (background, gated_reply) = match reply {
             Answer::Fetch(reply) => {
                 // A value the decoder refuses is a failure in the turn like a
@@ -3923,7 +3926,8 @@ impl InFlight {
     ///
     /// A detached reply gate is host work. It cannot keep handler operations
     /// alive after the handler ends. A successfully completed Durable Object
-    /// event keeps its pending I/O without `waitUntil`, as Workerd does. An
+    /// event keeps its pending I/O without `waitUntil`, as Workerd does, and
+    /// so does one whose caller hung up (`keeps_cell_io`). An
     /// operation that owns the event's `IoContext` and a block that holds or
     /// is queued to take a cell's input gate can also continue. The block
     /// belongs to the object, not to the client: it runs to completion as
@@ -3932,7 +3936,7 @@ impl InFlight {
     /// awaited, and the gate stayed shut for every later event (#733).
     pub(crate) fn keeps_native_ops(&self) -> bool {
         self.reply.is_some()
-            || self.completed_cell_event
+            || self.keeps_cell_io
             || !self.io_context_ops.is_empty()
             || self.keeps_native_ops_after_disconnect()
     }
@@ -4808,7 +4812,7 @@ fn begin<'s>(
                 reply: Some(Answer::Fetch(reply)),
                 gated_reply: None,
                 background: None,
-                completed_cell_event: false,
+                keeps_cell_io: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -4902,7 +4906,7 @@ fn begin_entrypoint_rpc(
                 reply: Some(Answer::Rpc(reply)),
                 gated_reply: None,
                 background: None,
-                completed_cell_event: false,
+                keeps_cell_io: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5141,7 +5145,7 @@ fn begin_queue(
                 reply: Some(Answer::Queue(reply)),
                 gated_reply: None,
                 background: None,
-                completed_cell_event: false,
+                keeps_cell_io: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5377,7 +5381,7 @@ fn start_cell_event<'s>(
                 reply: Some(answer),
                 gated_reply: None,
                 background: None,
-                completed_cell_event: false,
+                keeps_cell_io: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5432,7 +5436,7 @@ fn start_cell_event<'s>(
                     reply: None,
                     gated_reply,
                     background,
-                    completed_cell_event: false,
+                    keeps_cell_io: false,
                     ops: std::collections::HashSet::new(),
                     io_context_ops: std::collections::HashSet::new(),
                     unrefed_ops: std::collections::HashSet::new(),
@@ -5864,15 +5868,23 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
         // paths retire the same work.
         entry.retire_background_for_shutdown();
     }
-    // A cancelled handler with no waitUntil work has nothing left to drive.
-    // Drop its host ops now, so their guards cancel routed work. Explicit
-    // waitUntil work keeps its ops and continues after the client disconnects.
+    // A Durable Object's handler runs on after its caller hangs up, as
+    // workerd's does: its `request.signal` has fired, and its answer reaches
+    // no one, but the timers and calls it awaits are the object's
+    // (`keeps_cell_io`). Not at shutdown: the object leaves the process.
+    if !shutdown && entry.scope.is_some() {
+        entry.keeps_cell_io = true;
+    }
+    // A cancelled stateless handler with no waitUntil work has nothing left
+    // to drive. Drop its host ops now, so their guards cancel routed work.
+    // Explicit waitUntil work keeps its ops and continues after the client
+    // disconnects.
     //
     // So does a handler that holds or awaits the cell's input gate, or whose
     // cross-entry block can still use an operation started by this event.
     // Not at shutdown: nothing will run the block to its end, so its gate is
     // given up instead.
-    if shutdown || !entry.keeps_native_ops_after_disconnect() {
+    if shutdown || !(entry.keeps_cell_io || entry.keeps_native_ops_after_disconnect()) {
         entry.abandon();
     }
 }

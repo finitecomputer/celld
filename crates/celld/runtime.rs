@@ -1765,7 +1765,7 @@ impl RuntimeManager {
             // turn (`Answer::Alarm`), so the snapshot and the delta it replied
             // with are already final and nothing below reads the drive's
             // position. The drive itself runs on, because a completed cell
-            // event keeps its pending I/O (`completed_cell_event`), exactly as
+            // event keeps its pending I/O (`keeps_cell_io`), exactly as
             // it does after a fetch answers. Waiting for it here held the
             // core in `AlarmState::Firing` until the leftover I/O ended or the
             // operation deadline expired the firing, so an `alarm()` that left
