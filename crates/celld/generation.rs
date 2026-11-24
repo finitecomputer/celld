@@ -300,7 +300,8 @@ fn check_cross_script_classes<'a>(
             {
                 return Err(anyhow!(
                     "script {} binds Durable Object class {class} of script {owner}, which \
-                     declares no such class",
+                     declares no such class (a script declares a class with a \
+                     `durable_objects` binding of its own)",
                     deployment.script_name
                 ));
             }

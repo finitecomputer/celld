@@ -2175,6 +2175,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     }
     if main.is_none()
         && (!do_classes.is_empty()
+            || !cross_script.is_empty()
             || !sqlite_classes.is_empty()
             || service_count > 0
             || declared_vars
@@ -3681,6 +3682,15 @@ mod cross_script_tests {
             ),
             (migrated, "`migrations` names Counter, which this Worker binds from script \"owner\""),
             (binder(json!([{ "name": "C", "class_name": D1_CLASS, "script_name": "owner" }])), "is a runtime class"),
+            (
+                json!({
+                    "name": "binder",
+                    "compatibility_date": "2026-01-01",
+                    "assets": { "directory": "." },
+                    "durable_objects": { "bindings": [{ "name": "C", "class_name": "Counter", "script_name": "owner" }] }
+                }),
+                "an asset-only project cannot declare Worker bindings",
+            ),
         ];
         for (config, says) in refused {
             let e = format!("{:#}", build_config(config).err().expect("refused"));

@@ -99,13 +99,20 @@ binding reaches. These are the differences:
 
 - The node runs that script too: the script is the application, or a script
   that a binding of the deployment reaches (a script that `celld deploy
-  --named` published, or a `celld dev --with` project). Otherwise the node
-  refuses the deployment when it loads it, and it refuses a class that the
-  script does not declare.
+  --named` published, which a node loads with the next deployment of the
+  application, or a `celld dev --with` project). Otherwise the node refuses
+  the deployment when it loads it.
+- That script declares the class with a `durable_objects` binding of its own.
+  A class in its `migrations` alone is not declared, and the node refuses the
+  deployment.
 - celld addresses an object by its class name, so one deployment has one class
   of each name. A deploy refuses a class bound from two scripts, or bound both
   as its own and from another script, and a `migrations` entry for a class of
   another script.
+- The class name is also the address of the objects' storage. A binding moved
+  to another script that exports a class of the same name, like a class moved
+  from one script of the deployment to another, gives that script's code the
+  existing objects.
 
 The deploy requires the `durable-object-script-name-v1` feature, so a node that
 predates it refuses the deployment instead of hosting a second copy of the
