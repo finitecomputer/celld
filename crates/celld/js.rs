@@ -4022,26 +4022,48 @@ impl InFlight {
     /// Give an op to the event whose continuation enqueued it.
     ///
     /// The owner's driver polls it, so the owner's retirement decides when it
-    /// is cancelled and this event's retirement cannot take it away. An owner
-    /// that is already gone can never run the continuation again, so its
-    /// resolver goes with the op, exactly as `abandon` drops this event's own.
+    /// is cancelled and this event's retirement cannot take it away.
+    ///
+    /// An owner that is already gone left a continuation that this event's
+    /// turn ran: a later event let its promise go (a container's exit heard
+    /// by `monitor()`, a resolver the object kept). On a Durable Object that
+    /// continuation's I/O is the object's, as in workerd, where an actor's
+    /// requests share one I/O context, so this event drives the op as its own
+    /// and answers it (`Some`). Elsewhere a stateless request's continuation
+    /// ended with its request, so its resolver goes with the op, exactly as
+    /// `abandon` drops this event's own.
     fn hand_op(
         &mut self,
         owner: u64,
         id: u64,
         future: asyncrt::OpFuture,
         lifetime: asyncrt::OpLifetime,
-    ) {
+    ) -> Option<Op> {
         // One branch for both refusals — an owner that is already gone, and
         // one whose mailbox closed while this turn ran. Splitting them let the
         // second forget to drop the resolver, which is the whole defect.
-        let delivered = self
-            .runtime_state
-            .io_context(owner)
-            .is_some_and(|context| context.hand_op(id, future, lifetime));
-        if !delivered {
-            self.runtime_state.promises.lock().unwrap().remove(&id);
+        let refused = match self.runtime_state.io_context(owner) {
+            Some(context) => context.hand_op(id, future, lifetime).err(),
+            None => Some(future),
+        }?;
+        if self.scope.is_some() {
+            return Some(self.own_op(id, refused, lifetime));
         }
+        self.runtime_state.promises.lock().unwrap().remove(&id);
+        None
+    }
+
+    /// Record op `id` as this event's own, so that `deliver` and `abandon`
+    /// treat it as one this event enqueued.
+    fn own_op(&mut self, id: u64, future: asyncrt::OpFuture, lifetime: asyncrt::OpLifetime) -> Op {
+        self.ops.insert(id);
+        if lifetime == asyncrt::OpLifetime::IoContext {
+            self.io_context_ops.insert(id);
+        }
+        if lifetime == asyncrt::OpLifetime::Unrefed {
+            self.unrefed_ops.insert(id);
+        }
+        (id, future)
     }
 
     /// Take the ops another turn enqueued for this event, and record them as
@@ -4053,18 +4075,7 @@ impl InFlight {
             return Vec::new();
         }
         let handed = self.context.take_handed_ops();
-        let mut ops = Vec::with_capacity(handed.len());
-        for (id, future, lifetime) in handed {
-            self.ops.insert(id);
-            if lifetime == asyncrt::OpLifetime::IoContext {
-                self.io_context_ops.insert(id);
-            }
-            if lifetime == asyncrt::OpLifetime::Unrefed {
-                self.unrefed_ops.insert(id);
-            }
-            ops.push((id, future));
-        }
-        ops
+        handed.into_iter().map(|(id, future, lifetime)| self.own_op(id, future, lifetime)).collect()
     }
 
     fn retire_background_for_shutdown(&mut self) {
@@ -4662,18 +4673,11 @@ fn adopt(entry: &mut InFlight) -> Vec<Op> {
     let mine = entry.context.continuation_id();
     let mut ops = Vec::with_capacity(spawns.len());
     for (id, future, lifetime, owner) in spawns {
-        if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
-            entry.hand_op(owner, id, future, lifetime);
-            continue;
-        }
-        entry.ops.insert(id);
-        if lifetime == asyncrt::OpLifetime::IoContext {
-            entry.io_context_ops.insert(id);
-        }
-        if lifetime == asyncrt::OpLifetime::Unrefed {
-            entry.unrefed_ops.insert(id);
-        }
-        ops.push((id, future));
+        let op = match owner.filter(|owner| Some(*owner) != mine) {
+            Some(owner) => entry.hand_op(owner, id, future, lifetime),
+            None => Some(entry.own_op(id, future, lifetime)),
+        };
+        ops.extend(op);
     }
     ops
 }
@@ -11582,14 +11586,17 @@ impl IoContext {
 
     /// Take an op that another event's turn enqueued for this event.
     ///
-    /// Reports whether the mailbox accepted it. A closed mailbox refuses, and
-    /// the caller must then drop the op's resolver: this event will never run
-    /// the continuation waiting on it.
-    #[must_use]
-    fn hand_op(&self, id: u64, future: asyncrt::OpFuture, lifetime: asyncrt::OpLifetime) -> bool {
+    /// A closed mailbox refuses, and hands the op back: this event will never
+    /// drive it, so the caller drives it or drops its resolver.
+    fn hand_op(
+        &self,
+        id: u64,
+        future: asyncrt::OpFuture,
+        lifetime: asyncrt::OpLifetime,
+    ) -> Result<(), asyncrt::OpFuture> {
         let mut handed = self.handed.lock().unwrap();
         let Some(queue) = handed.as_mut() else {
-            return false;
+            return Err(future);
         };
         queue.push((id, future, lifetime));
         // Published under the lock, so a reader that sees this count can take
@@ -11597,7 +11604,7 @@ impl IoContext {
         self.handed_len.store(queue.len(), Ordering::Release);
         drop(handed);
         self.handed_wake.notify_one();
-        true
+        Ok(())
     }
 
     /// Whether a foreign turn has left this event an op, without locking.
@@ -11944,11 +11951,13 @@ impl IoContextRegistryForTest {
     /// only stores it, so nothing here polls it.
     #[doc(hidden)]
     pub fn hand_pending_op(&self, context: &Arc<IoContext>, id: u64) -> bool {
-        context.hand_op(
-            id,
-            Box::pin(std::future::pending()),
-            asyncrt::OpLifetime::Handler,
-        )
+        context
+            .hand_op(
+                id,
+                Box::pin(std::future::pending()),
+                asyncrt::OpLifetime::Handler,
+            )
+            .is_ok()
     }
 
     /// The op ids `context` still holds for a driver that has not taken them.

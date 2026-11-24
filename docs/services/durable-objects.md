@@ -70,6 +70,11 @@ but does not wait for one to finish before the next starts, so an incoming
 message can cancel work that an earlier handler awaits. A hibernatable socket
 delivers frames in send order across WebSocket handlers and RPC methods.
 
+A promise chain outlives the event that started it, as in workerd, where an
+object's requests share one I/O context. When a later event settles a promise
+that an ended event chained on, such as a container's `monitor()` after its
+exit, the chain's timers, calls, and storage run in the later event.
+
 A cell keeps no in-memory state across an eviction, so the constructor runs
 again at the next event. Ownership can also move when a node stops or drains,
 or when idle rebalancing moves a hibernated cell. A hibernatable WebSocket
