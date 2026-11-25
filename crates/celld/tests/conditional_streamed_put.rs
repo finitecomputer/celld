@@ -38,6 +38,9 @@ export default {
 const BIG: usize = 20 << 20;
 /// Past the 256 MiB a conditional put holds.
 const TOO_BIG: usize = (256 << 20) + (1 << 20);
+/// Three of these at once hold more than the 512 MiB every conditional
+/// body may hold together, node-wide.
+const MANY: usize = 200 << 20;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -88,4 +91,24 @@ fn a_conditional_put_of_a_big_stream_is_applied_as_r2_applies_it() {
     assert_eq!((status, &small["stored"], &small["size"]), (200, &serde_json::json!(true), &serde_json::json!(1024)), "{small}");
     let (status, plain) = put("key=plain", BIG, b'a');
     assert_eq!((status, &plain["stored"], &plain["size"]), (200, &serde_json::json!(true), &serde_json::json!(BIG)), "{plain}");
+
+    // at once, they hold no more than every conditional body may: one past
+    // it is refused, saying so, and what it held is given back
+    let at_once = runtime.block_on(async {
+        let tries = (0..3).map(|i| {
+            let url = format!("http://127.0.0.1:{}/?key=many-{i}&if=absent", dev.port);
+            let chunks = (0..MANY / (1 << 20)).map(|_| Ok::<_, std::io::Error>(vec![b'a'; 1 << 20]));
+            let client = client.clone();
+            async move {
+                let r = client.put(url).body(reqwest::Body::wrap_stream(futures_util::stream::iter(chunks))).send().await.unwrap();
+                (r.status().as_u16(), r.json::<serde_json::Value>().await.unwrap())
+            }
+        });
+        futures_util::future::join_all(tries).await
+    });
+    let refused = at_once.iter().filter(|(s, v)| *s == 500 && v["error"].as_str().is_some_and(|e| e.contains("node-wide"))).count();
+    let stored = at_once.iter().filter(|(s, v)| *s == 200 && v["stored"] == true).count();
+    assert!(refused >= 1 && stored >= 1 && refused + stored == 3, "{at_once:?}");
+    let (status, after) = put(&format!("key=after&if=absent&sha256={sum}"), BIG, b'a');
+    assert_eq!((status, &after["stored"]), (200, &serde_json::json!(true)), "what they held was given back: {after}");
 }

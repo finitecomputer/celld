@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -43,6 +44,15 @@ const STREAM_PART: usize = 8 << 20;
 /// whole and written as one conditional request, up to this, and refused
 /// past it. Room for a 100 MiB Worker request body forwarded whole.
 const CONDITIONAL_PUT_MAX: usize = 256 << 20;
+
+/// What every conditional body held at once may take, node-wide: a put
+/// that would grow past it is refused, so concurrent ones never hold more
+/// of a node's memory than this (`CONDITIONAL_HELD`).
+const CONDITIONAL_HELD_MAX: usize = 512 << 20;
+const _: () = assert!(CONDITIONAL_PUT_MAX <= CONDITIONAL_HELD_MAX, "one conditional body fits what all may hold");
+
+/// The bytes conditional bodies hold now, node-wide.
+static CONDITIONAL_HELD: AtomicUsize = AtomicUsize::new(0);
 
 /// The user-metadata name the R2 object record lives under. See
 /// [`Envelope`]. The bucket stores it as `celld_r2` on Azure, which
@@ -586,6 +596,15 @@ pub(crate) struct PutStream {
     /// Open once the body outgrew a single request.
     pub(crate) upload: Option<Box<dyn MultipartUpload>>,
     pub(crate) touched: Instant,
+    /// What this conditional body holds of `CONDITIONAL_HELD`, given back
+    /// as it is dropped (written, aborted or aged out).
+    held: usize,
+}
+
+impl Drop for PutStream {
+    fn drop(&mut self) {
+        CONDITIONAL_HELD.fetch_sub(self.held, Ordering::SeqCst);
+    }
 }
 
 /// Open a streaming write. `request_json` is R2's `R2PutOptions`,
@@ -622,17 +641,29 @@ pub(crate) fn open_put(
         size: 0,
         upload: None,
         touched: Instant::now(),
+        held: 0,
     })
 }
 
 impl PutStream {
     /// Take in one chunk, handing the store every whole part it makes.
     pub(crate) async fn push(&mut self, chunk: Vec<u8>) -> Result<(), String> {
+        let chunk_len = chunk.len();
         self.digests.update(&chunk);
         self.size += chunk.len() as u64;
         self.buffered.extend_from_slice(&chunk);
-        // a conditional body goes out whole, as one conditional request
+        // a conditional body goes out whole, as one conditional request,
+        // within what every one held at once may take
         if self.request.only_if.is_some() {
+            let n = chunk_len;
+            if CONDITIONAL_HELD.fetch_add(n, Ordering::SeqCst) + n > CONDITIONAL_HELD_MAX {
+                CONDITIONAL_HELD.fetch_sub(n, Ordering::SeqCst);
+                return Err(format!(
+                    "R2 put of {}: celld holds at most {CONDITIONAL_HELD_MAX} bytes of conditional (`onlyIf`) bodies at once, node-wide; try again",
+                    self.key
+                ));
+            }
+            self.held += n;
             if self.buffered.len() > CONDITIONAL_PUT_MAX {
                 return Err(format!(
                     "R2 put of {}: celld writes a conditional (`onlyIf`) put as one request, \
