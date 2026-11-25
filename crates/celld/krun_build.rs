@@ -680,9 +680,10 @@ impl Builder {
     }
 
     /// Why a command in the VM may have failed: the VM itself ended, with
-    /// buildkitd's last words; empty while it runs. A command killed as its
-    /// VM went down answers before the engine says the VM ended, so a VM
-    /// still running is asked again, for `ENDED_WAIT_MAX`.
+    /// buildkitd's last words while the engine keeps them; empty while it
+    /// runs. A command killed as its VM went down answers before the engine
+    /// says the VM ended, so a VM still running is asked again, for
+    /// `ENDED_WAIT_MAX`; one the engine no longer has ended with its words.
     async fn ended(&self, vm: &str) -> String {
         let t0 = Instant::now();
         // Bounded by ENDED_WAIT_MAX.
@@ -690,6 +691,9 @@ impl Builder {
             let Ok(reply) = self.api.call("GET", &format!("/v1/containers/{vm}"), None).await else {
                 return String::new();
             };
+            if reply.status.as_u16() == 404 {
+                return format!("\nthe builder VM {vm} ended under it: its entrypoint, buildkitd, exited, and the engine let the VM go");
+            }
             let Ok(v) = reply.json() else { return String::new() };
             if v.get("running").and_then(Value::as_bool) == Some(false) {
                 break v;
