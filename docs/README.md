@@ -423,8 +423,8 @@ celld does not scale itself. An external system starts and stops the
 nodes, and celld hands the cells off.
 
 Each node writes its lease to `nodes/<node>.json` in the bucket. The lease
-lives `CELLD_TTL_MS` (default 10000) and renews at one third of that. Its
-load block, dated by `sampled_ms`, contains `owned_cells`,
+lives `CELLD_TTL_MS` (default 10000; under `celld dev`, 60000) and renews
+at one third of that. Its load block, dated by `sampled_ms`, contains `owned_cells`,
 `placement_weight`, `resident_cells`, `host_websockets`, `rss_bytes`,
 `in_use_bytes`, `cpu_percent_x100`, `open_fds`, `pressured`,
 `memory_headroom`, `shed_cells`, and `restoring`. `owned_cells` includes

@@ -26,6 +26,25 @@ use tokio::sync::{mpsc, oneshot};
 pub const DEFAULT_PORT: u16 = 9876;
 const BUCKET: &str = "celld-dev";
 
+/// fork: the node lease of a `celld dev` node, unless the operator sets
+/// `CELLD_TTL_MS` (a fleet's default stays 10 s, `machine.rs`).
+///
+/// The lease's TTL is how long a node may go without renewing before it
+/// fences itself. A dev node renews it in a SQLite file on the project's
+/// disk, so another job writing gigabytes to that disk held the renewal,
+/// and the read-back after it, past 10 s, and the dev stack halted
+/// (docs/upstream-issues/dev-self-fence.md). The fence protects little
+/// here: the supervisor stops a node before it starts the next, and a
+/// second `celld dev` on the project, under the same node id, replaces the
+/// lease at once and the first fences at its next renewal. The watchdog
+/// only bounds how long a stalled node outlives a rival, and a request is
+/// refused whenever its authority has lapsed, so the stack trades a minute
+/// of that bound for riding out a stall Cloudflare would never fence. A
+/// restart after a crash takes the same time either way: the node id
+/// replaces its own lease without waiting it out (measured, 0.3 s after
+/// SIGKILL at 10 s and at 60 s).
+const DEV_LEASE_TTL_MS: u64 = 60_000;
+
 /// The narrow bridge used by the supervised binary process. The public fleet
 /// parser never receives this path, so no regular subcommand can select it.
 #[doc(hidden)]
@@ -761,6 +780,10 @@ async fn start_node(
         .env("CELLD_INTERNAL_DEV_STORE", &store.database)
         .env("CELLD_WATCH", state.join("runtime"))
         .env("CELLD_NODE", format!("dev-{}", &project_hash[..12]))
+        .env(
+            "CELLD_TTL_MS",
+            std::env::var("CELLD_TTL_MS").unwrap_or_else(|_| DEV_LEASE_TTL_MS.to_string()),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());

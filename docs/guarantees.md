@@ -276,8 +276,9 @@ restores, so no write past the cut can be acknowledged.
 ### Self-fencing
 
 Each node holds a lease in the bucket with an expiry, renewed after one third of
-the lifetime (`CELLD_TTL_MS`, default 10000 ms). A failed renewal is retried
-while the published expiry has not passed.
+the lifetime (`CELLD_TTL_MS`, default 10000 ms; a `celld dev` node's, 60000 ms,
+unless set). A failed renewal is retried while the published expiry has not
+passed.
 
 When the expiry passes, the node fences itself: it stops each active cell and
 fails every incomplete request. It also fences at once when its lease record is

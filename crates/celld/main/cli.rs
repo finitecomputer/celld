@@ -348,7 +348,7 @@ ENVIRONMENT:
   CELLD_ASSET_CACHE_BYTES         Asset cache limit
 
 TUNING:
-  CELLD_TTL_MS                    Node lease lifetime (default: 10000)
+  CELLD_TTL_MS                    Node lease lifetime (default: 10000; celld dev: 60000)
   CELLD_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
   CELLD_SHUTDOWN_TOTAL_MS         Complete process stop bound (default: {shutdown_total_ms})
                                   Internal shutdown waits scale with this bound

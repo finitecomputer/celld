@@ -50,8 +50,10 @@ checked against v0.6.3 (2026-10-22).
   not a starved thread; measured, with a repro, in
   `upstream-issues/dev-self-fence.md`, 2026-11-11) fenced the node
   ("SELF-FENCE: node lease not renewed within
-  TTL", exit 3), taking the whole dev stack down. No setting lengthens the
-  lease. Seen on v0.6.3, 2026-10-22.
+  TTL", exit 3), taking the whole dev stack down. `CELLD_TTL_MS` lengthens
+  the lease, and `celld dev` passes it to its node, but a dev node took a
+  fleet's 10 s. Seen on v0.6.3, 2026-10-22. On this fork a dev node's
+  lease is 60 s unless set (`DEV_LEASE_TTL_MS`, dev.rs).
 - **An alarm more than about two years ahead panics the node.** In any
   object, `await ctx.storage.setAlarm(Date.UTC(2100, 0, 1))` stops
   `celld dev` at once: `thread 'celld-core' panicked at

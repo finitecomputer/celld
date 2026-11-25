@@ -59,4 +59,6 @@ stack stops.
     could take a longer TTL;
   - the dev lease could live outside the shared SQLite file.
 
-  `celld dev` offers no setting for its lease today.
+  `CELLD_TTL_MS` sets the lease, and `celld dev` passes it to its node.
+  This fork's `celld dev` gives its node 60 s unless it is set
+  (`DEV_LEASE_TTL_MS`, dev.rs), the first option above.
