@@ -172,9 +172,21 @@ impl Pattern {
                     }
                     None => re.push_str("\\\\"),
                 },
+                '[' if in_class && chars.get(i) == Some(&':') => {
+                    // A POSIX class (`[:digit:]`), the same in both, as is.
+                    let end = chars[i..].windows(2).position(|w| w == [':', ']']).map(|e| i + e + 2);
+                    match end {
+                        Some(end) => {
+                            re.push('[');
+                            re.extend(&chars[i..end]);
+                            i = end;
+                        }
+                        None => re.push_str("\\["),
+                    }
+                }
                 '[' | ']' => {
-                    // A `[` inside a bracket is itself (Go has no nested
-                    // classes).
+                    // Any other `[` inside a bracket is itself (Go has no
+                    // nested classes).
                     if c == '[' && in_class {
                         re.push_str("\\[");
                     } else {
@@ -437,6 +449,9 @@ mod tests {
             ("[^a&&b].env", "c.env", true),
             ("[a~~b]x", "~x", true),
             ("[a-c]x", "bx", true),
+            ("local[[:digit:]].env", "local1.env", true),
+            ("local[[:digit:]].env", "locala.env", false),
+            ("[a[b]x", "[x", true),
         ];
         for (pattern, path, want) in cases {
             assert_eq!(ignore(pattern).excludes(path), *want, "{pattern:?} on {path:?}");

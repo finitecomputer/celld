@@ -81,9 +81,10 @@ and kept in `$XDG_CACHE_HOME/celld/krun-images` until the builder is destroyed;
 then the engine loads it, so an engine with room for the builder alone still
 has room for the load's own VM. The engine starts a second VM on a data disk
 another VM has mounted, so deploys take turns by a lock in the user's runtime
-directory: a second deploy waits for the first, and a builder found by the
-deploy holding the lock is one a killed `celld` left, and is destroyed (its
-owner is in the label `celld-builder`). A pulled reference builds as
+directory, held until their images are loaded: a second deploy waits for the
+first, and a builder or a staged image found by the deploy holding the lock is
+one a killed `celld` left, and goes (the builder's owner is in its label
+`celld-builder`). A pulled reference builds as
 `FROM <reference>`, with no registry login, so a private registry's image is
 not reached there. `celld deploy` still builds with the `docker` CLI and its
 login: the bucket's tar is Docker's `save`.

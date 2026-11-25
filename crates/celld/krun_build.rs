@@ -34,11 +34,13 @@
 //!   resets the cache;
 //! - the engine starts a second VM on a data disk another VM has mounted,
 //!   so sessions take turns by a lock of this machine's (`lock_path`; the
-//!   engine has one client user), held from the builder's start until it
-//!   is destroyed: a session waits for another's, and a builder it finds
+//!   engine has one client user), held from the builder's start until its
+//!   images are loaded: a session waits for another's (whose loads need
+//!   the engine's memory too), and a builder or a staged image it finds
 //!   when it holds the lock is one a killed `celld` left, and goes. The
 //!   builder's one name (`VM`) and its owner's label (`OWNER_LABEL`) let
-//!   anything else find it.
+//!   anything else find it; fragment's devstack reaps one under the same
+//!   lock.
 
 // The engine's socket is I/O outside the execution boundary, as for
 // container_krun, and the session is a deploy's, not a cell's.
@@ -182,29 +184,37 @@ fn start_ticks(pid: u32) -> Option<u64> {
     stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// The lock sessions on the engine at `socket` take turns by: in this
-/// user's runtime directory, else the machine's temporary one (the same
-/// for every process of the user, whatever its `TMPDIR`), named for the
-/// socket.
-fn lock_path(socket: &Path, uid: u32, runtime: Option<&Path>) -> PathBuf {
+/// The engine's name on this machine: 12 hex of the SHA-256 of its
+/// socket's canonical path, so two paths to one socket name one engine.
+fn engine_id(socket: &Path) -> String {
     use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(socket.as_os_str().as_encoded_bytes());
-    let name = format!("celld-builder-{uid}-{}.lock", &format!("{digest:x}")[..12]);
+    let canonical = std::fs::canonicalize(socket).unwrap_or_else(|_| socket.to_path_buf());
+    let digest = sha2::Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    format!("{digest:x}")[..12].to_string()
+}
+
+/// The lock sessions on the engine `engine` (`engine_id`) take turns by:
+/// in this user's runtime directory, else the machine's temporary one
+/// (the same for every process of the user, whatever its `TMPDIR`).
+fn lock_path(engine: &str, uid: u32, runtime: Option<&Path>) -> PathBuf {
+    let name = format!("celld-builder-{uid}-{engine}.lock");
     match runtime {
         Some(dir) => dir.join(name),
         None => Path::new("/tmp").join(name),
     }
 }
 
-/// Where a session keeps the images it built until the engine loads them:
-/// this user's cache, on disk (a machine's `/tmp` may be memory).
-fn staging_dir() -> PathBuf {
+/// Where a session keeps the images it built until the engine `engine`
+/// loads them: this user's cache, on disk (a machine's `/tmp` may be
+/// memory), one directory per engine, its files only while its lock is
+/// held.
+fn staging_dir(engine: &str) -> PathBuf {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    cache.join("celld/krun-images")
+    cache.join("celld/krun-images").join(engine)
 }
 
 /// An image built and fetched, for the engine to load once the builder
@@ -338,11 +348,10 @@ impl Builder {
             bail!("{label}'s export is not the image its build named ({again} against {key}): its Dockerfile does not build the same image twice");
         }
         // Fetched to this machine, for the engine to load once the builder
-        // has let go of its memory (`finish`). Named for this session: one
-        // after it may build the same image while this one loads it.
-        let dir = staging_dir();
+        // has let go of its memory (`finish`).
+        let dir = staging_dir(&engine_id(&self.socket));
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        let file = dir.join(format!("{key}-{}-{n}.tar", owner_of_self()));
+        let file = dir.join(format!("{key}-{n}.tar"));
         let bytes = self.fetch(&vm, &tar, &file).await.with_context(|| format!("fetch {label} from the krun engine's builder"))?;
         self.capture(&vm, &["rm", "-f", &tar]).await?;
         self.held.get_or_insert_with(HashSet::new).insert(reference.clone());
@@ -372,8 +381,8 @@ impl Builder {
 
     /// The session's end: the cache collected below its limits, its disk
     /// trimmed so the engine's file shrinks with it, buildkitd stopped,
-    /// the VM destroyed and the session's turn given up; then the images
-    /// it built loaded into the engine. Always called, a build's failure
+    /// the VM destroyed; then the images it built loaded into the engine,
+    /// and the session's turn given up. Always called, a build's failure
     /// or not.
     ///
     /// buildkitd is stopped (SIGTERM) and waited for before the VM goes:
@@ -410,8 +419,9 @@ impl Builder {
             // Under the session's turn, so the name is still this one's.
             result = self.destroy(&vm).await;
         }
-        self.lock.take();
-        // Bounded by the session's images.
+        // Still on the session's turn: a builder started beside a load
+        // could take the memory the load's own VM needs. Bounded by the
+        // session's images.
         for staged in std::mem::take(&mut self.staged) {
             let t0 = Instant::now();
             let loaded = match tokio::time::timeout(LOAD_MAX, self.load(&staged.file, &staged.reference)).await {
@@ -428,6 +438,7 @@ impl Builder {
                 }
             }
         }
+        self.lock.take();
         result
     }
 
@@ -503,7 +514,8 @@ impl Builder {
         // SAFETY: getuid reads the process's user and cannot fail.
         let uid = unsafe { libc::getuid() };
         let runtime = PathBuf::from(format!("/run/user/{uid}"));
-        let path = lock_path(&self.socket, uid, runtime.is_dir().then_some(runtime.as_path()));
+        let engine = engine_id(&self.socket);
+        let path = lock_path(&engine, uid, runtime.is_dir().then_some(runtime.as_path()));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -529,6 +541,13 @@ impl Builder {
             tokio::time::sleep(LOCK_WAIT_EVERY).await;
         }
         self.lock = Some(file);
+        // Images staged by a session that was killed before its loads.
+        if let Ok(left) = std::fs::read_dir(staging_dir(&engine)) {
+            for entry in left.flatten() {
+                tracing::warn!(file = %entry.path().display(), "removing an image a killed celld staged");
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
         Ok(())
     }
 
@@ -887,13 +906,17 @@ mod tests {
     // lock, whatever its environment; another engine has its own.
     #[test]
     fn sessions_on_one_engine_share_a_lock() {
-        let run = Path::new("/run/user/1000");
-        let a = lock_path(Path::new("/var/lib/sandcastle/engine.sock"), 1000, Some(run));
-        assert_eq!(a, lock_path(Path::new("/var/lib/sandcastle/engine.sock"), 1000, Some(run)));
-        assert!(a.starts_with(run));
-        assert_ne!(a, lock_path(Path::new("/srv/other/engine.sock"), 1000, Some(run)));
-        assert!(lock_path(Path::new("/x.sock"), 1000, None).starts_with("/tmp"));
         let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        std::fs::write(&socket, "").unwrap();
+        std::os::unix::fs::symlink(&socket, dir.path().join("link.sock")).unwrap();
+        assert_eq!(engine_id(&socket), engine_id(&dir.path().join("link.sock")), "two paths to one socket");
+        assert_ne!(engine_id(&socket), engine_id(Path::new("/srv/other/engine.sock")));
+        let run = Path::new("/run/user/1000");
+        let a = lock_path(&engine_id(&socket), 1000, Some(run));
+        assert!(a.starts_with(run) && a.to_string_lossy().ends_with(&format!("-{}.lock", engine_id(&socket))));
+        assert!(lock_path("e", 1000, None).starts_with("/tmp"));
+        assert_ne!(staging_dir("a"), staging_dir("b"), "each engine's images apart");
         let path = dir.path().join("l.lock");
         let first = std::fs::File::create(&path).unwrap();
         first.try_lock().unwrap();
