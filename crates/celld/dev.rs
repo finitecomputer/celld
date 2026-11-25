@@ -614,19 +614,10 @@ async fn deploy_project(config: &Path, with: &[PathBuf], store: &Store, logs: bo
             vars: read_dev_vars(project)?,
             local_images: true,
             named,
-        })?;
+        })
+        .await?;
         if logs {
             built.report();
-        }
-        // fork: a krun engine never reads Docker's store, where this build
-        // left its images, so they are loaded into it before the node is
-        // asked to start one.
-        if let Ok(crate::container::EngineChoice::Krun(socket)) =
-            crate::container::EngineChoice::parse(std::env::var("CELLD_CONTAINER_ENGINE").ok().as_deref())
-        {
-            for image in crate::container_krun::load_dev_images(&socket, &built.images).await? {
-                tracing::info!(image = %image, "container image loaded into the krun engine");
-            }
         }
         if named {
             deploy::write_named(&bucket, &built).await?;
@@ -660,7 +651,13 @@ async fn run_stack(
         .transpose()?;
 
     console.progress("building the application");
-    deploy_project(config, with, store, options.logs).await?;
+    // fork: a shutdown ends a build too, which on the krun engine runs in
+    // its builder for minutes and hears no signal of the terminal's; the
+    // build's session destroys its builder as it is dropped.
+    crate::asyncrt::select! {
+        deployed = deploy_project(config, with, store, options.logs) => deployed?,
+        _ = signals.received() => return Ok(()),
+    }
     let mut running = start_node(
         state,
         options.listener,
@@ -686,7 +683,15 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                if let Err(error) = deploy_project(config, with, store, options.logs).await {
+                let deployed = crate::asyncrt::select! {
+                    deployed = deploy_project(config, with, store, options.logs) => Some(deployed),
+                    _ = signals.received() => None,
+                };
+                let Some(deployed) = deployed else {
+                    stop_running_node(running).await;
+                    return Ok(());
+                };
+                if let Err(error) = deployed {
                     console.failure(&format!("reload failed: {error:#}"));
                     continue;
                 }
