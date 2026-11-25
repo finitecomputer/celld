@@ -33,7 +33,7 @@ const hosts = () => ({
   blob: new Blob(["hi"], { type: "text/plain" }),
   file: new File(["f"], "f.txt", { type: "text/x", lastModified: 5 }),
   error: new DOMException("m", "DataCloneError"),
-  nested: new Map([["blobs", new Set([new Blob(["deep"]), new File(["g"], "g.txt")])]]),
+  nested: new Map([["blobs", new Set([new Blob(["deep"]), new File(["g"], "g.txt", { lastModified: 7 })])]]),
 });
 
 // What JSON can say about a value, its Maps, Sets and host objects named.
