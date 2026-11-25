@@ -590,8 +590,8 @@ pub use self::v8_Intercepted as v8__Intercepted;
 pub const v8__MAJOR_VERSION: u32 = 15;
 pub const v8__MINOR_VERSION: u32 = 8;
 pub const v8__BUILD_NUMBER: u32 = 62;
-pub const v8__PATCH_LEVEL: u32 = 31;
-pub const v8__VERSION_STRING: &::std::ffi::CStr = c"15.8.62.31-rusty";
+pub const v8__PATCH_LEVEL: u32 = 68;
+pub const v8__VERSION_STRING: &::std::ffi::CStr = c"15.8.62.68-rusty";
 #[repr(C)]
 #[derive(Debug)]
 pub struct ExternalConstOneByteStringResource {

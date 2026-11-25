@@ -1,0 +1,7 @@
+# V8 public-header changes a person reviewed and accepted (docs/v8.md).
+# tools/v8/rusty-v8.sh build accepts a header that differs from the crate's
+# only when its exact pair is listed here: the header, the crate's blob, the
+# new V8's blob, and why. Add a line in a reviewed PR, never from the script.
+#
+# <header> <the crate's blob> <the new blob> <reason>
+include/v8-function.h 18532519f8b89c9932426b4d00ba26f430a3923e a7ed18e5d39bb3a4acf38b2524171d954de961d2 15.8.62.68: a comment only, on NewInstanceWithSideEffectType, documenting V8 1e43c50c (no-JS scopes enforced on API callbacks)

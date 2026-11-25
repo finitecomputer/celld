@@ -13,6 +13,9 @@
 #   tools/v8/rusty-v8.sh pin              check that the public URL serves the build, then write the target's pin
 #   tools/v8/rusty-v8.sh verify           build and test celld against the pin
 #   tools/v8/rusty-v8.sh update [V8]      all of the above, in that order
+#   tools/v8/rusty-v8.sh check-headers REPO FROM TO [ALLOWLIST]
+#                                         build's header gate alone, on V8 checkout REPO's revisions,
+#                                         against tools/v8/header-allowlist or ALLOWLIST (headers-test.sh)
 #
 # Each target has its own archive and pin: x86_64-unknown-linux-gnu's in
 # .cargo/config.toml (a plain `cargo build`), another's in .cargo/<target>.toml
@@ -23,14 +26,14 @@
 #
 # Environment: CELLD_V8_WORK (default ~/.cache/celld-v8), CELLD_V8_JOBS
 # (default 16; other work shares the box), CELLD_V8_REPO (default
-# futurepaul/celld), CELLD_TARGET_DIR (celld's target dir for verify),
+# finitecomputer/celld), CELLD_TARGET_DIR (celld's target dir for verify),
 # CELLD_V8_TARGET (above), CELLD_V8_DENO_COMMIT (build: the
 # denoland/v8 commit whose tree the patched V8 must equal, default the head of
 # its lkgr branch; a second target names the first's, as the branch moves on).
 set -euo pipefail
 
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-REPO=${CELLD_V8_REPO:-futurepaul/celld}
+REPO=${CELLD_V8_REPO:-finitecomputer/celld}
 WORK=${CELLD_V8_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/celld-v8}
 JOBS=${CELLD_V8_JOBS:-16}
 CHROMIUM_V8=https://chromium.googlesource.com/v8/v8
@@ -191,6 +194,73 @@ for path, dep in scope["deps"].items():
 '
 }
 
+# The header pairs a person has reviewed and accepted: each line of
+# tools/v8/header-allowlist is "<header> <the crate's blob> <the new blob>
+# <reason>". It is changed in a reviewed PR, never by this script.
+HEADER_ALLOWLIST="$ROOT/tools/v8/header-allowlist"
+
+# A header's text with its comments gone, read from stdin, for a person
+# reviewing a pair before listing it. The preprocessor strips them: gcc's
+# -fpreprocessed expands no macro and follows no include, and -dD keeps each
+# #define (clang's driver has no such mode). It decides nothing.
+uncommented() {
+  "${CELLD_V8_CPP:-gcc}" -fpreprocessed -dD -E -P -x c++ -
+}
+
+# Whether allowlist $1 lists header $2 changing from blob $3 to blob $4. A
+# malformed line anywhere in it stops the build.
+allowlisted() {
+  local list=$1 file=$2 old=$3 new=$4 path from to reason found=1
+  [[ -f $list ]] || die "no header allowlist at $list"
+  while read -r path from to reason; do
+    [[ -z $path || $path == '#'* ]] && continue
+    [[ $from =~ ^[0-9a-f]{40}$ && $to =~ ^[0-9a-f]{40}$ && -n $reason ]] ||
+      die "$list: a line is '<header> <old blob> <new blob> <reason>': '$path $from $to $reason'"
+    [[ $path == "$file" && $from == "$old" && $to == "$new" ]] && found=0
+  done < "$list"
+  return $found
+}
+
+# V8's public headers at revision $3 of the V8 checkout $1 must be those at
+# $2 (the release's), but for v8-version.h's V8_PATCH_LEVEL and for the
+# exact (old blob, new blob) pairs allowlist $4 lists: those are accepted,
+# named in ACCEPTED and printed. Any other change stops the build, naming
+# the header, since the crate's binding may not fit it: a pair not listed
+# (printed, with its comment-stripped diff, for review), a header added or
+# removed, or a v8-version.h define but V8_PATCH_LEVEL.
+ACCEPTED=()
+check_headers() {
+  local repo=$1 from=$2 to=$3 list=$4 changed version file old new
+  ACCEPTED=()
+  changed=$(git -C "$repo" diff --name-only "$from" "$to" -- include/) ||
+    die "can't list the public headers that changed from $from to $to"
+  version=$(git -C "$repo" diff "$from" "$to" -- include/v8-version.h) ||
+    die "can't diff v8-version.h from $from to $to"
+  while IFS= read -r file; do
+    [[ -n $file && $file != include/v8-version.h ]] || continue
+    old=$(git -C "$repo" rev-parse --verify -q "$from:$file") && new=$(git -C "$repo" rev-parse --verify -q "$to:$file") ||
+      die "V8's public header $file was added or removed; the crate's binding may not fit"
+    if ! allowlisted "$list" "$file" "$old" "$new"; then
+      git -C "$repo" diff "$from" "$to" -- "$file" >&2
+      echo "rusty-v8: $file with its comments stripped (gcc -fpreprocessed), for review:" >&2
+      if diff -u <(git -C "$repo" show "$old" | uncommented) <(git -C "$repo" show "$new" | uncommented) >&2; then
+        echo "  (no difference outside comments)" >&2
+      fi
+      die "V8's public header $file changed ($old -> $new), a pair $list does not list; review it (above) and list it in a PR, or the crate's binding may not fit"
+    fi
+    ACCEPTED+=("$file")
+  done <<< "$changed"
+  if grep '^[-+]#define' <<< "$version" | grep -qv ' V8_PATCH_LEVEL '; then
+    die "v8-version.h changed beyond the patch level"
+  fi
+  if (( ${#ACCEPTED[@]} > 0 )); then
+    say "V8's public headers are the release's but for V8_PATCH_LEVEL and $list's pairs for ${ACCEPTED[*]}:"
+    git -C "$repo" diff "$from" "$to" -- "${ACCEPTED[@]}" >&2
+  else
+    say "V8's public headers are the release's but for V8_PATCH_LEVEL"
+  fi
+}
+
 cmd_build() {
   local crate commit want src v8 pin base base_version patches branch build
   # This machine's archive, or aarch64 Linux's cross-built on x86_64 Linux:
@@ -346,13 +416,7 @@ cmd_build() {
   # code was written against those headers, so both fit this archive when
   # the headers are the crate's but for the patch level. (The generated file
   # varies with the host's libclang, so it is published, not compared.)
-  local headers
-  headers=$(git -C "$v8" diff --name-only "$pin" HEAD -- include/)
-  [[ -z $headers || $headers == include/v8-version.h ]] || die "V8's public headers changed: ${headers//$'\n'/ }; the crate's binding may not fit"
-  if git -C "$v8" diff "$pin" HEAD -- include/v8-version.h | grep '^[-+]#define' | grep -qv ' V8_PATCH_LEVEL '; then
-    die "v8-version.h changed beyond the patch level"
-  fi
-  say "V8's public headers are the release's but for V8_PATCH_LEVEL"
+  check_headers "$v8" "$pin" HEAD "$HEADER_ALLOWLIST"
 
   {
     if [[ -n $commit ]]; then
@@ -366,6 +430,8 @@ cmd_build() {
     git -C "$v8" log --format='  %h %s' "$want..HEAD"
     echo "denoland/v8 $branch-lkgr-denoland: $deno_head (same tree${CELLD_V8_DENO_COMMIT:+; named by CELLD_V8_DENO_COMMIT})"
     echo "Dependencies moved to V8's DEPS: ${moved[*]:-none}"
+    echo "Public headers changed, accepted by tools/v8/header-allowlist: ${ACCEPTED[*]:-none}"
+    (( ${#ACCEPTED[@]} == 0 )) || git -C "$v8" diff "$pin" HEAD -- "${ACCEPTED[@]}" | sed 's/^/  /'
     echo "Target: $TARGET${cross:+ (cross-built on $HOST with the arm64 sysroot)}; profile: release; features: default (use_custom_libcxx)"
     echo "Clang: $(sed -n "s/^CLANG_REVISION = '\(.*\)'/\1/p" "$src/tools/clang/scripts/update.py") (Chromium's); bindgen's libclang: $(basename "$(readlink -f "$libclang/libclang.so")")"
     echo "Rust (rusty_v8's toolchain): $(sed -n 's/^channel = "\(.*\)"/\1/p' "$src/rust-toolchain.toml")"
@@ -530,6 +596,7 @@ case ${1:-} in
   verify-local) cmd_verify_local ;;
   publish) cmd_publish ;;
   verify) cmd_verify ;;
+  check-headers) (( $# == 4 || $# == 5 )) || die "check-headers REPO FROM TO [ALLOWLIST]"; check_headers "$2" "$3" "$4" "${5:-$HEADER_ALLOWLIST}" ;;
   update)
     cmd_build "${2:-}"
     cmd_verify_local
