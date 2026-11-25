@@ -59,10 +59,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// machines runs, by its index's digest.
 pub const BUILDKIT_IMAGE: &str =
     "moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c";
-/// The builder's size: Cloudflare's largest instance, 4 vCPU and 12 GiB,
-/// for a cold build's compiles. It lives only while a deploy builds, and
-/// is gone before an image is loaded.
-const INSTANCE: &str = "standard-4";
+/// The builder's sizes, largest first, with the memory each reserves:
+/// Cloudflare's largest instance, 4 vCPU and 12 GiB, for a cold build's
+/// compiles, down to what an engine with little room can hold (`instance`).
+/// It lives only while a deploy builds, and is gone before an image loads.
+const INSTANCES: [(&str, u64); 4] = [("standard-4", 12_288), ("standard-3", 8_192), ("standard-2", 6_144), ("basic", 1_024)];
+
+/// The largest of `INSTANCES` the engine's free memory holds, by its health
+/// (`memory_mib`, its VMs' reservations, of `memory_mib_max`).
+fn instance(health: &Value) -> Option<&'static str> {
+    let max = health.get("memory_mib_max")?.as_u64()?;
+    let used = health.get("memory_mib")?.as_u64()?;
+    let free = max.saturating_sub(used);
+    INSTANCES.iter().find(|(_, mib)| *mib <= free).map(|(name, _)| *name)
+}
 /// The cache's disk, and its size. A cold build of fragment's stub and
 /// Hermes images held 15 GB (2026-11-24); the disk holds three times
 /// that under the collection's limit below, and a cold build's growth
@@ -391,9 +401,36 @@ impl Builder {
 
     /// A registry image, pulled by the engine itself, as `docker pull`
     /// pulls one: no Dockerfile runs, so neither do its `ONBUILD`
-    /// triggers. It is named by its reference, which the engine holds it
-    /// under.
+    /// triggers. Named by its digest, `<reference>@<digest>`, as a built
+    /// image is by its content: the engine holds a tag under whatever it
+    /// pulled last, and a deployment keeps the image it was given. Pulled
+    /// on the session's turn, before its builder starts (`deploy`'s
+    /// `resolve_declared` pulls first): the pull's own VM needs the engine's
+    /// memory too.
     pub async fn pull(&mut self, reference: &str) -> anyhow::Result<String> {
+        if self.lock.is_none() {
+            self.take_turn().await?;
+        }
+        let pulled = self.engine_pull(reference).await?;
+        let pinned = if reference.contains('@') {
+            reference.to_string()
+        } else {
+            let digest = pulled
+                .get("digest")
+                .and_then(Value::as_str)
+                .filter(|d| d.starts_with("sha256:"))
+                .with_context(|| format!("the krun engine's pull of {reference} names no digest"))?;
+            let pinned = format!("{reference}@{digest}");
+            // Held under the pinned name too: its manifest fetched again,
+            // nothing built.
+            self.engine_pull(&pinned).await?;
+            pinned
+        };
+        crate::note!("image {reference} pulled by the krun engine: {pinned}");
+        Ok(pinned)
+    }
+
+    async fn engine_pull(&self, reference: &str) -> anyhow::Result<Value> {
         let reply = self.api.call("POST", "/v1/images/pull", Some(json!({ "reference": reference }))).await?;
         anyhow::ensure!(
             reply.status.is_success(),
@@ -401,8 +438,7 @@ impl Builder {
             reply.status.as_u16(),
             reply.message_or_error()
         );
-        crate::note!("image {reference} pulled by the krun engine");
-        Ok(reference.to_string())
+        reply.json()
     }
 
     /// The session's end: the cache collected below its limits, its disk
@@ -417,7 +453,10 @@ impl Builder {
     /// layers under a new name (seen 2026-11-24).
     pub async fn finish(mut self) -> anyhow::Result<()> {
         let mut result = Ok(());
-        if let Some(vm) = self.vm.take() {
+        // The name stays the session's until the VM is destroyed, and each
+        // staged image until it is loaded: a deploy cancelled here (Ctrl-C)
+        // leaves them to `Drop`.
+        if let Some(vm) = self.vm.clone() {
             let prune = [
                 "buildctl".to_string(),
                 "prune".into(),
@@ -444,17 +483,23 @@ impl Builder {
             }
             // Under the session's turn, so the name is still this one's.
             result = self.destroy(&vm).await;
+            if result.is_ok() {
+                self.vm = None;
+            }
         }
         // Still on the session's turn: a builder started beside a load
         // could take the memory the load's own VM needs. Bounded by the
         // session's images.
-        for staged in std::mem::take(&mut self.staged) {
+        while let Some(staged) = self.staged.first() {
+            let (label, reference, file) = (staged.label.clone(), staged.reference.clone(), staged.file.clone());
             let t0 = Instant::now();
-            let loaded = match tokio::time::timeout(LOAD_MAX, self.load(&staged.file, &staged.reference)).await {
+            let loaded = match tokio::time::timeout(LOAD_MAX, self.load(&file, &reference)).await {
                 Ok(loaded) => loaded,
                 Err(_) => Err(anyhow!("the engine did not load it within {LOAD_MAX:?}")),
             };
-            let _ = std::fs::remove_file(&staged.file);
+            let _ = std::fs::remove_file(&file);
+            self.staged.remove(0);
+            let staged = Staged { label, reference, file };
             match loaded {
                 Ok(()) => crate::note!("image {} loaded into the krun engine in {:.1?}", staged.label, t0.elapsed()),
                 Err(e) => {
@@ -581,11 +626,21 @@ impl Builder {
     /// held: a builder already there is one a killed session left, and goes.
     async fn take_vm(&self) -> anyhow::Result<()> {
         assert!(self.lock.is_some(), "the builder starts on the session's turn");
+        let health = self.api.call("GET", "/v1/health", None).await?.json()?;
+        let Some(instance) = instance(&health) else {
+            bail!(
+                "the krun engine has no room for the image builder: {} of its {} MiB in use, and the smallest builder takes {} MiB",
+                health["memory_mib"], health["memory_mib_max"], INSTANCES[INSTANCES.len() - 1].1
+            );
+        };
+        if instance != INSTANCES[0].0 {
+            crate::note!("the image builder runs as {instance}: the krun engine has no room for {}", INSTANCES[0].0);
+        }
         let start = json!({
             "image": BUILDKIT_IMAGE,
             "enableInternet": true,
             "entrypoint": entrypoint(),
-            "instance": INSTANCE,
+            "instance": instance,
             "data": { "name": CACHE_DISK, "path": CACHE_PATH, "gib": CACHE_GIB },
             "labels": { OWNER_LABEL: owner_of_self() },
         });
@@ -601,7 +656,7 @@ impl Builder {
                     tracing::warn!("destroying an image builder a killed celld left");
                     self.destroy(VM).await?;
                 }
-                429 => bail!("the krun engine has no room for the image builder ({INSTANCE}): {message}"),
+                429 => bail!("the krun engine has no room for the image builder ({instance}): {message}"),
                 status => bail!("start the image builder {VM}: [{status}] {message}"),
             }
         }
@@ -909,6 +964,18 @@ mod tests {
         p.push(b"CHED\n#6 [build 3/3] RUN cargo build\n#6 0.3 Compiling\n#7 [stage-0 1/1] COPY x\n#7 CACHED\n");
         assert_eq!(p.cached_of_steps(), (2, 3), "the FROM is not counted");
         assert!(p.tail().ends_with("#7 CACHED"));
+    }
+
+    // Goal: the builder takes the largest size the engine has room for.
+    #[test]
+    fn the_builder_fits_the_engines_room() {
+        let h = |used: u64, max: u64| json!({ "memory_mib": used, "memory_mib_max": max });
+        assert_eq!(instance(&h(1024, 32_768)), Some("standard-4"));
+        assert_eq!(instance(&h(0, 7_168)), Some("standard-2"), "Sandcastle's default budget");
+        assert_eq!(instance(&h(0, 8_192)), Some("standard-3"));
+        assert_eq!(instance(&h(6_000, 7_168)), Some("basic"));
+        assert_eq!(instance(&h(7_000, 7_168)), None);
+        assert_eq!(instance(&json!({})), None);
     }
 
     #[test]

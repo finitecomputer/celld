@@ -913,7 +913,10 @@ impl ImageBuilder {
 }
 
 /// Each container class's images, resolved (`resolve_image`,
-/// `resolve_named_image`): none for nodes that run no container.
+/// `resolve_named_image`): none for nodes that run no container. fork:
+/// registry images first, then builds: on the krun engine a pull runs a VM
+/// of the engine's own, which an engine with room for the builder alone
+/// would refuse beside it.
 async fn resolve_declared(
     containers: &[ContainerDecl],
     root: &Path,
@@ -921,19 +924,19 @@ async fn resolve_declared(
     runs_containers: bool,
     builder: &mut ImageBuilder,
 ) -> anyhow::Result<Vec<(Option<String>, BTreeMap<String, String>)>> {
-    let mut resolved = Vec::with_capacity(containers.len());
-    for decl in containers {
-        let mut image = None;
-        let mut images = BTreeMap::new();
-        if runs_containers {
-            if let Some(declared) = &decl.image {
-                image = Some(resolve_image(root, declared, platform, builder).await?);
+    let mut resolved: Vec<(Option<String>, BTreeMap<String, String>)> = vec![(None, BTreeMap::new()); containers.len()];
+    if !runs_containers {
+        return Ok(resolved);
+    }
+    for pulls in [true, false] {
+        for (decl, (image, images)) in containers.iter().zip(resolved.iter_mut()) {
+            if let Some(declared) = decl.image.as_deref().filter(|d| pulls != is_dockerfile(root, d)) {
+                *image = Some(resolve_image(root, declared, platform, builder).await?);
             }
-            for (name, declared) in &decl.images {
+            for (name, declared) in decl.images.iter().filter(|(_, d)| pulls == d.dockerfile.is_none()) {
                 images.insert(name.clone(), resolve_named_image(root, name, declared, platform, builder).await?);
             }
         }
-        resolved.push((image, images));
     }
     Ok(resolved)
 }

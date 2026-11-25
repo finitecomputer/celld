@@ -163,9 +163,11 @@ impl Pattern {
                     re.push('\\');
                     re.push(c);
                 }
+                // As Go passes it: `\s` is whitespace, `\.` a dot.
                 '\\' => match chars.get(i) {
                     Some(next) => {
-                        re.push_str(&regex::escape(&next.to_string()));
+                        re.push('\\');
+                        re.push(*next);
                         i += 1;
                         m = M::Regex;
                     }
@@ -481,6 +483,9 @@ mod tests {
             ("local[[:digit:]].env", "local1.env", true),
             ("local[[:digit:]].env", "locala.env", false),
             ("[a[b]x", "[x", true),
+            ("secrets\\s*.env", "secrets prod.env", true),
+            ("secrets\\s*.env", "secretss.env", false),
+            ("a\\.b", "a.b", true),
         ];
         for (pattern, path, want) in cases {
             assert_eq!(ignore(pattern).excludes(path), *want, "{pattern:?} on {path:?}");
