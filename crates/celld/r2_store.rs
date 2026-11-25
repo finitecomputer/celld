@@ -648,14 +648,20 @@ pub(crate) fn open_put(
 impl PutStream {
     /// Take in one chunk, handing the store every whole part it makes.
     pub(crate) async fn push(&mut self, chunk: Vec<u8>) -> Result<(), String> {
-        let chunk_len = chunk.len();
-        self.digests.update(&chunk);
-        self.size += chunk.len() as u64;
-        self.buffered.extend_from_slice(&chunk);
         // a conditional body goes out whole, as one conditional request,
-        // within what every one held at once may take
-        if self.request.only_if.is_some() {
-            let n = chunk_len;
+        // within its own bound and what every one held at once may take,
+        // both checked before its buffer grows, and grown by exactly the
+        // chunk (never doubled past what it holds of the budget)
+        let conditional = self.request.only_if.is_some();
+        if conditional {
+            let n = chunk.len();
+            if self.buffered.len() + n > CONDITIONAL_PUT_MAX {
+                return Err(format!(
+                    "R2 put of {}: celld writes a conditional (`onlyIf`) put as one request, \
+                     and holds its body for it up to {CONDITIONAL_PUT_MAX} bytes",
+                    self.key
+                ));
+            }
             if CONDITIONAL_HELD.fetch_add(n, Ordering::SeqCst) + n > CONDITIONAL_HELD_MAX {
                 CONDITIONAL_HELD.fetch_sub(n, Ordering::SeqCst);
                 return Err(format!(
@@ -664,13 +670,12 @@ impl PutStream {
                 ));
             }
             self.held += n;
-            if self.buffered.len() > CONDITIONAL_PUT_MAX {
-                return Err(format!(
-                    "R2 put of {}: celld writes a conditional (`onlyIf`) put as one request, \
-                     and holds its body for it up to {CONDITIONAL_PUT_MAX} bytes",
-                    self.key
-                ));
-            }
+            self.buffered.reserve_exact(n);
+        }
+        self.digests.update(&chunk);
+        self.size += chunk.len() as u64;
+        self.buffered.extend_from_slice(&chunk);
+        if conditional {
             return Ok(());
         }
         while self.buffered.len() > STREAM_PART {
