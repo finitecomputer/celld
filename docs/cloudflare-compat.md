@@ -210,8 +210,10 @@ room. `put()` follows Cloudflare's rules for what it keeps and for how long:
 the default edge TTL of the status (200 and 301 for 2 hours, 302 and 303 for 20
 minutes, 404 and 410 for 3 minutes). It keeps nothing for `no-store`,
 `private`, `no-cache`, a zero lifetime, or a `Set-Cookie` that
-`private=Set-Cookie` does not drop. As on Cloudflare, `Vary` is not part of the
-key, and a match leaves out `Cache-Tag`. A `match()` or `delete()` of a non-GET
+`private=Set-Cookie` does not drop. A match leaves out `Cache-Tag`, as
+Cloudflare's does. `Vary` is not part of the key: Cloudflare considers it only
+for `Accept-Encoding` (the encodings it serves) and image variants, and celld
+does neither. A `match()` or `delete()` of a non-GET
 request needs `ignoreMethod`.
 
 - Another node never sees the entry, and a node that restarts starts empty.

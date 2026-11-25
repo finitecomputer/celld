@@ -40,6 +40,9 @@ pub const MAX_TTL_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 /// its key's one shared allocation and the three index nodes that point at
 /// it. So a flood of empty responses still meets the byte bound.
 const ENTRY_OVERHEAD_BYTES: u64 = 512;
+/// The slots the entry table keeps however empty it gets: below this, giving
+/// memory back costs more than it returns.
+const TABLE_FLOOR: usize = 64;
 /// The bytes each header is charged beyond its name and value: the pair's
 /// two `String`s.
 const HEADER_OVERHEAD_BYTES: u64 = std::mem::size_of::<(String, String)>() as u64;
@@ -388,6 +391,11 @@ impl Store {
         self.order.remove(&entry.used);
         self.expiry.remove(&(entry.expires_at_ms, entry.id));
         self.bytes -= entry.charge;
+        // the table gives back what a fuller store grew it to, so the bound
+        // the charges keep is the bound the node holds
+        if self.entries.capacity() > TABLE_FLOOR && self.entries.len() * 4 < self.entries.capacity() {
+            self.entries.shrink_to((self.entries.len() * 2).max(TABLE_FLOOR));
+        }
         Some(entry)
     }
 
@@ -564,5 +572,17 @@ mod tests {
 
         let mut none = Store::new(0);
         assert!(!none.put(key("https://a/0"), body(0), 1_000, None, 0), "a store of 0 bytes keeps nothing");
+
+        // a table a full store grew gives its room back as the store empties
+        let mut store = Store::new(1 << 30);
+        for i in 0..1_500 {
+            assert!(store.put(key(&format!("https://a/{i}")), body(1), 1_000, None, 0));
+        }
+        let grown = store.entries.capacity();
+        for i in 0..1_500 {
+            assert!(store.delete(&key(&format!("https://a/{i}")), 1));
+        }
+        assert!(grown >= 1_500 && store.entries.capacity() <= 2 * TABLE_FLOOR, "grown to {grown}, now {}", store.entries.capacity());
+        assert_eq!((store.len(), store.bytes(), store.order.len(), store.expiry.len()), (0, 0, 0, 0));
     }
 }

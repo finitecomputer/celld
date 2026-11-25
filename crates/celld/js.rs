@@ -7322,11 +7322,12 @@ fn op_cache_match(
     let Some(key) = cache_key(scope, &args) else {
         return;
     };
-    let now = crate::asyncrt::mono_ms();
-    let found = crate::cache_api::node()
-        .lock()
-        .expect("cache store lock poisoned")
-        .get(&key, now);
+    let found = {
+        let mut store = crate::cache_api::node().lock().expect("cache store lock poisoned");
+        // read under the lock: an entry that expired while this waited for it
+        // is not answered
+        store.get(&key, crate::asyncrt::mono_ms())
+    };
     let Some(crate::cache_api::Hit { stored, age_s }) = found else {
         return;
     };
