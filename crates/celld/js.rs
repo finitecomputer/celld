@@ -2615,6 +2615,10 @@ struct ActorRuntimeState {
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
+    /// The cell of each cell event that ended, by continuation id, so an op
+    /// one of its continuations enqueues later goes to an event of that same
+    /// cell, never another's (`InFlight::hand_op`).
+    ended_cells: Mutex<EndedCells>,
     /// WebSocket captures that received a frame in the current isolate turn.
     /// Weak references record every continuation context without extending
     /// an event's lifetime merely to flush its output.
@@ -2705,6 +2709,46 @@ impl ActorRuntimeState {
             contexts.remove(&id);
         }
         context
+    }
+
+    /// The cell of ended cell event `id`, while it is remembered.
+    fn ended_cell(&self, id: u64) -> Option<Arc<str>> {
+        self.ended_cells.lock().unwrap().cells.get(&id).cloned()
+    }
+}
+
+/// How many ended cell events an isolate remembers the cell of. An op that
+/// a continuation of an older one enqueues is dropped, as every such op was
+/// before this record.
+const ENDED_CELLS_MAX: usize = 4096;
+/// How many more it remembers of those that ended with an op still pending
+/// that could not keep them alive, such as a container's `monitor()`, which
+/// a later event settles perhaps much later, so a long run of other events
+/// does not push them out.
+const ENDED_HOLDING_CELLS_MAX: usize = 4096;
+
+/// The cells of ended cell events (`ActorRuntimeState::ended_cells`): each
+/// kind kept to its bound, the oldest let go first.
+#[derive(Default)]
+struct EndedCells {
+    cells: HashMap<u64, Arc<str>>,
+    recent: std::collections::VecDeque<u64>,
+    holding: std::collections::VecDeque<u64>,
+}
+
+impl EndedCells {
+    fn ended(&mut self, id: u64, cell: Arc<str>, holding: bool) {
+        let (order, max) = if holding {
+            (&mut self.holding, ENDED_HOLDING_CELLS_MAX)
+        } else {
+            (&mut self.recent, ENDED_CELLS_MAX)
+        };
+        order.push_back(id);
+        let gone = if order.len() > max { order.pop_front() } else { None };
+        self.cells.insert(id, cell);
+        if let Some(gone) = gone {
+            self.cells.remove(&gone);
+        }
     }
 }
 
@@ -4004,6 +4048,9 @@ impl InFlight {
     /// isolate lives. A request that drives itself has to purge them on its
     /// own way out.
     pub fn abandon(&mut self) {
+        // its cell remembered while its context still resolves, so no later
+        // event finds it neither alive nor remembered (`hand_op`)
+        self.context.ended(!self.unrefed_ops.is_empty());
         self.context.seal_wait_until();
         self.io_context_ops.clear();
         self.unrefed_ops.clear();
@@ -4038,26 +4085,53 @@ impl InFlight {
     /// Give an op to the event whose continuation enqueued it.
     ///
     /// The owner's driver polls it, so the owner's retirement decides when it
-    /// is cancelled and this event's retirement cannot take it away. An owner
-    /// that is already gone can never run the continuation again, so its
-    /// resolver goes with the op, exactly as `abandon` drops this event's own.
+    /// is cancelled and this event's retirement cannot take it away.
+    ///
+    /// An owner that is already gone, or retiring, left a continuation that
+    /// this event's turn ran: a later event let its promise go (a container's
+    /// exit heard by `monitor()`, a resolver the object kept). When this event
+    /// is of the owner's own cell, that continuation's I/O is the object's, as
+    /// in workerd, where an actor's requests share one I/O context, so this
+    /// event drives the op as its own and answers it (`Some`); its writes and
+    /// effects are that cell's, gated as this event's are. Otherwise (another
+    /// cell's continuation, a stateless request's, or an owner too old to be
+    /// remembered) its resolver goes with the op, exactly as `abandon` drops
+    /// this event's own.
     fn hand_op(
         &mut self,
         owner: u64,
         id: u64,
         future: asyncrt::OpFuture,
         lifetime: asyncrt::OpLifetime,
-    ) {
+    ) -> Option<Op> {
         // One branch for both refusals — an owner that is already gone, and
         // one whose mailbox closed while this turn ran. Splitting them let the
         // second forget to drop the resolver, which is the whole defect.
-        let delivered = self
-            .runtime_state
-            .io_context(owner)
-            .is_some_and(|context| context.hand_op(id, future, lifetime));
-        if !delivered {
-            self.runtime_state.promises.lock().unwrap().remove(&id);
+        let (refused, cell) = match self.runtime_state.io_context(owner) {
+            Some(context) => match context.hand_op(id, future, lifetime) {
+                Ok(()) => return None,
+                Err(future) => (future, context.cell.get().cloned()),
+            },
+            None => (future, self.runtime_state.ended_cell(owner)),
+        };
+        if cell.is_some() && cell.as_deref() == self.scope.as_deref() {
+            return Some(self.own_op(id, refused, lifetime));
         }
+        self.runtime_state.promises.lock().unwrap().remove(&id);
+        None
+    }
+
+    /// Record op `id` as this event's own, so that `deliver` and `abandon`
+    /// treat it as one this event enqueued.
+    fn own_op(&mut self, id: u64, future: asyncrt::OpFuture, lifetime: asyncrt::OpLifetime) -> Op {
+        self.ops.insert(id);
+        if lifetime == asyncrt::OpLifetime::IoContext {
+            self.io_context_ops.insert(id);
+        }
+        if lifetime == asyncrt::OpLifetime::Unrefed {
+            self.unrefed_ops.insert(id);
+        }
+        (id, future)
     }
 
     /// Take the ops another turn enqueued for this event, and record them as
@@ -4069,18 +4143,7 @@ impl InFlight {
             return Vec::new();
         }
         let handed = self.context.take_handed_ops();
-        let mut ops = Vec::with_capacity(handed.len());
-        for (id, future, lifetime) in handed {
-            self.ops.insert(id);
-            if lifetime == asyncrt::OpLifetime::IoContext {
-                self.io_context_ops.insert(id);
-            }
-            if lifetime == asyncrt::OpLifetime::Unrefed {
-                self.unrefed_ops.insert(id);
-            }
-            ops.push((id, future));
-        }
-        ops
+        handed.into_iter().map(|(id, future, lifetime)| self.own_op(id, future, lifetime)).collect()
     }
 
     fn retire_background_for_shutdown(&mut self) {
@@ -4678,18 +4741,11 @@ fn adopt(entry: &mut InFlight) -> Vec<Op> {
     let mine = entry.context.continuation_id();
     let mut ops = Vec::with_capacity(spawns.len());
     for (id, future, lifetime, owner) in spawns {
-        if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
-            entry.hand_op(owner, id, future, lifetime);
-            continue;
-        }
-        entry.ops.insert(id);
-        if lifetime == asyncrt::OpLifetime::IoContext {
-            entry.io_context_ops.insert(id);
-        }
-        if lifetime == asyncrt::OpLifetime::Unrefed {
-            entry.unrefed_ops.insert(id);
-        }
-        ops.push((id, future));
+        let op = match owner.filter(|owner| Some(*owner) != mine) {
+            Some(owner) => entry.hand_op(owner, id, future, lifetime),
+            None => Some(entry.own_op(id, future, lifetime)),
+        };
+        ops.extend(op);
     }
     ops
 }
@@ -5340,6 +5396,7 @@ fn start_cell_event<'s>(
 ) -> Begun {
     let runtime_state = actor_runtime_state(tc);
     let context = IoContext::tracked(&runtime_state);
+    let _ = context.cell.set(Arc::from(scope));
     if let Some(stream_id) = body_stream_id {
         context.own_body_stream(stream_id);
     }
@@ -11459,6 +11516,11 @@ pub struct IoContext {
     /// starts, or `handler_settled` is set. Each change can make the driver's
     /// current wait obsolete.
     handed_wake: tokio::sync::Notify,
+    /// The cell of a cell event (`start_cell_event`), remembered once it ends
+    /// (`ActorRuntimeState::ended_cells`, `ended`).
+    cell: OnceLock<Arc<str>>,
+    /// Whether its cell is remembered already (`ended`).
+    cell_remembered: AtomicBool,
     /// Set by the reaction `watch_handler_settlement` puts on a cell event's
     /// handler promise, in whichever turn settles it.
     ///
@@ -11656,6 +11718,8 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            cell: OnceLock::new(),
+            cell_remembered: AtomicBool::new(false),
             handler_settled: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: limits.and_then(|limits| limits.sub_requests),
@@ -11689,6 +11753,8 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            cell: OnceLock::new(),
+            cell_remembered: AtomicBool::new(false),
             handler_settled: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: runtime_state
@@ -11718,14 +11784,37 @@ impl IoContext {
 
     /// Take an op that another event's turn enqueued for this event.
     ///
-    /// Reports whether the mailbox accepted it. A closed mailbox refuses, and
-    /// the caller must then drop the op's resolver: this event will never run
-    /// the continuation waiting on it.
-    #[must_use]
-    fn hand_op(&self, id: u64, future: asyncrt::OpFuture, lifetime: asyncrt::OpLifetime) -> bool {
+    /// This cell event has ended (its driver's `abandon`): its cell is
+    /// remembered, once, for an op that one of its continuations enqueues
+    /// later. `holding`: it ended with an op pending that could not keep it
+    /// alive, which a later event settles.
+    fn ended(&self, holding: bool) {
+        if let Some((id, runtime_state)) = &self.continuation {
+            if let Some(runtime_state) = runtime_state.upgrade() {
+                self.remember_cell(&runtime_state, *id, holding);
+            }
+        }
+    }
+
+    fn remember_cell(&self, runtime_state: &ActorRuntimeState, id: u64, holding: bool) {
+        if let Some(cell) = self.cell.get() {
+            if !self.cell_remembered.swap(true, Ordering::Relaxed) {
+                runtime_state.ended_cells.lock().unwrap().ended(id, cell.clone(), holding);
+            }
+        }
+    }
+
+    /// A closed mailbox refuses, and hands the op back: this event will never
+    /// drive it, so the caller drives it or drops its resolver.
+    fn hand_op(
+        &self,
+        id: u64,
+        future: asyncrt::OpFuture,
+        lifetime: asyncrt::OpLifetime,
+    ) -> Result<(), asyncrt::OpFuture> {
         let mut handed = self.handed.lock().unwrap();
         let Some(queue) = handed.as_mut() else {
-            return false;
+            return Err(future);
         };
         queue.push((id, future, lifetime));
         // Published under the lock, so a reader that sees this count can take
@@ -11733,7 +11822,7 @@ impl IoContext {
         self.handed_len.store(queue.len(), Ordering::Release);
         drop(handed);
         self.handed_wake.notify_one();
-        true
+        Ok(())
     }
 
     /// Whether a foreign turn has left this event an op, without locking.
@@ -12080,11 +12169,13 @@ impl IoContextRegistryForTest {
     /// only stores it, so nothing here polls it.
     #[doc(hidden)]
     pub fn hand_pending_op(&self, context: &Arc<IoContext>, id: u64) -> bool {
-        context.hand_op(
-            id,
-            Box::pin(std::future::pending()),
-            asyncrt::OpLifetime::Handler,
-        )
+        context
+            .hand_op(
+                id,
+                Box::pin(std::future::pending()),
+                asyncrt::OpLifetime::Handler,
+            )
+            .is_ok()
     }
 
     /// The op ids `context` still holds for a driver that has not taken them.
@@ -12144,6 +12235,7 @@ impl Drop for IoContext {
         if let Some((id, runtime_state)) = &self.continuation {
             if let Some(runtime_state) = runtime_state.upgrade() {
                 runtime_state.io_contexts.lock().unwrap().remove(id);
+                self.remember_cell(&runtime_state, *id, false);
             }
         }
         if let Some(payload) = first_panic {
@@ -13164,5 +13256,33 @@ mod v8_pin_tests {
     #[test]
     fn celld_links_the_pinned_v8() {
         assert_eq!(v8::V8::get_version(), super::V8_VERSION);
+    }
+}
+
+#[cfg(test)]
+mod ended_cells_tests {
+    use super::{EndedCells, ENDED_CELLS_MAX, ENDED_HOLDING_CELLS_MAX};
+    use std::sync::Arc;
+
+    // Goal: an ended event's cell is remembered within its kind's bound, the
+    // oldest of that kind let go first, and a run of events that hold
+    // nothing never pushes out one that held a `monitor()`.
+    #[test]
+    fn ended_cells_keep_each_kind_to_its_bound() {
+        let mut ended = EndedCells::default();
+        let cell: Arc<str> = Arc::from("Door:1");
+        ended.ended(1, cell.clone(), true);
+        for id in 2..(ENDED_CELLS_MAX as u64 + 3) {
+            ended.ended(id, Arc::from("Door:2"), false);
+        }
+        assert_eq!(ended.cells.get(&1), Some(&cell), "a holding event outlives others");
+        assert!(!ended.cells.contains_key(&2), "the oldest of the others is let go");
+        assert!(ended.cells.contains_key(&(ENDED_CELLS_MAX as u64 + 2)), "the newest is kept");
+        assert_eq!(ended.cells.len(), ENDED_CELLS_MAX + 1);
+        for id in 0..ENDED_HOLDING_CELLS_MAX as u64 {
+            ended.ended(1_000_000 + id, Arc::from("Door:3"), true);
+        }
+        assert!(!ended.cells.contains_key(&1), "a holding event goes once its own kind is full");
+        assert_eq!(ended.cells.len(), ENDED_CELLS_MAX + ENDED_HOLDING_CELLS_MAX);
     }
 }
