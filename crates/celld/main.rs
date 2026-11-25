@@ -4082,6 +4082,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     crons,
                     containers: Vec::new(),
                     fence_image: None,
+                    cross_script_classes: Vec::new(),
                 }),
                 GenerationOptions {
                     node: node.clone(),

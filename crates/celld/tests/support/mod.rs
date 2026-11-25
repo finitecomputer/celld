@@ -62,10 +62,58 @@ impl Dev {
 
     /// One `celld dev` with `env` set beside the defaults.
     pub fn start_with(project: &Path, env: &[(&str, &str)]) -> Dev {
+        Dev::start_args(&[project.as_os_str()], env)
+    }
+
+    /// One `celld dev` given `args` (a project, and any `--with PROJECT`).
+    pub fn start_args<A: AsRef<std::ffi::OsStr>>(args: &[A], env: &[(&str, &str)]) -> Dev {
+        let mut dev = Dev::spawn(args, env);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Ok((200, _)) = dev.get("/.well-known/celld/health") {
+                return dev;
+            }
+            if let Some(status) = dev.child.try_wait().unwrap() {
+                panic!("celld dev exited with {status}:\n{}", dev.output());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "celld dev did not become ready:\n{}",
+                dev.output()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// What `celld dev` given `args` said, when it must stop before it
+    /// serves: it may not answer its health first.
+    pub fn refused<A: AsRef<std::ffi::OsStr>>(args: &[A], env: &[(&str, &str)]) -> String {
+        let mut dev = Dev::spawn(args, env);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Some(status) = dev.child.try_wait().unwrap() {
+                assert!(!status.success(), "celld dev exited cleanly:\n{}", dev.output());
+                // the readers drain what the process wrote before it exited
+                std::thread::sleep(Duration::from_millis(200));
+                return dev.output();
+            }
+            if let Ok((200, _)) = dev.get("/.well-known/celld/health") {
+                panic!("celld dev served:\n{}", dev.output());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "celld dev neither served nor exited:\n{}",
+                dev.output()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn spawn<A: AsRef<std::ffi::OsStr>>(args: &[A], env: &[(&str, &str)]) -> Dev {
         let port = free_port();
         let mut child = Command::new(env!("CARGO_BIN_EXE_celld"))
             .arg("dev")
-            .arg(project)
+            .args(args.iter())
             .args(["--port", &port.to_string(), "--no-watch", "--logs"])
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
@@ -94,25 +142,10 @@ impl Dev {
                 }
             });
         }
-        let mut dev = Dev {
+        Dev {
             child,
             port,
             output,
-        };
-        let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            if let Ok((200, _)) = dev.get("/.well-known/celld/health") {
-                return dev;
-            }
-            if let Some(status) = dev.child.try_wait().unwrap() {
-                panic!("celld dev exited with {status}:\n{}", dev.output());
-            }
-            assert!(
-                Instant::now() < deadline,
-                "celld dev did not become ready:\n{}",
-                dev.output()
-            );
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
 

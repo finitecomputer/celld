@@ -5424,7 +5424,10 @@ const __fetcherHelper = (fetch, prop) => {
   };
 };
 function makeNamespace(className) {
-  const namespaceKey = __cell.namespaceKeys[className];
+  // fork: a class of another script (`script_name`) is keyed by its owner.
+  const namespaceKey = Object.hasOwn(__cell.namespaceKeys, className)
+    ? __cell.namespaceKeys[className]
+    : __cell.crossScriptNamespaceKeys[className];
   if (typeof namespaceKey !== "string")
     throw new Error("no Durable Object namespace key for " + className);
   return new DurableObjectNamespace(className, namespaceKey);
@@ -6311,6 +6314,7 @@ const __cell = __celld.__cell = {
   env: {},
   idNames: {},
   namespaceKeys: {},
+  crossScriptNamespaceKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
   compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },

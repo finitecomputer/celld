@@ -835,6 +835,22 @@ async fn load_worker_at_pointer(
             ))
         })
         .collect();
+    // fork: (class, owner) of each binding to another script's class. The
+    // generation checks the owner declares it, and keys its ids by the owner.
+    let mut cross_script_classes = bindings(&manifest, "durable_object_namespace")
+        .filter_map(|binding| {
+            let owner = binding.get("script_name")?.as_str()?;
+            if owner == manifest.script_name {
+                return None;
+            }
+            Some((
+                binding.get("class_name")?.as_str()?.to_string(),
+                owner.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    cross_script_classes.sort();
+    cross_script_classes.dedup();
     // (env name, bucket name). The bucket name is the key space the
     // binding owns inside the fleet bucket; see [[r2]].
     let r2_bindings = bindings(&manifest, "r2_bucket")
@@ -970,6 +986,7 @@ async fn load_worker_at_pointer(
         crons,
         containers,
         fence_image,
+        cross_script_classes,
     })
 }
 
@@ -994,6 +1011,10 @@ pub struct LoadedDeployment {
     pub containers: Vec<crate::container::ContainerSpec>,
     /// See `Manifest::fence_image`.
     pub fence_image: Option<String>,
+    /// fork: the Durable Object classes this script binds from another
+    /// script (`script_name`), as (class, owning script), sorted. Their
+    /// objects are the owner's; this script hosts none of them.
+    pub cross_script_classes: Vec<(String, String)>,
 }
 
 fn bindings<'a>(
