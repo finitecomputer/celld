@@ -94,6 +94,8 @@ pub mod queue_cli;
 pub mod queue_policy;
 pub mod r2_cli;
 pub(crate) mod r2_store;
+pub mod sealed_bucket;
+pub mod seal_bucket_cli;
 pub mod replication;
 pub mod runtime;
 pub mod secrets;

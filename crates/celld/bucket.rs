@@ -667,6 +667,42 @@ impl Bucket {
         app: Option<&str>,
         sources: CloudSources,
     ) -> anyhow::Result<Bucket> {
+        Self::open_sealable(bucket, endpoint, region, credentials, app, sources, true)
+    }
+
+    /// fork: a bucket never sealed, whatever `CELLD_BUCKET_SEAL` says: the
+    /// sealed bucket's own counter (sealed_bucket.rs), and a migration's
+    /// plain source.
+    pub fn open_unsealed(
+        bucket: &str,
+        endpoint: Option<&str>,
+        region: &str,
+        credentials: Option<StaticCredentials>,
+        app: Option<&str>,
+    ) -> anyhow::Result<Bucket> {
+        Self::open_sealable(bucket, endpoint, region, credentials, app, CloudSources::from_process(), false)
+    }
+
+    /// The conditional-write client, for a caller that writes its own
+    /// objects (the sealed bucket's counter).
+    pub(crate) fn cas_store(&self) -> Arc<dyn ObjectStore> {
+        self.cas_store.clone()
+    }
+
+    /// The store's path of a caller's key.
+    pub(crate) fn path_of(&self, key: &str) -> Path {
+        Path::from(self.key(key).as_str())
+    }
+
+    fn open_sealable(
+        bucket: &str,
+        endpoint: Option<&str>,
+        region: &str,
+        credentials: Option<StaticCredentials>,
+        app: Option<&str>,
+        sources: CloudSources,
+        sealable: bool,
+    ) -> anyhow::Result<Bucket> {
         let CloudSources {
             gcs: gcs_builder,
             azure: azure_env,
@@ -825,6 +861,21 @@ impl Bucket {
             StorageBackend::Local => {
                 unreachable!("the local development store has its own constructor")
             }
+        };
+        // fork: the sealed fleet bucket, when CELLD_BUCKET_SEAL names one
+        // (docs/services/sealed-bucket.md): one store per bucket and prefix
+        // in the process, over both clients.
+        let sealed = match sealable {
+            true => crate::sealed_bucket::wrap(bucket, &prefix, store.clone(), cas_store.clone())?,
+            false => None,
+        };
+        let (store, paginated, cas_store) = match sealed {
+            Some(sealed) => (
+                Arc::new(sealed.clone()) as Arc<dyn ObjectStore>,
+                Arc::new(sealed.clone()) as Arc<dyn PaginatedListStore>,
+                Arc::new(sealed) as Arc<dyn ObjectStore>,
+            ),
+            None => (store, paginated, cas_store),
         };
         Ok(Bucket {
             store,

@@ -1483,6 +1483,16 @@ impl LtxRepl {
                 Arc::new(crate::local_store::LocalStore::open(&bucket)?)
             }
         };
+        // fork: the sealed fleet bucket (sealed_bucket.rs). The cells' pages
+        // are its most private objects: they go through the same sealed store
+        // the node's bucket opened, never through a client of their own.
+        let store = match crate::sealed_bucket::registered(&bucket, &prefix) {
+            Some(sealed) => Arc::new(sealed) as Arc<dyn ObjectStore>,
+            None if crate::sealed_bucket::Config::from_env()?.is_some() => {
+                anyhow::bail!("{} is set but the bucket {bucket} opened unsealed: the cells' pages would leave plain", crate::sealed_bucket::VARIABLE)
+            }
+            None => store,
+        };
         // Azure blob metadata names must be C# identifiers, so the standard
         // Litestream key cannot carry its hyphen there. External Litestream
         // tooling reads that key, therefore an az:// replica gives up
