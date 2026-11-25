@@ -97,6 +97,8 @@ const WORK: &str = "/build";
 /// its owner (`owner_of_self`).
 const VM: &str = "celld-builder";
 const OWNER_LABEL: &str = "celld-builder";
+/// The krun engine's references, at most (sandcastle's `Reference::parse`).
+const REFERENCE_BYTES_MAX: usize = 256;
 /// How long a session waits for another's to end (`lock_path`).
 const LOCK_WAIT_MAX: Duration = Duration::from_secs(30 * 60);
 const LOCK_WAIT_EVERY: Duration = Duration::from_millis(500);
@@ -425,6 +427,11 @@ impl Builder {
         if self.lock.is_none() {
             self.take_turn().await?;
         }
+        // Its pinned name must fit the engine's references too.
+        anyhow::ensure!(
+            reference.contains('@') || pinned(reference, &format!("sha256:{}", "0".repeat(64))).len() <= REFERENCE_BYTES_MAX,
+            "the image reference {reference:?} is too long to pin by its digest: the krun engine holds references of at most {REFERENCE_BYTES_MAX} bytes"
+        );
         let pulled = self.engine_pull(reference).await?;
         let pinned = if reference.contains('@') {
             reference.to_string()
@@ -631,6 +638,12 @@ impl Builder {
             tokio::time::sleep(LOCK_WAIT_EVERY).await;
         }
         self.lock = Some(file);
+        // On the turn, a builder there is one a killed session left: it
+        // goes first, before a pull or a build needs the engine's room.
+        if self.api.call("GET", &format!("/v1/containers/{VM}"), None).await?.status.is_success() {
+            tracing::warn!("destroying an image builder a killed celld left");
+            self.destroy(VM).await?;
+        }
         // Images staged by a session that was killed before its loads.
         if let Ok(left) = std::fs::read_dir(staging_dir(&engine)) {
             for entry in left.flatten() {
@@ -645,12 +658,6 @@ impl Builder {
     /// held: a builder already there is one a killed session left, and goes.
     async fn take_vm(&self) -> anyhow::Result<()> {
         assert!(self.lock.is_some(), "the builder starts on the session's turn");
-        // A builder there now is one a killed session left: it goes before
-        // the engine's room is read, which counts it.
-        if self.api.call("GET", &format!("/v1/containers/{VM}"), None).await?.status.is_success() {
-            tracing::warn!("destroying an image builder a killed celld left");
-            self.destroy(VM).await?;
-        }
         let health = self.api.call("GET", "/v1/health", None).await?.json()?;
         let Some(instance) = instance(&health) else {
             bail!(
@@ -1012,6 +1019,7 @@ mod tests {
         assert_eq!(pinned("redis", d), format!("redis@{d}"));
         assert_eq!(pinned("localhost:5000/a/b:v1", d), format!("localhost:5000/a/b@{d}"));
         assert_eq!(pinned("localhost:5000/a/b", d), format!("localhost:5000/a/b@{d}"));
+        assert!(pinned(&"r".repeat(185), d).len() > REFERENCE_BYTES_MAX, "one too long to pin is refused before its pull");
     }
 
     #[test]

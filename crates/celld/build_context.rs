@@ -167,10 +167,12 @@ impl Pattern {
                 '\\' => match chars.get(i) {
                     Some(next) => {
                         // Go's Perl classes are ASCII; Rust's, Unicode.
+                        // Inside a bracket their grammars part ways too
+                        // (`[\s-z]`): a letter escaped there is refused.
                         match (*next, in_class) {
-                            ('s', true) => re.push_str("\\t\\n\\x0C\\r "),
-                            ('d', true) => re.push_str("0-9"),
-                            ('w', true) => re.push_str("0-9A-Za-z_"),
+                            (c, true) if c.is_ascii_alphabetic() => {
+                                bail!("an escaped letter inside a bracket ([...\\{c}...]) is not supported by celld's krun builder; spell the characters out")
+                            }
                             ('s', false) => re.push_str("[\\t\\n\\x0C\\r ]"),
                             ('S', false) => re.push_str("[^\\t\\n\\x0C\\r ]"),
                             ('d', false) => re.push_str("[0-9]"),
@@ -500,8 +502,7 @@ mod tests {
             ("secrets\\s*.env", "secrets prod.env", true),
             ("secrets\\s*.env", "secretss.env", false),
             ("secrets\\s*.env", "secrets\u{a0}prod.env", false),
-            ("a[\\s]b", "a b", true),
-            ("a[\\d]b", "a1b", true),
+
             ("a\\Sb", "a\u{e9}b", true),
             ("a\\Sb", "a b", false),
             ("a\\db", "a\u{0663}b", false),
@@ -526,6 +527,9 @@ mod tests {
         assert!(ignore("!x\n*").excludes("x"), "an earlier ! is undone");
         assert!(Ignore::parse("!").is_err());
         assert!(Ignore::parse("[").is_err());
+        assert!(Ignore::parse("a[\\s-z]b").is_err(), "an escaped letter in a bracket is refused");
+        assert!(Ignore::parse("a[\\W]b").is_err());
+        assert!(ignore("a[\\-z]b").excludes("a-b"), "an escaped punctuation mark is itself");
     }
 
     // Goal: a directory is skipped as fsutil skips it.
