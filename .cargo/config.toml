@@ -1,5 +1,6 @@
 # celld links V8 from our own rusty_v8 build, not denoland's prebuilt
 # archive. tools/v8/rusty-v8.sh pin writes this file; docs/v8.md says why.
+# This is x86_64-unknown-linux-gnu's pin, which a plain `cargo build` applies.
 #
 # The v8 build script fetches RUSTY_V8_ARCHIVE and checks it against
 # RUSTY_V8_ARCHIVE_SHA256 before use. It compiles the binding at
@@ -9,11 +10,11 @@
 # crates/celld/build.rs checks that file against CELLD_V8_BINDING_SHA256,
 # refuses the variables that would bring other V8 code in (a binding mirror
 # or URL; trybuild; a source or debug build), and any target but x86_64-unknown-linux-gnu,
-# the only one with an archive. Every value is forced over the environment.
+# which this archive is for. Every value is forced over the environment.
 [env]
-CELLD_V8_VERSION = { value = "15.8.62.31", force = true }
-RUSTY_V8_ARCHIVE = { value = "https://github.com/futurepaul/celld/releases/download/rusty_v8-v158.0.0-v8-15.8.62.31/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz", force = true }
-RUSTY_V8_ARCHIVE_SHA256 = { value = "81004e53337c85bf55ffcb2a4b9963a09de15a9f41eeefc5201bc20ccd66f930", force = true }
+CELLD_V8_VERSION = { value = "15.8.62.68", force = true }
+RUSTY_V8_ARCHIVE = { value = "https://github.com/finitecomputer/celld/releases/download/rusty_v8-v158.0.0-v8-15.8.62.68/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz", force = true }
+RUSTY_V8_ARCHIVE_SHA256 = { value = "791fb194b0c4ea76dab4af488bd8257404e37d692183beeb28fc87c1c3ba4cc1", force = true }
 RUSTY_V8_SRC_BINDING_PATH = { value = ".cargo/v8/src_binding_release_x86_64-unknown-linux-gnu.rs", relative = true, force = true }
-CELLD_V8_BINDING_SHA256 = { value = "b8155c3f25a1d6ff3dc8f4625db5872f21240bd38552143db0072615d7a5a149", force = true }
+CELLD_V8_BINDING_SHA256 = { value = "216f448e83d744eee02725e8a7bfad9a5d4918347bb4c9b800cd4f53cb860b2d", force = true }
 RUSTY_V8_SKIP_DOWNLOAD = { value = "0", force = true }
