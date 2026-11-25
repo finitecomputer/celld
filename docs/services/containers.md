@@ -182,6 +182,15 @@ window, and the next activation on the same node reconnects to it. A move to
 another node, a node restart, a reset, and a node stop destroy the container.
 Ctrl-C on `celld dev` destroys the containers and keeps the local state.
 
+A restart can keep them instead, as Cloudflare keeps a container through its
+Worker's restart: on the krun engine, a stop by
+`POST /shutdown?handoff=preserve&containers=keep` (on the internal listener)
+leaves the node's containers running and a marker in its data directory. The
+same node's next start takes the marker and adopts each container by name as
+its cell comes back. It destroys any that no cell has claimed after 10
+minutes. A stop without `containers=keep`, a handoff, a crash and a start
+without the marker reap as before. Docker's containers are always reaped.
+
 `instance_type` accepts `lite` and its older name `dev`, `basic`, `standard-1`
 and its alias `standard`, `standard-2`, `standard-3`, and `standard-4`, with the
 CPU and memory limits of
