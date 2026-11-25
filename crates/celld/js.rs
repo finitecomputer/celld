@@ -3928,7 +3928,9 @@ impl InFlight {
     /// this one (`watch_handler_settlement`). Asking clears it, so a driver
     /// polls once for each settlement rather than spinning.
     pub(crate) fn take_settled_unanswered(&mut self) -> bool {
-        self.context.take_handler_settled() && self.reply.is_some()
+        // a hung-up handler has no reply, but its settling still ends its
+        // budget (`settle`), so its driver looks too
+        self.context.take_handler_settled() && (self.reply.is_some() || self.hung_up)
     }
 
     /// Whether a native operation can still resume JavaScript for this event.

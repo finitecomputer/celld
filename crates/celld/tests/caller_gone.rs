@@ -30,6 +30,17 @@ export class Saver {
       await this.ctx.storage.put("done", true);
       return new Response("done");
     }
+    if (url.searchParams.has("wait")) {
+      // leaves a write for after the budget, then waits for another request
+      setTimeout(() => this.ctx.storage.put("late", true), 4000);
+      await this.ctx.storage.put("waiting", true);
+      await new Promise((resolve) => (this.release = resolve));
+      return new Response("released");
+    }
+    if (url.searchParams.has("release")) {
+      this.release();
+      return new Response("let go");
+    }
     if (url.searchParams.has("forever")) {
       // counts every 100 ms and never answers
       for (let n = 1; ; n++) {
@@ -41,6 +52,8 @@ export class Saver {
       began: (await this.ctx.storage.get("began")) ?? false,
       done: (await this.ctx.storage.get("done")) ?? false,
       count: (await this.ctx.storage.get("count")) ?? 0,
+      waiting: (await this.ctx.storage.get("waiting")) ?? false,
+      late: (await this.ctx.storage.get("late")) ?? false,
     });
   }
 }
@@ -106,4 +119,26 @@ fn a_handler_whose_caller_hung_up_still_ends_at_its_budget() {
     std::thread::sleep(Duration::from_secs(1));
     let (then, _) = dev.json("/");
     assert_eq!(first["count"], then["count"], "the handler ended at its budget:\n{}", dev.output());
+}
+
+#[test]
+fn a_hung_up_handler_settled_by_another_request_keeps_what_it_left() {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path(), WORKER, &[("SAVER", "Saver")]);
+    let dev = Dev::start_with(dir.path(), &[("CELLD_HANDLER_BUDGET_S", &BUDGET_S.to_string())]);
+
+    let mut caller = TcpStream::connect(("127.0.0.1", dev.port)).unwrap();
+    write!(caller, "GET /?wait HTTP/1.0\r\nhost: 127.0.0.1\r\n\r\n").unwrap();
+    let waiting = until(&dev, Duration::from_secs(20), |seen| seen["waiting"] == true);
+    assert_eq!(waiting["waiting"], true, "it waits:\n{}", dev.output());
+    caller.shutdown(Shutdown::Both).unwrap();
+    drop(caller);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // another request settles it within its budget; the write it left for
+    // after that budget is the object's, and lands
+    let (status, body) = dev.get("/?release").unwrap();
+    assert_eq!((status, body.as_str()), (200, "let go"), "{}", dev.output());
+    let seen = until(&dev, Duration::from_secs(10), |seen| seen["late"] == true);
+    assert_eq!(seen["late"], true, "what it left after settling ran past the budget:\n{}", dev.output());
 }
