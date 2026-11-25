@@ -63,6 +63,12 @@ response can reveal, as the Cloudflare
 [output gate](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)
 does, so an application does not have to `await` a `put()`.
 
+A handler whose caller hangs up runs on to its end, as in workerd: its
+`request.signal` fires and its answer reaches no one, but the timers, calls,
+and storage it awaits are the object's, not the request's. This holds for a
+caller that reaches the object through a Worker too. A node that stops ends the
+handler instead.
+
 The output gate holds each WebSocket frame only for its own proof, so a
 `webSocketMessage()` handler that sends and then awaits delivers that frame
 while it runs. On one socket, celld starts message handlers in arrival order

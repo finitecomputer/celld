@@ -3486,10 +3486,17 @@ pub struct InFlight {
     /// request stays in flight until it settles, as the single-request loop
     /// keeps driving it.
     background: Option<v8::Global<v8::Promise>>,
-    /// A successfully completed Durable Object event keeps every referenced
-    /// native operation alive. Workerd does not require `waitUntil` for this
-    /// I/O, so dropping these operations loses detached timers and subrequests.
-    completed_cell_event: bool,
+    /// A Durable Object event that completed successfully, or whose caller
+    /// hung up, keeps every referenced native operation alive. Workerd does
+    /// not require `waitUntil` for this I/O: an actor's work is the object's,
+    /// not the request's, and runs on until the actor shuts down. Dropping
+    /// these operations loses detached timers and subrequests, and a handler
+    /// whose caller hung up stops at its next await.
+    keeps_cell_io: bool,
+    /// A Durable Object handler whose caller hung up and that has not
+    /// settled: the handler budget still bounds it (`remaining`), as it bounds
+    /// one whose caller waits, and its ops go when it runs out (`time_out`).
+    hung_up: bool,
     /// Ops this request is waiting on, so a completion can be attributed to
     /// the request whose context must be current while its continuation runs.
     ops: std::collections::HashSet<u64>,
@@ -3546,7 +3553,7 @@ impl InFlight {
                 reply.fail_with_arm_gates(anyhow!(error), self.context.take_arm_gates());
             return;
         }
-        self.completed_cell_event = self.scope.is_some();
+        self.keeps_cell_io = self.scope.is_some();
         let (background, gated_reply) = match reply {
             Answer::Fetch(reply) => {
                 // A value the decoder refuses is a failure in the turn like a
@@ -3888,19 +3895,24 @@ impl InFlight {
         }
     }
 
-    /// How long this handler may still run, or `None` once it has answered.
+    /// How long this handler may still run, or `None` once it has answered
+    /// (or, its caller gone, once it has settled).
     ///
     /// The budget bounds the *response*, not the request: `waitUntil` work
     /// continues after the client has been served and is not charged for the
     /// time the handler already spent.
     pub fn remaining(&self, budget: Duration) -> Option<Duration> {
-        self.reply
-            .is_some()
+        (self.reply.is_some() || self.hung_up)
             .then(|| budget.saturating_sub(self.started.elapsed()))
     }
 
-    /// Give up on a handler that will not settle.
+    /// Give up on a handler that will not settle. One whose caller hung up
+    /// keeps its ops no longer, so they go as a waited-on handler's do.
     pub fn time_out(&mut self, budget: Duration) {
+        if self.hung_up {
+            self.hung_up = false;
+            self.keeps_cell_io = false;
+        }
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
     }
 
@@ -3932,14 +3944,17 @@ impl InFlight {
     /// this one (`watch_handler_settlement`). Asking clears it, so a driver
     /// polls once for each settlement rather than spinning.
     pub(crate) fn take_settled_unanswered(&mut self) -> bool {
-        self.context.take_handler_settled() && self.reply.is_some()
+        // a hung-up handler has no reply, but its settling still ends its
+        // budget (`settle`), so its driver looks too
+        self.context.take_handler_settled() && (self.reply.is_some() || self.hung_up)
     }
 
     /// Whether a native operation can still resume JavaScript for this event.
     ///
     /// A detached reply gate is host work. It cannot keep handler operations
     /// alive after the handler ends. A successfully completed Durable Object
-    /// event keeps its pending I/O without `waitUntil`, as Workerd does. An
+    /// event keeps its pending I/O without `waitUntil`, as Workerd does, and
+    /// so does one whose caller hung up (`keeps_cell_io`). An
     /// operation that owns the event's `IoContext` and a block that holds or
     /// is queued to take a cell's input gate can also continue. The block
     /// belongs to the object, not to the client: it runs to completion as
@@ -3948,7 +3963,7 @@ impl InFlight {
     /// awaited, and the gate stayed shut for every later event (#733).
     pub(crate) fn keeps_native_ops(&self) -> bool {
         self.reply.is_some()
-            || self.completed_cell_event
+            || self.keeps_cell_io
             || !self.io_context_ops.is_empty()
             || self.keeps_native_ops_after_disconnect()
     }
@@ -4824,7 +4839,8 @@ fn begin<'s>(
                 reply: Some(Answer::Fetch(reply)),
                 gated_reply: None,
                 background: None,
-                completed_cell_event: false,
+                keeps_cell_io: false,
+                hung_up: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -4918,7 +4934,8 @@ fn begin_entrypoint_rpc(
                 reply: Some(Answer::Rpc(reply)),
                 gated_reply: None,
                 background: None,
-                completed_cell_event: false,
+                keeps_cell_io: false,
+                hung_up: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5157,7 +5174,8 @@ fn begin_queue(
                 reply: Some(Answer::Queue(reply)),
                 gated_reply: None,
                 background: None,
-                completed_cell_event: false,
+                keeps_cell_io: false,
+                hung_up: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5393,7 +5411,8 @@ fn start_cell_event<'s>(
                 reply: Some(answer),
                 gated_reply: None,
                 background: None,
-                completed_cell_event: false,
+                keeps_cell_io: false,
+                hung_up: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5448,7 +5467,8 @@ fn start_cell_event<'s>(
                     reply: None,
                     gated_reply,
                     background,
-                    completed_cell_event: false,
+                    keeps_cell_io: false,
+                    hung_up: false,
                     ops: std::collections::HashSet::new(),
                     io_context_ops: std::collections::HashSet::new(),
                     unrefed_ops: std::collections::HashSet::new(),
@@ -5880,15 +5900,24 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
         // paths retire the same work.
         entry.retire_background_for_shutdown();
     }
-    // A cancelled handler with no waitUntil work has nothing left to drive.
-    // Drop its host ops now, so their guards cancel routed work. Explicit
-    // waitUntil work keeps its ops and continues after the client disconnects.
+    // A Durable Object's handler runs on after its caller hangs up, as
+    // workerd's does: its `request.signal` has fired, and its answer reaches
+    // no one, but the timers and calls it awaits are the object's
+    // (`keeps_cell_io`). Not at shutdown: the object leaves the process.
+    if !shutdown && entry.scope.is_some() {
+        entry.keeps_cell_io = true;
+        entry.hung_up = true;
+    }
+    // A cancelled stateless handler with no waitUntil work has nothing left
+    // to drive. Drop its host ops now, so their guards cancel routed work.
+    // Explicit waitUntil work keeps its ops and continues after the client
+    // disconnects.
     //
     // So does a handler that holds or awaits the cell's input gate, or whose
     // cross-entry block can still use an operation started by this event.
     // Not at shutdown: nothing will run the block to its end, so its gate is
     // given up instead.
-    if shutdown || !entry.keeps_native_ops_after_disconnect() {
+    if shutdown || !(entry.keeps_cell_io || entry.keeps_native_ops_after_disconnect()) {
         entry.abandon();
     }
 }
@@ -5896,6 +5925,11 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
 /// Answer a request whose handler promise has settled, and retire its
 /// `waitUntil` work once that settles too.
 fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
+    // A handler whose caller hung up has ended: what it left running is the
+    // object's, as a completed handler's is, past the handler budget.
+    if entry.hung_up && !matches!(v8::Local::new(tc, &entry.promise).state(), v8::PromiseState::Pending) {
+        entry.hung_up = false;
+    }
     if entry.reply.is_some() {
         let promise = v8::Local::new(tc, &entry.promise);
         match promise.state() {
