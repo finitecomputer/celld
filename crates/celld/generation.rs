@@ -145,13 +145,13 @@ impl DeploymentGraph {
         let mut cohosted = Vec::new();
         while let Some(dependency) = dependencies.pop_front() {
             let loaded = match dependency {
-                Dependency::Service(target) => {
+                Dependency::Script(target, binding) => {
                     if target == primary_script || loaded_scripts.contains_key(&target) {
                         continue;
                     }
                     let loaded = fleet::load_named_worker(bucket, &target, node.clone())
                         .await
-                        .with_context(|| format!("load service binding target {target}"))?;
+                        .with_context(|| format!("load {binding} target {target}"))?;
                     if loaded.script_name != target {
                         anyhow::bail!(
                             "service pointer {target} resolved script {}",
@@ -236,7 +236,10 @@ impl DeploymentGraph {
 }
 
 enum Dependency {
-    Service(String),
+    /// A script, and the kind of binding that reaches it: a service
+    /// binding's target, or the script whose Durable Object class an object
+    /// binding names (`script_name`), whose code runs those objects.
+    Script(String, &'static str),
     Queue(String),
 }
 
@@ -261,9 +264,50 @@ fn dependencies_of(loaded: &LoadedDeployment) -> VecDeque<Dependency> {
     loaded
         .services
         .iter()
-        .map(|(_, script, _)| Dependency::Service(script.clone()))
+        .map(|(_, script, _)| Dependency::Script(script.clone(), "service binding"))
+        .chain(
+            loaded
+                .cross_script_classes
+                .iter()
+                .map(|(_, owner)| Dependency::Script(owner.clone(), "Durable Object binding")),
+        )
         .chain(queues.into_iter().map(Dependency::Queue))
         .collect()
+}
+
+/// fork: refuse a binding to another script's Durable Object class unless
+/// that script is part of this deployment and declares the class, as workerd
+/// refuses a `durableObjectNamespace` whose service has no such class. The
+/// binding script hosts none of these objects: a call reaches the owner's,
+/// the same cells the owner's own binding reaches.
+fn check_cross_script_classes<'a>(
+    deployments: impl Iterator<Item = &'a LoadedDeployment> + Clone,
+) -> anyhow::Result<()> {
+    for deployment in deployments.clone() {
+        for (class, owner) in &deployment.cross_script_classes {
+            let Some(declared) = deployments
+                .clone()
+                .find(|other| other.script_name == *owner)
+            else {
+                return Err(anyhow!(
+                    "script {} binds Durable Object class {class} of script {owner}, which is not \
+                     part of this deployment",
+                    deployment.script_name
+                ));
+            };
+            if crate::deploy::is_reserved_class(class)
+                || !declared.options.do_classes.iter().any(|own| own == class)
+            {
+                return Err(anyhow!(
+                    "script {} binds Durable Object class {class} of script {owner}, which \
+                     declares no such class (a script declares a class with a \
+                     `durable_objects` binding of its own)",
+                    deployment.script_name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Node-level inputs `Generation::build` needs beside the deployment itself.
@@ -467,6 +511,7 @@ impl Generation {
     ) -> anyhow::Result<Self> {
         let GenerationOptions { node, region } = options;
         let DeploymentGraph { primary, cohosted } = graph;
+        check_cross_script_classes(std::iter::once(&primary).chain(cohosted.iter()))?;
         crate::runtime::init_engine();
 
         // A Queue class is shared by every co-hosted script, but its broker
@@ -560,6 +605,7 @@ impl Generation {
                 crons,
                 containers,
                 fence_image: fence,
+                cross_script_classes,
                 ..
             } = deployment;
             all_containers.extend(containers.iter().cloned());
@@ -577,6 +623,7 @@ impl Generation {
                     .with_queue_consumers(queue_catalog.clone())
                     .with_crons(if is_primary { crons } else { Vec::new() })
                     .with_containers(containers)
+                    .with_cross_script_classes(cross_script_classes)
                     .with_generation(id),
             );
             let pool = crate::runtime::StatelessRuntime::start(

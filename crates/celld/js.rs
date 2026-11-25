@@ -1968,6 +1968,11 @@ pub struct WorkerConfig {
     origin: WorkerOrigin,
     do_classes: Vec<String>,
     bindings: Vec<(String, String)>,
+    /// fork: the Durable Object classes a binding of this script names in
+    /// another script (`script_name`), as (class, owning script). The
+    /// binding's ids derive from the owner's namespace key, so it reaches
+    /// the owner's objects; this script registers none of these classes.
+    cross_script_classes: Vec<(String, String)>,
     /// `r2_buckets`: (environment name, bucket name). The bucket name is
     /// the key space the binding owns inside the fleet bucket; see [[r2]].
     r2_bindings: Vec<(String, String)>,
@@ -2136,6 +2141,7 @@ impl WorkerConfig {
             origin: WorkerOrigin::Deployment,
             do_classes,
             bindings,
+            cross_script_classes: Vec::new(),
             r2_bindings,
             d1_bindings,
             kv_bindings,
@@ -2165,6 +2171,13 @@ impl WorkerConfig {
 
     pub fn with_containers(mut self, containers: Vec<crate::container::ContainerSpec>) -> Self {
         self.containers = containers;
+        self
+    }
+
+    /// fork: the classes this script binds from other scripts, as (class,
+    /// owning script); the generation has checked each owner declares its class.
+    pub fn with_cross_script_classes(mut self, classes: Vec<(String, String)>) -> Self {
+        self.cross_script_classes = classes;
         self
     }
 
@@ -2610,6 +2623,9 @@ struct ActorRuntimeState {
     resource_limits: Option<ResourceLimits>,
     tail_reporting: bool,
     script_name: String,
+    /// fork: whether this isolate's Cache API keeps anything (`cache_api`):
+    /// a deployed script's does, a Dynamic Worker's never.
+    cache_api: bool,
     event_hooks: OnceLock<EventHooks>,
     /// See [`internals`].
     internals: OnceLock<v8::Global<v8::Object>>,
@@ -6062,6 +6078,7 @@ impl Worker {
             resource_limits: config.resource_limits,
             tail_reporting: config.tail_reporting,
             script_name: script_name.to_string(),
+            cache_api: config.origin == WorkerOrigin::Deployment,
             ..Default::default()
         });
         let heap_limit_state = Arc::new(HeapLimitState {
@@ -6191,7 +6208,7 @@ impl Worker {
                     .ok_or_else(|| anyhow!("DO class {cn} not exported"))?;
                 register_class(scope, cn, cls)?;
             }
-            inject_namespace_keys(scope, script_name, do_classes)?;
+            inject_namespace_keys(scope, script_name, do_classes, &config.cross_script_classes)?;
             inject_crons(scope, &config.crons)?;
             inject_workflows(scope, script_name, &config.workflow_bindings)?;
             inject_containers(scope, &config.containers)?;
@@ -7110,6 +7127,9 @@ ops! { OP_NAMES, install_op_functions,
         "__structured_clone" => storage_ops::op_structured_clone,
         "__op_fetch" => op_fetch,
         "__secret_get" => op_secret_get,
+        "__cache_put" => op_cache_put,
+        "__cache_match" => op_cache_match,
+        "__cache_delete" => op_cache_delete,
         "__r2_head" => r2_ops::op_r2_head,
         "__r2_get" => r2_ops::op_r2_get,
         "__r2_put" => r2_ops::op_r2_put,
@@ -7242,6 +7262,122 @@ fn op_kv_blob(
         }
     });
     rv.set(promise_for(scope, id));
+}
+
+/// fork: the Cache API key of a call from this isolate: its script, the
+/// cache (`null` for `caches.default`), and the URL (the shim strips its
+/// fragment). `None` for a Dynamic Worker, whose cache keeps nothing.
+fn cache_key(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments) -> Option<crate::cache_api::Key> {
+    let state = actor_runtime_state(scope);
+    if !state.cache_api {
+        return None;
+    }
+    let cache = args.get(0);
+    let cache = (!cache.is_null_or_undefined()).then(|| cache.to_rust_string_lossy(scope));
+    Some(crate::cache_api::Key {
+        script: state.script_name.clone(),
+        cache,
+        url: args.get(1).to_rust_string_lossy(scope),
+    })
+}
+
+/// fork: `__cache_put(cache, url, status, statusText, headersJson, body)`:
+/// `cache.put()` after the shim's checks. Keeps the response as long as
+/// Cloudflare's rules say (`cache_api::keep_for`), or not at all; answers
+/// whether it was kept.
+fn op_cache_put(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(key) = cache_key(scope, &args) else {
+        rv.set(v8::Boolean::new(scope, false).into());
+        return;
+    };
+    let status = args.get(2).uint32_value(scope).unwrap_or(0).min(u16::MAX as u32) as u16;
+    let status_text = args.get(3).to_rust_string_lossy(scope);
+    let headers: Vec<(String, String)> =
+        match serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)) {
+            Ok(headers) => headers,
+            Err(error) => return loader_throw(scope, &format!("cache: the headers are not a name/value list: {error}")),
+        };
+    let Some(body) = view_bytes(args.get(5)) else {
+        return loader_throw(scope, "cache: the body is not a typed array");
+    };
+    // both clocks read before the lock: a wait for it spends no lifetime
+    let (wall, now) = (crate::asyncrt::wall_ms(), crate::asyncrt::mono_ms());
+    let kept = match crate::cache_api::keep_for(status, &headers, wall) {
+        crate::cache_api::Keep::For { ttl_ms, headers, age_s } => {
+            let stored = crate::cache_api::Stored { status, status_text, headers, body };
+            let mut store = crate::cache_api::node().lock().expect("cache store lock poisoned");
+            store.put(key, stored, ttl_ms, age_s, now)
+        }
+        // a put that keeps nothing still replaces what the URL held, but a
+        // 304's says the stored representation holds
+        crate::cache_api::Keep::Not(why) => {
+            if why.replaces() {
+                let mut store = crate::cache_api::node().lock().expect("cache store lock poisoned");
+                store.delete(&key, now);
+            }
+            false
+        }
+    };
+    rv.set(v8::Boolean::new(scope, kept).into());
+}
+
+/// fork: `__cache_match(cache, url)`: `[status, statusText, headersJson,
+/// body]` of the response the cache keeps for it, or `undefined`.
+fn op_cache_match(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(key) = cache_key(scope, &args) else {
+        return;
+    };
+    let found = {
+        let mut store = crate::cache_api::node().lock().expect("cache store lock poisoned");
+        // read under the lock: an entry that expired while this waited for it
+        // is not answered
+        store.get(&key, crate::asyncrt::mono_ms())
+    };
+    let Some(crate::cache_api::Hit { stored, age_s }) = found else {
+        return;
+    };
+    // a response that arrived with an `Age` leaves with its age now
+    let headers: Vec<(&str, std::borrow::Cow<str>)> = stored
+        .headers
+        .iter()
+        .map(|(name, value)| match age_s {
+            Some(age) if name.eq_ignore_ascii_case("age") => (name.as_str(), age.to_string().into()),
+            _ => (name.as_str(), value.as_str().into()),
+        })
+        .collect();
+    let headers = serde_json::to_string(&headers).expect("headers serialize");
+    let values = [
+        v8::Integer::new_from_unsigned(scope, u32::from(stored.status)).into(),
+        v8::String::new(scope, &stored.status_text).unwrap().into(),
+        v8::String::new(scope, &headers).unwrap().into(),
+        bytes_value(scope, stored.body.clone()),
+    ];
+    rv.set(v8::Array::new_with_elements(scope, &values).into());
+}
+
+/// fork: `__cache_delete(cache, url)`: whether the cache kept a response
+/// for it; it keeps none after.
+fn op_cache_delete(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let deleted = match cache_key(scope, &args) {
+        Some(key) => crate::cache_api::node()
+            .lock()
+            .expect("cache store lock poisoned")
+            .delete(&key, crate::asyncrt::mono_ms()),
+        None => false,
+    };
+    rv.set(v8::Boolean::new(scope, deleted).into());
 }
 
 /// Create a JS promise for an async op `id` and return it to JS.

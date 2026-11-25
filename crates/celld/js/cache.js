@@ -1,18 +1,20 @@
-// The Workers Cache API with always-miss semantics.
+// The Workers Cache API over the node's cache (crates/celld/cache_api.rs).
 //
-// celld has no shared edge cache, and Cloudflare's Cache API is a view of
-// exactly that cache. Refusing the API would break the large class of
-// Workers that treat `caches.default` as a best-effort layer over their
-// own origin logic, so celld accepts the surface, validates it with
-// Workerd's rules and messages, and misses every match -- the same
-// posture as `passThroughOnException()`, which is a documented no-op
-// because there is no CDN behind it. A per-node in-memory cache can
-// replace the miss without changing any observable contract.
+// Cloudflare's Cache API is a view of the edge cache of the data center a
+// Worker runs in. A node is celld's data center: every isolate of the node
+// shares one cache, kept in memory, per script. The shim validates each call
+// with Workerd's rules and messages; the host keeps what Cloudflare's rules
+// say to keep (`cache_api::keep_for`) and answers matches until each entry
+// expires. A Dynamic Worker's cache keeps nothing and misses every match.
 (function () {
   const kCreate = Symbol("celld.Cache.create");
+  const kName = Symbol("celld.Cache.name");
+  // The statuses whose Response must have a null body.
+  const nullBodyStatus = new Set([101, 103, 204, 205, 304]);
 
   // A key is a Request or URL string, and it must parse as an absolute
   // http(s) URL -- the same rule and message as Workerd's validateUrl.
+  // The entry's URL has no fragment: a fragment never reaches a server.
   const asKey = (request) => {
     const url = request instanceof Request ? request.url : String(request);
     let parsed = null;
@@ -24,12 +26,30 @@
       throw new TypeError(
         "Invalid URL. Cache API keys must be fully-qualified, valid URLs.");
     }
-    return request instanceof Request ? request : new Request(url);
+    // cut at the serialized fragment, which keeps the rest as it is: a bare
+    // `?` stays, and is another URL
+    const href = parsed.href;
+    const hash = href.indexOf("#");
+    const method = request instanceof Request ? request.method : "GET";
+    const headers = request instanceof Request ? request.headers : null;
+    return { url: hash < 0 ? href : href.slice(0, hash), method, headers };
   };
 
+  // A match or delete considers only a GET, unless `ignoreMethod`.
+  const considered = (key, options) =>
+    key.method === "GET" || Boolean(options && options.ignoreMethod);
+
+  // Cloudflare answers these from the cache with a 206 or a 304; the node
+  // answers neither, so it misses, and the Worker's own path answers them
+  // as it did when every match missed.
+  const partOrCondition = ["range", "if-none-match", "if-modified-since"];
+  const whole = (key) =>
+    key.headers === null || !partOrCondition.some((h) => key.headers.has(h));
+
   class Cache {
-    constructor(token = undefined) {
+    constructor(token = undefined, name = null) {
       if (token !== kCreate) throw new TypeError("Illegal constructor");
+      Object.defineProperty(this, kName, { value: name });
     }
 
     get [Symbol.toStringTag]() { return "Cache"; }
@@ -55,26 +75,34 @@
         throw new TypeError(
           "Cannot cache a response whose body is already used.");
       }
-      // Consume the body even though nothing is stored: put()'s contract
-      // is that the response is disturbed when it returns, and a
-      // streaming producer must see its stream pulled to completion
-      // instead of hanging on a reader that never comes.
-      if (response.body) await response.arrayBuffer();
+      // put() disturbs the response, kept or not: a streaming producer sees
+      // its stream pulled to completion instead of hanging on a reader that
+      // never comes.
+      const body = response.body
+        ? new Uint8Array(await response.arrayBuffer())
+        : new Uint8Array();
+      __cache_put(
+        this[kName], key.url, response.status, response.statusText,
+        JSON.stringify([...response.headers]), body);
     }
 
     async match(request, options = undefined) {
       const key = asKey(request);
-      // A non-GET key cannot match without ignoreMethod; celld misses
-      // either way, and the option is accepted for compatibility.
-      void key;
-      void options;
-      return undefined;
+      if (!considered(key, options) || !whole(key)) return undefined;
+      const found = __cache_match(this[kName], key.url);
+      if (found === undefined) return undefined;
+      const [status, statusText, headers, body] = found;
+      return new Response(nullBodyStatus.has(status) ? null : body, {
+        status,
+        statusText,
+        headers: JSON.parse(headers),
+      });
     }
 
     async delete(request, options = undefined) {
-      asKey(request);
-      void options;
-      return false;
+      const key = asKey(request);
+      if (!considered(key, options)) return false;
+      return __cache_delete(this[kName], key.url);
     }
   }
 
@@ -86,16 +114,17 @@
     get [Symbol.toStringTag]() { return "CacheStorage"; }
 
     async open(cacheName) {
-      if (String(cacheName).length >= 1024) {
+      const name = String(cacheName);
+      if (name.length >= 1024) {
         throw new TypeError("Cache name is too long.");
       }
-      return new Cache(kCreate);
+      return new Cache(kCreate, name);
     }
   }
 
   const storage = new CacheStorage(kCreate);
   Object.defineProperty(storage, "default", {
-    value: new Cache(kCreate),
+    value: new Cache(kCreate, null),
     enumerable: true,
   });
 

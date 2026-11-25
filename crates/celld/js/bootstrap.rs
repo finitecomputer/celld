@@ -396,29 +396,47 @@ pub(super) fn populate_cf_exports(
     Ok(())
 }
 
+/// `__cell.namespaceKeys`: each of this script's own classes, keyed by this
+/// script; and (fork) `__cell.crossScriptNamespaceKeys`: each class a binding
+/// names in another script (`cross_script`, as (class, owner)), keyed by its
+/// owner, so its ids are the ids the owner's own binding derives. The second
+/// is a registry of its own: `ctx.exports` reads the first as "a class of
+/// this script with storage", which another script's class is not.
 pub(super) fn inject_namespace_keys(
     scope: &mut v8::PinScope,
     script_name: &str,
     do_classes: &[String],
+    cross_script: &[(String, String)],
 ) -> Result<()> {
     let cell = cell_state(scope)?;
-    let keys_key = v8::String::new(scope, "namespaceKeys").unwrap();
-    let keys = cell
-        .get(scope, keys_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing Durable Object namespace registry"))?;
     let script_key = v8::String::new(scope, "script").unwrap();
     let script_value = v8::String::new(scope, script_name).unwrap();
     cell.set(scope, script_key.into(), script_value.into());
-    for class_name in do_classes {
-        let class_key = v8::String::new(scope, class_name).unwrap();
-        let namespace_key = super::namespace_key(script_name, class_name);
-        let namespace_key = v8::String::new(scope, &namespace_key).unwrap();
-        if !keys
-            .set(scope, class_key.into(), namespace_key.into())
-            .unwrap_or(false)
-        {
-            anyhow::bail!("could not register namespace key for {class_name}");
+    let own = do_classes
+        .iter()
+        .map(|class| (class.as_str(), script_name));
+    let other = cross_script
+        .iter()
+        .map(|(class, owner)| (class.as_str(), owner.as_str()));
+    for (registry, classes) in [
+        ("namespaceKeys", own.collect::<Vec<_>>()),
+        ("crossScriptNamespaceKeys", other.collect()),
+    ] {
+        let registry_key = v8::String::new(scope, registry).unwrap();
+        let keys = cell
+            .get(scope, registry_key.into())
+            .and_then(|value| value.to_object(scope))
+            .ok_or_else(|| anyhow!("missing Durable Object namespace registry {registry}"))?;
+        for (class_name, script) in classes {
+            let class_key = v8::String::new(scope, class_name).unwrap();
+            let namespace_key = super::namespace_key(script, class_name);
+            let namespace_key = v8::String::new(scope, &namespace_key).unwrap();
+            if !keys
+                .set(scope, class_key.into(), namespace_key.into())
+                .unwrap_or(false)
+            {
+                anyhow::bail!("could not register namespace key for {class_name}");
+            }
         }
     }
     Ok(())

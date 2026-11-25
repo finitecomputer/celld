@@ -41,6 +41,7 @@ mod asyncrt_contract_tests {
 pub mod bucket;
 // fork: an image's build context as a tar, for the krun engine's builder
 mod build_context;
+pub mod cache_api;
 pub mod cell_cli;
 pub mod cell_dispatch;
 mod cell_host;

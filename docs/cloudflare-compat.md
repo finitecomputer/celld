@@ -55,7 +55,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Performance and timers](#performance-and-timers) | **Yes** |
 | Console | **Yes** |
 | [Node.js compatibility](#nodejs-compatibility) | **Partial** |
-| [Cache](#cache) | **Partial** |
+| [Cache](#cache) | **Yes** |
 | HTMLRewriter | **Yes** |
 | [TCP sockets](#tcp-sockets) | **Yes** |
 | EventSource | **Yes** |
@@ -89,6 +89,34 @@ type's): `DurableObjectNamespace`, `R2Bucket`, `D1Database`, `KvNamespace`,
 service bindings, Secrets Store secrets and Browser Rendering. A service
 binding's prototype is `ServiceStub`'s, as before; its `constructor` is
 `Fetcher`.
+
+#### Durable Objects of another script
+
+A `durable_objects` binding with `script_name` reaches the objects of that
+script, as on Cloudflare. The binding script hosts none of them and never runs
+their class, and its calls reach the objects that the other script's own
+binding reaches. These are the differences:
+
+- The node runs that script too: the script is the application, or a script
+  that a binding of the deployment reaches (a script that `celld deploy
+  --named` published, which a node loads with the next deployment of the
+  application, or a `celld dev --with` project). Otherwise the node refuses
+  the deployment when it loads it.
+- That script declares the class with a `durable_objects` binding of its own.
+  A class in its `migrations` alone is not declared, and the node refuses the
+  deployment.
+- celld addresses an object by its class name, so one deployment has one class
+  of each name. A deploy refuses a class bound from two scripts, or bound both
+  as its own and from another script, and a `migrations` entry for a class of
+  another script.
+- The class name is also the address of the objects' storage. A binding moved
+  to another script that exports a class of the same name, like a class moved
+  from one script of the deployment to another, gives that script's code the
+  existing objects.
+
+The deploy requires the `durable-object-script-name-v1` feature, so a node that
+predates it refuses the deployment instead of hosting a second copy of the
+objects.
 
 #### Services a node does not run
 
@@ -202,9 +230,30 @@ execution.
 
 ### [Cache](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 
-celld provides an always-miss cache because it has no shared edge cache.
-`put()` validates and consumes a response but stores nothing, `match()` returns
-`undefined`, and `delete()` returns `false`.
+Each node keeps a cache in memory, as each Cloudflare data center keeps its
+edge cache: `put()` keeps a response that `match()` returns from every isolate
+of that node, until its lifetime ends, it is deleted, or the node needs the
+room. `put()` follows Cloudflare's rules for what it keeps and for how long:
+`s-maxage`, then `max-age` (less the response's `Age`), then `Expires`, then
+the default edge TTL of the status (200 and 301 for 2 hours, 302 and 303 for 20
+minutes, 404 and 410 for 3 minutes). It keeps nothing for `no-store`,
+`private`, `no-cache`, a zero lifetime, or a `Set-Cookie` that
+`private=Set-Cookie` does not drop. A match leaves out `Cache-Tag`, as
+Cloudflare's does. `Vary` is not part of the key: Cloudflare considers it only
+for `Accept-Encoding` (the encodings it serves) and image variants, and celld
+does neither. A `match()` or `delete()` of a non-GET
+request needs `ignoreMethod`.
+
+- Another node never sees the entry, and a node that restarts starts empty.
+- Each script has its own cache, where Cloudflare shares one among a zone's
+  Workers.
+- A Dynamic Worker's cache keeps nothing, and its `match()` misses.
+- `match()` of a `Range`, `If-None-Match` or `If-Modified-Since` request misses,
+  where Cloudflare answers a 206 or a 304.
+- A `put()` of a 304 keeps nothing and leaves what the URL held.
+- The node keeps 64 MiB at most by default (`CELLD_CACHE_API_MAX_BYTES`; 0 keeps
+  nothing) and 65,536 entries, and evicts the expired entries first, then the
+  least recently used.
 
 ### [TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
 
