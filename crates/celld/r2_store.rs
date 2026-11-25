@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -36,6 +37,22 @@ const LIST_HEADS: usize = 16;
 /// The part size a streaming `put` cuts at once it is too big to write in
 /// one request. Above S3's 5 MiB floor, and a round number of pages.
 const STREAM_PART: usize = 8 << 20;
+
+/// The largest streamed body a conditional `put` takes. R2 applies `onlyIf`
+/// to a put of any size it takes in one request (5 GiB); a multipart
+/// completion here takes no precondition, so a conditional body is held
+/// whole and written as one conditional request, up to this, and refused
+/// past it. Room for a 100 MiB Worker request body forwarded whole.
+const CONDITIONAL_PUT_MAX: usize = 256 << 20;
+
+/// What every conditional body held at once may take, node-wide: a put
+/// that would grow past it is refused, so concurrent ones never hold more
+/// of a node's memory than this (`CONDITIONAL_HELD`).
+const CONDITIONAL_HELD_MAX: usize = 512 << 20;
+const _: () = assert!(CONDITIONAL_PUT_MAX <= CONDITIONAL_HELD_MAX, "one conditional body fits what all may hold");
+
+/// The bytes conditional bodies hold now, node-wide.
+static CONDITIONAL_HELD: AtomicUsize = AtomicUsize::new(0);
 
 /// The user-metadata name the R2 object record lives under. See
 /// [`Envelope`]. The bucket stores it as `celld_r2` on Azure, which
@@ -579,6 +596,15 @@ pub(crate) struct PutStream {
     /// Open once the body outgrew a single request.
     pub(crate) upload: Option<Box<dyn MultipartUpload>>,
     pub(crate) touched: Instant,
+    /// What this conditional body holds of `CONDITIONAL_HELD`, given back
+    /// as it is dropped (written, aborted or aged out).
+    held: usize,
+}
+
+impl Drop for PutStream {
+    fn drop(&mut self) {
+        CONDITIONAL_HELD.fetch_sub(self.held, Ordering::SeqCst);
+    }
 }
 
 /// Open a streaming write. `request_json` is R2's `R2PutOptions`,
@@ -615,15 +641,43 @@ pub(crate) fn open_put(
         size: 0,
         upload: None,
         touched: Instant::now(),
+        held: 0,
     })
 }
 
 impl PutStream {
     /// Take in one chunk, handing the store every whole part it makes.
     pub(crate) async fn push(&mut self, chunk: Vec<u8>) -> Result<(), String> {
+        // a conditional body goes out whole, as one conditional request,
+        // within its own bound and what every one held at once may take,
+        // both checked before its buffer grows, and grown by exactly the
+        // chunk (never doubled past what it holds of the budget)
+        let conditional = self.request.only_if.is_some();
+        if conditional {
+            let n = chunk.len();
+            if self.buffered.len() + n > CONDITIONAL_PUT_MAX {
+                return Err(format!(
+                    "R2 put of {}: celld writes a conditional (`onlyIf`) put as one request, \
+                     and holds its body for it up to {CONDITIONAL_PUT_MAX} bytes",
+                    self.key
+                ));
+            }
+            if CONDITIONAL_HELD.fetch_add(n, Ordering::SeqCst) + n > CONDITIONAL_HELD_MAX {
+                CONDITIONAL_HELD.fetch_sub(n, Ordering::SeqCst);
+                return Err(format!(
+                    "R2 put of {}: celld holds at most {CONDITIONAL_HELD_MAX} bytes of conditional (`onlyIf`) bodies at once, node-wide; try again",
+                    self.key
+                ));
+            }
+            self.held += n;
+            self.buffered.reserve_exact(n);
+        }
         self.digests.update(&chunk);
         self.size += chunk.len() as u64;
         self.buffered.extend_from_slice(&chunk);
+        if conditional {
+            return Ok(());
+        }
         while self.buffered.len() > STREAM_PART {
             let part = self.buffered.drain(..STREAM_PART).collect::<Vec<_>>();
             self.part(part).await?;
@@ -636,17 +690,9 @@ impl PutStream {
     async fn part(&mut self, bytes: Vec<u8>) -> Result<(), String> {
         if self.upload.is_none() {
             // A precondition is checked against the version a write is
-            // about to replace, and a multipart completion takes none. A
-            // small streamed body still goes out as one conditional
-            // request; this one has outgrown that.
-            if self.request.only_if.is_some() {
-                return Err(format!(
-                    "R2 put of {}: celld cannot apply `onlyIf` to a streamed body larger than \
-                     {STREAM_PART} bytes, because it is written as a multipart upload and a \
-                     multipart completion takes no precondition",
-                    self.key
-                ));
-            }
+            // about to replace, and a multipart completion takes none: a
+            // conditional body is held whole (`push`), never parted.
+            assert!(self.request.only_if.is_none(), "a conditional put is written as one request");
             // The record is fixed when the upload opens, so it can only
             // carry checksums already known: the ones the caller asserted,
             // which the completion refuses to apply if the bytes disagree.
