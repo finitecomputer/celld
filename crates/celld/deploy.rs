@@ -867,14 +867,14 @@ fn run_engine(args: &[&str], what: &str) -> anyhow::Result<String> {
 /// which only Docker's build writes here.
 enum ImageBuilder {
     Docker,
-    Krun(crate::krun_build::Builder),
+    Krun(Box<crate::krun_build::Builder>),
 }
 
 impl ImageBuilder {
     fn for_build(local_images: bool) -> Self {
         match crate::container::EngineChoice::parse(std::env::var("CELLD_CONTAINER_ENGINE").ok().as_deref()) {
             Ok(crate::container::EngineChoice::Krun(socket)) if local_images => {
-                Self::Krun(crate::krun_build::Builder::new(&socket))
+                Self::Krun(Box::new(crate::krun_build::Builder::new(&socket)))
             }
             _ => Self::Docker,
         }

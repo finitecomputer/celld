@@ -69,20 +69,24 @@ local machine and keeps the image in the local engine.
 
 On the krun engine, `celld dev` needs no Docker: it builds each image with
 BuildKit (`moby/buildkit` v0.35.1, pinned by digest) in a microVM of that
-engine, and the engine loads it from there. The VM lives while the deploy
-builds, its context sent in as a tar less what `.dockerignore` leaves out.
-BuildKit's cache is on the engine's data disk `celld-buildkit-64g`, 64 GiB,
+engine, and the engine loads it from there. The VM, `celld-builder`, lives while
+the deploy builds, its context sent in as a tar less what `.dockerignore` leaves
+out. BuildKit's cache is on the engine's data disk `celld-buildkit-64g`, 64 GiB,
 collected to at most 44 GB when each deploy's builds end and trimmed so the
 engine's file shrinks with it; `DELETE /v1/data/celld-buildkit-64g` on the
 engine resets it. An image's name is `celld-image:<config digest>`, built with
 `SOURCE_DATE_EPOCH=0` so that the same layers make the same name: an unchanged
-image exports nothing, and a changed one is exported once, checked against its
-name, and loaded. The builder is one VM per engine, `celld-builder`, since the
-engine refuses a second VM of a running name but not a second VM on a disk: a
-second deploy waits for the first, and a builder whose `celld` has gone is
-destroyed. A pulled reference
-builds as `FROM <reference>`. `celld deploy` still builds with the `docker`
-CLI: the bucket's tar is Docker's `save`.
+image exports nothing. A changed one is exported once, checked against its name,
+and kept in `$XDG_CACHE_HOME/celld/krun-images` until the builder is destroyed;
+then the engine loads it, so an engine with room for the builder alone still
+has room for the load's own VM. The engine starts a second VM on a data disk
+another VM has mounted, so deploys take turns by a lock in the user's runtime
+directory: a second deploy waits for the first, and a builder found by the
+deploy holding the lock is one a killed `celld` left, and is destroyed (its
+owner is in the label `celld-builder`). A pulled reference builds as
+`FROM <reference>`, with no registry login, so a private registry's image is
+not reached there. `celld deploy` still builds with the `docker` CLI and its
+login: the bucket's tar is Docker's `save`.
 
 The container runs on the node that owns the cell. Each node that serves a
 container class needs a Docker or Podman daemon. celld uses the Unix socket

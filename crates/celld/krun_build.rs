@@ -8,9 +8,12 @@
 //! digest) with BuildKit's state on a data disk of the engine's
 //! (`CACHE_DISK`), so the cache outlives the VM; the last one's end
 //! (`finish`) collects the cache below its limit, trims the disk and
-//! destroys the VM. Everything goes through the engine's API: `start`,
-//! `exec` (the context in as a tar on its stdin, the image out on its
-//! stdout), `images/load`.
+//! destroys the VM, and only then has the engine load the images it
+//! built: each load runs a VM of the engine's own, which an engine with
+//! room for the builder alone would refuse beside it. Everything goes
+//! through the engine's API: `start`, `exec` (the context in as a tar on
+//! its stdin, an image out on its stdout to a file of this machine's),
+//! `images/load`.
 //!
 //! Each image is built twice, the second time only when the engine lacks
 //! it. The first build exports nothing but its manifest (`type=image`,
@@ -30,10 +33,12 @@
 //!   its name: a new size is a new disk, and `DELETE /v1/data/<name>`
 //!   resets the cache;
 //! - the engine starts a second VM on a data disk another VM has mounted,
-//!   and refuses only a second VM of a name that runs: so the builder has
-//!   one name per engine (`VM`), the disk's mutex. A second session waits
-//!   for the first; a builder whose `celld` is gone (its owner, in a
-//!   label) is destroyed (`take_vm`).
+//!   so sessions take turns by a lock of this machine's (`lock_path`; the
+//!   engine has one client user), held from the builder's start until it
+//!   is destroyed: a session waits for another's, and a builder it finds
+//!   when it holds the lock is one a killed `celld` left, and goes. The
+//!   builder's one name (`VM`) and its owner's label (`OWNER_LABEL`) let
+//!   anything else find it.
 
 // The engine's socket is I/O outside the execution boundary, as for
 // container_krun, and the session is a deploy's, not a cell's.
@@ -53,12 +58,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const BUILDKIT_IMAGE: &str =
     "moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c";
 /// The builder's size: Cloudflare's largest instance, 4 vCPU and 12 GiB,
-/// for a cold build's compiles. It lives only while a deploy builds.
+/// for a cold build's compiles. It lives only while a deploy builds, and
+/// is gone before an image is loaded.
 const INSTANCE: &str = "standard-4";
-/// The cache's disk, and its size. A cold build of every image a
-/// fragment node runs (the stub's two, Hermes' two, the door) holds about
-/// CACHE_COLD_GB; the disk leaves room for a second cold Hermes beside
-/// it before the collection below runs.
+/// The cache's disk, and its size. A cold build of fragment's stub and
+/// Hermes images held 15 GB (2026-11-24); the disk holds three times
+/// that under the collection's limit below, and a cold build's growth
+/// above it.
 const CACHE_GIB: u32 = 64;
 const CACHE_DISK: &str = "celld-buildkit-64g";
 const CACHE_PATH: &str = "/var/lib/buildkit";
@@ -78,9 +84,12 @@ const WORK: &str = "/build";
 /// its owner (`owner_of_self`).
 const VM: &str = "celld-builder";
 const OWNER_LABEL: &str = "celld-builder";
-/// How long a session waits for another's VM to let go of the disk.
-const DISK_WAIT_MAX: Duration = Duration::from_secs(30 * 60);
-const DISK_WAIT_EVERY: Duration = Duration::from_secs(2);
+/// How long a session waits for another's to end (`lock_path`).
+const LOCK_WAIT_MAX: Duration = Duration::from_secs(30 * 60);
+const LOCK_WAIT_EVERY: Duration = Duration::from_millis(500);
+/// One image's load into the engine, at most: it unpacks the image into a
+/// disk of its own in a VM.
+const LOAD_MAX: Duration = Duration::from_secs(30 * 60);
 /// How long buildkitd has to answer once its VM is up.
 const READY_MAX: Duration = Duration::from_secs(60);
 /// One build, at most: a cold Hermes compiles for minutes.
@@ -173,16 +182,37 @@ fn start_ticks(pid: u32) -> Option<u64> {
     stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// Whether the session `owner` (`owner_of_self`: pid, start) still runs
-/// on this machine.
-fn owner_alive(owner: &str) -> bool {
-    let Some((pid, start)) = owner.split_once('-') else {
-        return false;
-    };
-    match (pid.parse::<u32>(), start.parse::<u64>()) {
-        (Ok(pid), Ok(start)) => start_ticks(pid) == Some(start),
-        _ => false,
+/// The lock sessions on the engine at `socket` take turns by: in this
+/// user's runtime directory, else the machine's temporary one (the same
+/// for every process of the user, whatever its `TMPDIR`), named for the
+/// socket.
+fn lock_path(socket: &Path, uid: u32, runtime: Option<&Path>) -> PathBuf {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(socket.as_os_str().as_encoded_bytes());
+    let name = format!("celld-builder-{uid}-{}.lock", &format!("{digest:x}")[..12]);
+    match runtime {
+        Some(dir) => dir.join(name),
+        None => Path::new("/tmp").join(name),
     }
+}
+
+/// Where a session keeps the images it built until the engine loads them:
+/// this user's cache, on disk (a machine's `/tmp` may be memory).
+fn staging_dir() -> PathBuf {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    cache.join("celld/krun-images")
+}
+
+/// An image built and fetched, for the engine to load once the builder
+/// is gone.
+struct Staged {
+    label: String,
+    reference: String,
+    file: PathBuf,
 }
 
 /// A config digest's hex, from BuildKit's metadata file.
@@ -246,7 +276,12 @@ fn entrypoint() -> Vec<String> {
 /// A build session on the krun engine at its socket.
 pub struct Builder {
     api: Docker,
+    socket: PathBuf,
+    /// The session's turn (`lock_path`), held from the builder's start
+    /// until it is destroyed.
+    lock: Option<std::fs::File>,
     vm: Option<String>,
+    staged: Vec<Staged>,
     /// The contexts sent this session, by directory and ignore file: their
     /// directory in the VM.
     contexts: HashMap<(PathBuf, Option<PathBuf>), String>,
@@ -258,7 +293,10 @@ impl Builder {
     pub fn new(socket: &Path) -> Self {
         Self {
             api: Docker::new(socket),
+            socket: socket.to_path_buf(),
+            lock: None,
             vm: None,
+            staged: Vec::new(),
             contexts: HashMap::new(),
             builds: 0,
             held: None,
@@ -299,13 +337,20 @@ impl Builder {
         if again != key {
             bail!("{label}'s export is not the image its build named ({again} against {key}): its Dockerfile does not build the same image twice");
         }
-        let loaded = self.load(&vm, &tar, &reference).await.with_context(|| format!("load {label} into the krun engine"))?;
+        // Fetched to this machine, for the engine to load once the builder
+        // has let go of its memory (`finish`). Named for this session: one
+        // after it may build the same image while this one loads it.
+        let dir = staging_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let file = dir.join(format!("{key}-{}-{n}.tar", owner_of_self()));
+        let bytes = self.fetch(&vm, &tar, &file).await.with_context(|| format!("fetch {label} from the krun engine's builder"))?;
         self.capture(&vm, &["rm", "-f", &tar]).await?;
         self.held.get_or_insert_with(HashSet::new).insert(reference.clone());
+        self.staged.push(Staged { label: label.to_string(), reference: reference.clone(), file });
         crate::note!(
-            "image {label} built in {:.1?} ({cached} of {steps} steps cached) and loaded: {reference}, {} MB",
+            "image {label} built in {:.1?} ({cached} of {steps} steps cached): {reference}, {} MB, loaded once the builder is gone",
             t0.elapsed(),
-            loaded / 1_000_000
+            bytes / 1_000_000
         );
         Ok(reference)
     }
@@ -327,39 +372,63 @@ impl Builder {
 
     /// The session's end: the cache collected below its limits, its disk
     /// trimmed so the engine's file shrinks with it, buildkitd stopped,
-    /// the VM destroyed. Always called, a build's failure or not.
+    /// the VM destroyed and the session's turn given up; then the images
+    /// it built loaded into the engine. Always called, a build's failure
+    /// or not.
     ///
     /// buildkitd is stopped (SIGTERM) and waited for before the VM goes:
     /// a VM destroyed under it (SIGKILL) lost the cache records of its
     /// session's last steps, so every boot built its `COPY`s again, as new
     /// layers under a new name (seen 2026-11-24).
     pub async fn finish(mut self) -> anyhow::Result<()> {
-        let Some(vm) = self.vm.take() else { return Ok(()) };
-        let prune = [
-            "buildctl".to_string(),
-            "prune".into(),
-            format!("--keep-storage-min={GC_RESERVED_MB}"),
-            format!("--keep-storage={GC_MAX_MB}"),
-            format!("--free-storage={GC_FREE_MB}"),
-        ];
-        let tidied = async {
-            self.run(&vm, &prune, None, tokio::io::sink(), STEP_MAX).await?;
-            let df = self.capture(&vm, &["df", "-kP", CACHE_PATH]).await?;
-            if let Some(used) = used_kib(&String::from_utf8_lossy(&df)) {
-                crate::note!("the image builder's cache: {:.1} GB of its {CACHE_GIB} GiB disk", used as f64 * 1024.0 / 1e9);
+        let mut result = Ok(());
+        if let Some(vm) = self.vm.take() {
+            let prune = [
+                "buildctl".to_string(),
+                "prune".into(),
+                format!("--keep-storage-min={GC_RESERVED_MB}"),
+                format!("--keep-storage={GC_MAX_MB}"),
+                format!("--free-storage={GC_FREE_MB}"),
+            ];
+            let tidied = async {
+                self.run(&vm, &prune, None, tokio::io::sink(), STEP_MAX).await?;
+                let df = self.capture(&vm, &["df", "-kP", CACHE_PATH]).await?;
+                if let Some(used) = used_kib(&String::from_utf8_lossy(&df)) {
+                    crate::note!("the image builder's cache: {:.1} GB of its {CACHE_GIB} GiB disk", used as f64 * 1024.0 / 1e9);
+                }
+                for cmd in [vec!["fstrim".to_string(), CACHE_PATH.into()], vec!["sync".into()]] {
+                    let (code, _, p) = self.run(&vm, &cmd, None, tokio::io::sink(), STEP_MAX).await?;
+                    anyhow::ensure!(code == 0, "{}: {}", cmd[0], p.tail());
+                }
+                self.stop(&vm).await
             }
-            for cmd in [vec!["fstrim".to_string(), CACHE_PATH.into()], vec!["sync".into()]] {
-                let (code, _, p) = self.run(&vm, &cmd, None, tokio::io::sink(), STEP_MAX).await?;
-                anyhow::ensure!(code == 0, "{}: {}", cmd[0], p.tail());
+            .await;
+            if let Err(e) = &tidied {
+                // A VM that ended mid-build has nothing to tidy.
+                tracing::warn!(vm = %vm, error = %format!("{e:#}"), "the builder's cache was not collected");
             }
-            self.stop(&vm).await
+            // Under the session's turn, so the name is still this one's.
+            result = self.destroy(&vm).await;
         }
-        .await;
-        if let Err(e) = &tidied {
-            // A VM that ended mid-build has nothing to tidy.
-            tracing::warn!(vm = %vm, error = %format!("{e:#}"), "the builder's cache was not collected");
+        self.lock.take();
+        // Bounded by the session's images.
+        for staged in std::mem::take(&mut self.staged) {
+            let t0 = Instant::now();
+            let loaded = match tokio::time::timeout(LOAD_MAX, self.load(&staged.file, &staged.reference)).await {
+                Ok(loaded) => loaded,
+                Err(_) => Err(anyhow!("the engine did not load it within {LOAD_MAX:?}")),
+            };
+            let _ = std::fs::remove_file(&staged.file);
+            match loaded {
+                Ok(()) => crate::note!("image {} loaded into the krun engine in {:.1?}", staged.label, t0.elapsed()),
+                Err(e) => {
+                    if result.is_ok() {
+                        result = Err(e.context(format!("load {} into the krun engine", staged.label)));
+                    }
+                }
+            }
         }
-        self.destroy(&vm).await
+        result
     }
 
     /// buildkitd, the VM's entrypoint, told to stop and waited for.
@@ -409,8 +478,10 @@ impl Builder {
             return Ok(vm.clone());
         }
         let vm = VM.to_string();
-        self.take_vm().await?;
+        self.take_turn().await?;
+        // Set before the start: a start that failed may have left the VM.
         self.vm = Some(vm.clone());
+        self.take_vm().await?;
         let t0 = Instant::now();
         // Bounded by READY_MAX.
         loop {
@@ -426,53 +497,70 @@ impl Builder {
         Ok(vm)
     }
 
-    /// Starts the builder (`VM`) with the cache's disk, waiting while
-    /// another session's runs and destroying one whose `celld` is gone.
+    /// The session's turn on the engine (`lock_path`), waited for while
+    /// another session has it, for `LOCK_WAIT_MAX`.
+    async fn take_turn(&mut self) -> anyhow::Result<()> {
+        // SAFETY: getuid reads the process's user and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        let path = lock_path(&self.socket, uid, runtime.is_dir().then_some(runtime.as_path()));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let t0 = Instant::now();
+        let mut said = false;
+        // Bounded by LOCK_WAIT_MAX.
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("lock {}", path.display())),
+            }
+            if t0.elapsed() > LOCK_WAIT_MAX {
+                bail!("another build still has the krun engine's image builder after {LOCK_WAIT_MAX:?} ({})", path.display());
+            }
+            if !said {
+                crate::note!("waiting for another build to let go of the krun engine's image builder");
+                said = true;
+            }
+            tokio::time::sleep(LOCK_WAIT_EVERY).await;
+        }
+        self.lock = Some(file);
+        Ok(())
+    }
+
+    /// Starts the builder (`VM`) with the cache's disk, the session's turn
+    /// held: a builder already there is one a killed session left, and goes.
     async fn take_vm(&self) -> anyhow::Result<()> {
-        let owner = owner_of_self();
+        assert!(self.lock.is_some(), "the builder starts on the session's turn");
         let start = json!({
             "image": BUILDKIT_IMAGE,
             "enableInternet": true,
             "entrypoint": entrypoint(),
             "instance": INSTANCE,
             "data": { "name": CACHE_DISK, "path": CACHE_PATH, "gib": CACHE_GIB },
-            "labels": { OWNER_LABEL: owner },
+            "labels": { OWNER_LABEL: owner_of_self() },
         });
-        let t0 = Instant::now();
-        let mut said = false;
-        // Bounded by DISK_WAIT_MAX.
-        loop {
+        // Bounded: one leftover destroyed, then one start more.
+        for attempt in 0..2 {
             let reply = self.api.call("POST", &format!("/v1/containers/{VM}/start?wait=ready"), Some(start.clone())).await?;
             if reply.status.is_success() {
                 return Ok(());
             }
             let message = reply.message_or_error();
             match reply.status.as_u16() {
-                409 => {}
+                409 if attempt == 0 => {
+                    tracing::warn!("destroying an image builder a killed celld left");
+                    self.destroy(VM).await?;
+                }
                 429 => bail!("the krun engine has no room for the image builder ({INSTANCE}): {message}"),
                 status => bail!("start the image builder {VM}: [{status}] {message}"),
             }
-            // Another session's builder: one whose celld is gone goes.
-            let info = self.api.call("GET", &format!("/v1/containers/{VM}"), None).await?;
-            let holder = info
-                .json()
-                .ok()
-                .and_then(|v| v.get("labels")?.get(OWNER_LABEL)?.as_str().map(str::to_string))
-                .unwrap_or_default();
-            if info.status.is_success() && !owner_alive(&holder) {
-                tracing::warn!(owner = %holder, "destroying an image builder whose celld is gone");
-                self.destroy(VM).await?;
-                continue;
-            }
-            if t0.elapsed() > DISK_WAIT_MAX {
-                bail!("the image builder {VM} is still another build's after {DISK_WAIT_MAX:?} (its celld: {holder:?})");
-            }
-            if !said {
-                crate::note!("waiting for the image builder, another build's (its celld: {holder:?})");
-                said = true;
-            }
-            tokio::time::sleep(DISK_WAIT_EVERY).await;
         }
+        unreachable!("the second attempt answers")
     }
 
     /// Sends `spec`'s Dockerfile (to `dir`) and, once a session, its
@@ -542,36 +630,34 @@ impl Builder {
         Ok(out)
     }
 
-    /// The tar at `tar` in the VM, piped into the engine's load as it is
-    /// read; answers its bytes.
-    async fn load(&self, vm: &str, tar: &str, reference: &str) -> anyhow::Result<u64> {
-        let (writer, reader) = tokio::io::duplex(1 << 20);
-        let counted = Counted { inner: writer, bytes: 0 };
+    /// The tar at `tar` in the VM, written to `file` on this machine;
+    /// answers its bytes.
+    async fn fetch(&self, vm: &str, tar: &str, file: &Path) -> anyhow::Result<u64> {
+        let out = tokio::fs::File::create(file).await.with_context(|| format!("create {}", file.display()))?;
+        let cat = ["cat".to_string(), tar.to_string()];
+        let (code, out, p) = match self.run(vm, &cat, None, Counted { inner: out, bytes: 0 }, BUILD_MAX).await {
+            Ok(ran) => ran,
+            Err(e) => {
+                let _ = std::fs::remove_file(file);
+                bail!("{e:#}{}", self.ended(vm).await)
+            }
+        };
+        if code != 0 {
+            let _ = std::fs::remove_file(file);
+            bail!("read {tar} (exit {code}): {}{}", p.tail(), self.ended(vm).await);
+        }
+        out.inner.sync_all().await.with_context(|| format!("write {}", file.display()))?;
+        Ok(out.bytes)
+    }
+
+    /// The image tar at `file` loaded into the engine under `reference`.
+    async fn load(&self, file: &Path, reference: &str) -> anyhow::Result<()> {
+        let body = tokio::fs::File::open(file).await.with_context(|| format!("open {}", file.display()))?;
         let path = format!(
             "/v1/images/load?reference={}",
             percent_encoding::utf8_percent_encode(reference, percent_encoding::NON_ALPHANUMERIC)
         );
-        let cat = ["cat".to_string(), tar.to_string()];
-        let (read, loaded) = futures_util::future::join(
-            self.run(vm, &cat, None, counted, BUILD_MAX),
-            self.api.post_stream(&path, reader, "load image"),
-        )
-        .await;
-        match (read, loaded) {
-            (Ok((0, counted, _)), Ok(_)) => Ok(counted.bytes),
-            // Either side's failure ends the other's: both are said.
-            (read, loaded) => {
-                let read = match read {
-                    Ok((code, _, p)) => format!("exit {code}: {}", p.tail()),
-                    Err(e) => format!("{e:#}"),
-                };
-                let loaded = match loaded {
-                    Ok(_) => "loaded".to_string(),
-                    Err(e) => format!("{e:#}"),
-                };
-                bail!("read {tar} ({read}); the engine's load: {loaded}{}", self.ended(vm).await)
-            }
-        }
+        self.api.post_stream(&path, body, "load image").await.map(drop)
     }
 
     /// Why a command in the VM may have failed: the VM itself ended, with
@@ -785,17 +871,36 @@ mod tests {
         assert!(args.contains(&"build-arg:SOURCE_DATE_EPOCH=7".to_string()));
     }
 
-    // Goal: a session whose celld is gone is told apart from a live one.
+    // Goal: the builder names its owner as a label may hold it: its pid
+    // and when that process started.
     #[test]
     fn a_builder_names_its_owner() {
         let mine = owner_of_self();
-        assert!(owner_alive(&mine));
         assert!(mine.len() <= 64, "a label's value");
         assert!(OWNER_LABEL.len() <= 16, "a label's name");
-        assert!(!owner_alive(&format!("{}-1", std::process::id())), "the pid, started at another time");
-        assert!(!owner_alive("4194305-1"), "past pid_max");
-        assert!(!owner_alive("x"));
-        assert!(!owner_alive(""), "a builder with no owner's label");
+        let (pid, start) = mine.split_once('-').unwrap();
+        assert_eq!(pid.parse::<u32>().unwrap(), std::process::id());
+        assert!(start.parse::<u64>().unwrap() > 0, "read from /proc");
+    }
+
+    // Goal: every session of the user on one engine takes its turn by one
+    // lock, whatever its environment; another engine has its own.
+    #[test]
+    fn sessions_on_one_engine_share_a_lock() {
+        let run = Path::new("/run/user/1000");
+        let a = lock_path(Path::new("/var/lib/sandcastle/engine.sock"), 1000, Some(run));
+        assert_eq!(a, lock_path(Path::new("/var/lib/sandcastle/engine.sock"), 1000, Some(run)));
+        assert!(a.starts_with(run));
+        assert_ne!(a, lock_path(Path::new("/srv/other/engine.sock"), 1000, Some(run)));
+        assert!(lock_path(Path::new("/x.sock"), 1000, None).starts_with("/tmp"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.lock");
+        let first = std::fs::File::create(&path).unwrap();
+        first.try_lock().unwrap();
+        let second = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(matches!(second.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "a second session waits");
+        drop(first);
+        second.try_lock().unwrap();
     }
 
     #[test]

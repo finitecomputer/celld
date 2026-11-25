@@ -120,6 +120,10 @@ impl Pattern {
         }
         let mut m = M::Exact;
         let mut re = String::from("^");
+        // Inside a bracket, Rust's regex reads `&&`, `--` and `~~` as set
+        // operations, which Go's (patternmatcher's) does not: there `&` and
+        // `~` are themselves.
+        let mut in_class = false;
         let chars: Vec<char> = pattern.chars().collect();
         let mut i = 0;
         // Bounded by the pattern's length.
@@ -169,8 +173,19 @@ impl Pattern {
                     None => re.push_str("\\\\"),
                 },
                 '[' | ']' => {
-                    re.push(c);
+                    // A `[` inside a bracket is itself (Go has no nested
+                    // classes).
+                    if c == '[' && in_class {
+                        re.push_str("\\[");
+                    } else {
+                        in_class = c == '[';
+                        re.push(c);
+                    }
                     m = M::Regex;
+                }
+                '&' | '~' if in_class => {
+                    re.push('\\');
+                    re.push(c);
                 }
                 // Other characters a regular expression reads (`^`, a
                 // bracket's `-`) pass as patternmatcher passes them.
@@ -415,6 +430,13 @@ mod tests {
             ("a.b", "axb", false),
             ("\\*", "*", true),
             ("\\*", "a", false),
+            // Go's brackets have no set operations: `&` is itself
+            ("[a&&b].env", "a.env", true),
+            ("[a&&b].env", "&.env", true),
+            ("[^a&&b].env", "a.env", false),
+            ("[^a&&b].env", "c.env", true),
+            ("[a~~b]x", "~x", true),
+            ("[a-c]x", "bx", true),
         ];
         for (pattern, path, want) in cases {
             assert_eq!(ignore(pattern).excludes(path), *want, "{pattern:?} on {path:?}");
