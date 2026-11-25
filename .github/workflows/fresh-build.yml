@@ -48,6 +48,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: rusty-v8.sh's header gate
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: tools/v8/headers-test.sh
+
       - name: Toolchain, and an empty Cargo cache
         run: |
           set -euo pipefail

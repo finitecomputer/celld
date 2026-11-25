@@ -13,6 +13,9 @@
 #   tools/v8/rusty-v8.sh pin              check that the public URL serves the build, then write the target's pin
 #   tools/v8/rusty-v8.sh verify           build and test celld against the pin
 #   tools/v8/rusty-v8.sh update [V8]      all of the above, in that order
+#   tools/v8/rusty-v8.sh check-headers REPO FROM TO
+#                                         build's header gate alone, on V8 checkout REPO's revisions
+#                                         (tools/v8/headers-test.sh)
 #
 # Each target has its own archive and pin: x86_64-unknown-linux-gnu's in
 # .cargo/config.toml (a plain `cargo build`), another's in .cargo/<target>.toml
@@ -191,6 +194,44 @@ for path, dep in scope["deps"].items():
 '
 }
 
+# A header's text with its comments gone and its whitespace collapsed, read
+# from stdin. The preprocessor strips the comments: gcc's -fpreprocessed
+# expands no macro and follows no include, and -dD keeps each #define
+# (clang's driver has no such mode).
+uncommented() {
+  "${CELLD_V8_CPP:-gcc}" -fpreprocessed -dD -E -P -x c++ - | tr -s '[:space:]' ' '
+}
+
+# V8's public headers at revision $3 of the V8 checkout $1 must be those at
+# $2 (the release's), but for v8-version.h's V8_PATCH_LEVEL and for
+# comments: a header whose change is in comments alone is accepted, named in
+# COMMENT_ONLY and printed. Any other change (a declaration, a macro, a
+# header added or removed) stops the build, naming the header, since the
+# crate's binding may not fit it.
+COMMENT_ONLY=()
+check_headers() {
+  local repo=$1 from=$2 to=$3 file old new
+  COMMENT_ONLY=()
+  while IFS= read -r file; do
+    [[ -n $file && $file != include/v8-version.h ]] || continue
+    git -C "$repo" cat-file -e "$from:$file" 2>/dev/null && git -C "$repo" cat-file -e "$to:$file" 2>/dev/null ||
+      die "V8's public header $file was added or removed; the crate's binding may not fit"
+    old=$(git -C "$repo" show "$from:$file" | uncommented) || die "can't strip the comments of $file at $from"
+    new=$(git -C "$repo" show "$to:$file" | uncommented) || die "can't strip the comments of $file at $to"
+    [[ $old == "$new" ]] || die "V8's public header $file changed beyond its comments; the crate's binding may not fit"
+    COMMENT_ONLY+=("$file")
+  done < <(git -C "$repo" diff --name-only "$from" "$to" -- include/)
+  if git -C "$repo" diff "$from" "$to" -- include/v8-version.h | grep '^[-+]#define' | grep -qv ' V8_PATCH_LEVEL '; then
+    die "v8-version.h changed beyond the patch level"
+  fi
+  if (( ${#COMMENT_ONLY[@]} > 0 )); then
+    say "V8's public headers are the release's but for V8_PATCH_LEVEL and comments in ${COMMENT_ONLY[*]}:"
+    git -C "$repo" diff "$from" "$to" -- "${COMMENT_ONLY[@]}" >&2
+  else
+    say "V8's public headers are the release's but for V8_PATCH_LEVEL"
+  fi
+}
+
 cmd_build() {
   local crate commit want src v8 pin base base_version patches branch build
   # This machine's archive, or aarch64 Linux's cross-built on x86_64 Linux:
@@ -346,13 +387,7 @@ cmd_build() {
   # code was written against those headers, so both fit this archive when
   # the headers are the crate's but for the patch level. (The generated file
   # varies with the host's libclang, so it is published, not compared.)
-  local headers
-  headers=$(git -C "$v8" diff --name-only "$pin" HEAD -- include/)
-  [[ -z $headers || $headers == include/v8-version.h ]] || die "V8's public headers changed: ${headers//$'\n'/ }; the crate's binding may not fit"
-  if git -C "$v8" diff "$pin" HEAD -- include/v8-version.h | grep '^[-+]#define' | grep -qv ' V8_PATCH_LEVEL '; then
-    die "v8-version.h changed beyond the patch level"
-  fi
-  say "V8's public headers are the release's but for V8_PATCH_LEVEL"
+  check_headers "$v8" "$pin" HEAD
 
   {
     if [[ -n $commit ]]; then
@@ -366,6 +401,8 @@ cmd_build() {
     git -C "$v8" log --format='  %h %s' "$want..HEAD"
     echo "denoland/v8 $branch-lkgr-denoland: $deno_head (same tree${CELLD_V8_DENO_COMMIT:+; named by CELLD_V8_DENO_COMMIT})"
     echo "Dependencies moved to V8's DEPS: ${moved[*]:-none}"
+    echo "Public headers changed in their comments alone (accepted): ${COMMENT_ONLY[*]:-none}"
+    (( ${#COMMENT_ONLY[@]} == 0 )) || git -C "$v8" diff "$pin" HEAD -- "${COMMENT_ONLY[@]}" | sed 's/^/  /'
     echo "Target: $TARGET${cross:+ (cross-built on $HOST with the arm64 sysroot)}; profile: release; features: default (use_custom_libcxx)"
     echo "Clang: $(sed -n "s/^CLANG_REVISION = '\(.*\)'/\1/p" "$src/tools/clang/scripts/update.py") (Chromium's); bindgen's libclang: $(basename "$(readlink -f "$libclang/libclang.so")")"
     echo "Rust (rusty_v8's toolchain): $(sed -n 's/^channel = "\(.*\)"/\1/p' "$src/rust-toolchain.toml")"
@@ -530,6 +567,7 @@ case ${1:-} in
   verify-local) cmd_verify_local ;;
   publish) cmd_publish ;;
   verify) cmd_verify ;;
+  check-headers) (( $# == 4 )) || die "check-headers REPO FROM TO"; check_headers "$2" "$3" "$4" ;;
   update)
     cmd_build "${2:-}"
     cmd_verify_local
