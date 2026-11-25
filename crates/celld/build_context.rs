@@ -166,8 +166,22 @@ impl Pattern {
                 // As Go passes it: `\s` is whitespace, `\.` a dot.
                 '\\' => match chars.get(i) {
                     Some(next) => {
-                        re.push('\\');
-                        re.push(*next);
+                        // Go's Perl classes are ASCII; Rust's, Unicode.
+                        match (*next, in_class) {
+                            ('s', true) => re.push_str("\\t\\n\\x0C\\r "),
+                            ('d', true) => re.push_str("0-9"),
+                            ('w', true) => re.push_str("0-9A-Za-z_"),
+                            ('s', false) => re.push_str("[\\t\\n\\x0C\\r ]"),
+                            ('S', false) => re.push_str("[^\\t\\n\\x0C\\r ]"),
+                            ('d', false) => re.push_str("[0-9]"),
+                            ('D', false) => re.push_str("[^0-9]"),
+                            ('w', false) => re.push_str("[0-9A-Za-z_]"),
+                            ('W', false) => re.push_str("[^0-9A-Za-z_]"),
+                            (next, _) => {
+                                re.push('\\');
+                                re.push(next);
+                            }
+                        }
                         i += 1;
                         m = M::Regex;
                     }
@@ -485,6 +499,12 @@ mod tests {
             ("[a[b]x", "[x", true),
             ("secrets\\s*.env", "secrets prod.env", true),
             ("secrets\\s*.env", "secretss.env", false),
+            ("secrets\\s*.env", "secrets\u{a0}prod.env", false),
+            ("a[\\s]b", "a b", true),
+            ("a[\\d]b", "a1b", true),
+            ("a\\Sb", "a\u{e9}b", true),
+            ("a\\Sb", "a b", false),
+            ("a\\db", "a\u{0663}b", false),
             ("a\\.b", "a.b", true),
         ];
         for (pattern, path, want) in cases {

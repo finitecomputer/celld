@@ -63,7 +63,8 @@ pub const BUILDKIT_IMAGE: &str =
 /// Cloudflare's largest instance, 4 vCPU and 12 GiB, for a cold build's
 /// compiles, down to what an engine with little room can hold (`instance`).
 /// It lives only while a deploy builds, and is gone before an image loads.
-const INSTANCES: [(&str, u64); 4] = [("standard-4", 12_288), ("standard-3", 8_192), ("standard-2", 6_144), ("basic", 1_024)];
+const INSTANCES: [(&str, u64); 5] =
+    [("standard-4", 12_288), ("standard-3", 8_192), ("standard-2", 6_144), ("standard-1", 4_096), ("basic", 1_024)];
 
 /// The largest of `INSTANCES` the engine's free memory holds, by its health
 /// (`memory_mib`, its VMs' reservations, of `memory_mib_max`).
@@ -252,6 +253,19 @@ fn destroy_blocking(socket: &Path, vm: &str) -> anyhow::Result<u16> {
     line.split(' ').nth(1).and_then(|s| s.parse().ok()).context("the engine's answer has a status")
 }
 
+/// A pulled reference pinned to `digest`: its repository and the digest,
+/// as Docker pins one, its tag dropped (a tag and a digest both could pass
+/// the engine's reference length).
+fn pinned(reference: &str, digest: &str) -> String {
+    let repository = match reference.rfind(':') {
+        // A colon after the last slash is the tag's; one before it, a
+        // registry's port.
+        Some(i) if !reference[i..].contains('/') => &reference[..i],
+        _ => reference,
+    };
+    format!("{repository}@{digest}")
+}
+
 /// An image built and fetched, for the engine to load once the builder
 /// is gone.
 struct Staged {
@@ -420,7 +434,7 @@ impl Builder {
                 .and_then(Value::as_str)
                 .filter(|d| d.starts_with("sha256:"))
                 .with_context(|| format!("the krun engine's pull of {reference} names no digest"))?;
-            let pinned = format!("{reference}@{digest}");
+            let pinned = pinned(reference, digest);
             // Held under the pinned name too: its manifest fetched again,
             // nothing built.
             self.engine_pull(&pinned).await?;
@@ -582,6 +596,11 @@ impl Builder {
     /// The session's turn on the engine (`lock_path`), waited for while
     /// another session has it, for `LOCK_WAIT_MAX`.
     async fn take_turn(&mut self) -> anyhow::Result<()> {
+        // Held already (a pull took it): a second open of the lock's file
+        // would wait on this session's own lock.
+        if self.lock.is_some() {
+            return Ok(());
+        }
         // SAFETY: getuid reads the process's user and cannot fail.
         let uid = unsafe { libc::getuid() };
         let runtime = PathBuf::from(format!("/run/user/{uid}"));
@@ -626,6 +645,12 @@ impl Builder {
     /// held: a builder already there is one a killed session left, and goes.
     async fn take_vm(&self) -> anyhow::Result<()> {
         assert!(self.lock.is_some(), "the builder starts on the session's turn");
+        // A builder there now is one a killed session left: it goes before
+        // the engine's room is read, which counts it.
+        if self.api.call("GET", &format!("/v1/containers/{VM}"), None).await?.status.is_success() {
+            tracing::warn!("destroying an image builder a killed celld left");
+            self.destroy(VM).await?;
+        }
         let health = self.api.call("GET", "/v1/health", None).await?.json()?;
         let Some(instance) = instance(&health) else {
             bail!(
@@ -973,9 +998,20 @@ mod tests {
         assert_eq!(instance(&h(1024, 32_768)), Some("standard-4"));
         assert_eq!(instance(&h(0, 7_168)), Some("standard-2"), "Sandcastle's default budget");
         assert_eq!(instance(&h(0, 8_192)), Some("standard-3"));
+        assert_eq!(instance(&h(0, 5_120)), Some("standard-1"));
         assert_eq!(instance(&h(6_000, 7_168)), Some("basic"));
         assert_eq!(instance(&h(7_000, 7_168)), None);
         assert_eq!(instance(&json!({})), None);
+    }
+
+    // Goal: a pull is pinned as Docker pins one, its tag dropped.
+    #[test]
+    fn a_pull_is_pinned_by_its_digest() {
+        let d = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(pinned("redis:7", d), format!("redis@{d}"));
+        assert_eq!(pinned("redis", d), format!("redis@{d}"));
+        assert_eq!(pinned("localhost:5000/a/b:v1", d), format!("localhost:5000/a/b@{d}"));
+        assert_eq!(pinned("localhost:5000/a/b", d), format!("localhost:5000/a/b@{d}"));
     }
 
     #[test]
