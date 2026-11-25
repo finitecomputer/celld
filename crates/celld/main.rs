@@ -5395,6 +5395,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             }
         }
     };
+    // The dispatch sets are not polled from here on, so a preserve takes no
+    // further request, not even a Queue broker's (actor.rs, `BeginPreserve`).
+    if shutdown_mode == ShutdownMode::Preserve {
+        let _ = app.tx.send(Message::EndPreserveDrain);
+    }
     let _ = connection_drain_tx.send(true);
     let _ = drain_connection_tx.send(true);
     // Release the token whether or not the drain completed: the process is
