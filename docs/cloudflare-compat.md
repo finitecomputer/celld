@@ -55,7 +55,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Performance and timers](#performance-and-timers) | **Yes** |
 | Console | **Yes** |
 | [Node.js compatibility](#nodejs-compatibility) | **Partial** |
-| [Cache](#cache) | **Partial** |
+| [Cache](#cache) | **Yes** |
 | HTMLRewriter | **Yes** |
 | [TCP sockets](#tcp-sockets) | **Yes** |
 | EventSource | **Yes** |
@@ -202,9 +202,30 @@ execution.
 
 ### [Cache](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 
-celld provides an always-miss cache because it has no shared edge cache.
-`put()` validates and consumes a response but stores nothing, `match()` returns
-`undefined`, and `delete()` returns `false`.
+Each node keeps a cache in memory, as each Cloudflare data center keeps its
+edge cache: `put()` keeps a response that `match()` returns from every isolate
+of that node, until its lifetime ends, it is deleted, or the node needs the
+room. `put()` follows Cloudflare's rules for what it keeps and for how long:
+`s-maxage`, then `max-age` (less the response's `Age`), then `Expires`, then
+the default edge TTL of the status (200 and 301 for 2 hours, 302 and 303 for 20
+minutes, 404 and 410 for 3 minutes). It keeps nothing for `no-store`,
+`private`, `no-cache`, a zero lifetime, or a `Set-Cookie` that
+`private=Set-Cookie` does not drop. A match leaves out `Cache-Tag`, as
+Cloudflare's does. `Vary` is not part of the key: Cloudflare considers it only
+for `Accept-Encoding` (the encodings it serves) and image variants, and celld
+does neither. A `match()` or `delete()` of a non-GET
+request needs `ignoreMethod`.
+
+- Another node never sees the entry, and a node that restarts starts empty.
+- Each script has its own cache, where Cloudflare shares one among a zone's
+  Workers.
+- A Dynamic Worker's cache keeps nothing, and its `match()` misses.
+- `match()` of a `Range`, `If-None-Match` or `If-Modified-Since` request misses,
+  where Cloudflare answers a 206 or a 304.
+- A `put()` of a 304 keeps nothing and leaves what the URL held.
+- The node keeps 64 MiB at most by default (`CELLD_CACHE_API_MAX_BYTES`; 0 keeps
+  nothing) and 65,536 entries, and evicts the expired entries first, then the
+  least recently used.
 
 ### [TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
 

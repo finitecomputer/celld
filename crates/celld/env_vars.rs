@@ -273,6 +273,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_ADMISSION_WAIT_MS",
         "CELLD_ALARM_RESIDENT_MS",
         "CELLD_ASSET_CACHE_BYTES",
+        "CELLD_CACHE_API_MAX_BYTES",
         "CELLD_DEPLOY_MAX_AGE_S",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
         "CELLD_LTX_TRUNCATE_PAGES",
