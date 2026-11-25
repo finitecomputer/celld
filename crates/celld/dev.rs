@@ -651,7 +651,13 @@ async fn run_stack(
         .transpose()?;
 
     console.progress("building the application");
-    deploy_project(config, with, store, options.logs).await?;
+    // fork: a shutdown ends a build too, which on the krun engine runs in
+    // its builder for minutes and hears no signal of the terminal's; the
+    // build's session destroys its builder as it is dropped.
+    crate::asyncrt::select! {
+        deployed = deploy_project(config, with, store, options.logs) => deployed?,
+        _ = signals.received() => return Ok(()),
+    }
     let mut running = start_node(
         state,
         options.listener,
@@ -677,7 +683,15 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                if let Err(error) = deploy_project(config, with, store, options.logs).await {
+                let deployed = crate::asyncrt::select! {
+                    deployed = deploy_project(config, with, store, options.logs) => Some(deployed),
+                    _ = signals.received() => None,
+                };
+                let Some(deployed) = deployed else {
+                    stop_running_node(running).await;
+                    return Ok(());
+                };
+                if let Err(error) = deployed {
                     console.failure(&format!("reload failed: {error:#}"));
                     continue;
                 }

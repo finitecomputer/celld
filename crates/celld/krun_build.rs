@@ -217,6 +217,31 @@ fn staging_dir(engine: &str) -> PathBuf {
     cache.join("celld/krun-images").join(engine)
 }
 
+/// `dir`, made this user's alone (mode 700), its parents made as needed.
+fn private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(|| format!("make {} private", dir.display()))
+}
+
+/// A builder destroyed with no client but this blocking call: a session
+/// dropped before its end (`Builder`'s `Drop`). Answers the engine's status.
+fn destroy_blocking(socket: &Path, vm: &str) -> anyhow::Result<u16> {
+    use std::io::{Read as _, Write as _};
+    let mut c = std::os::unix::net::UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
+    c.set_read_timeout(Some(Duration::from_secs(30)))?;
+    c.set_write_timeout(Some(Duration::from_secs(30)))?;
+    write!(c, "POST /v1/containers/{vm}/destroy HTTP/1.1\r\nhost: engine\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{{}}")?;
+    let mut head = [0u8; 64];
+    let n = c.read(&mut head)?;
+    let line = String::from_utf8_lossy(&head[..n]);
+    line.split(' ').nth(1).and_then(|s| s.parse().ok()).context("the engine's answer has a status")
+}
+
 /// An image built and fetched, for the engine to load once the builder
 /// is gone.
 struct Staged {
@@ -350,7 +375,7 @@ impl Builder {
         // Fetched to this machine, for the engine to load once the builder
         // has let go of its memory (`finish`).
         let dir = staging_dir(&engine_id(&self.socket));
-        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        private_dir(&dir)?;
         let file = dir.join(format!("{key}-{n}.tar"));
         let bytes = self.fetch(&vm, &tar, &file).await.with_context(|| format!("fetch {label} from the krun engine's builder"))?;
         self.capture(&vm, &["rm", "-f", &tar]).await?;
@@ -364,19 +389,20 @@ impl Builder {
         Ok(reference)
     }
 
-    /// A registry image, named by its content as a built one is: a
-    /// Dockerfile of `FROM <reference>`.
-    pub async fn pull(&mut self, reference: &str, platform: Option<&str>) -> anyhow::Result<String> {
-        anyhow::ensure!(!reference.contains(['\n', '\r']), "an image reference on one line");
-        let dir = tempfile::tempdir().context("a context for a pulled image")?;
-        std::fs::write(dir.path().join("Dockerfile"), format!("FROM {reference}\n")).context("write its Dockerfile")?;
-        let spec = Spec {
-            dockerfile: dir.path().join("Dockerfile"),
-            context: dir.path().to_path_buf(),
-            vars: BTreeMap::new(),
-            platform: platform.map(str::to_string),
-        };
-        self.build(reference, &spec).await
+    /// A registry image, pulled by the engine itself, as `docker pull`
+    /// pulls one: no Dockerfile runs, so neither do its `ONBUILD`
+    /// triggers. It is named by its reference, which the engine holds it
+    /// under.
+    pub async fn pull(&mut self, reference: &str) -> anyhow::Result<String> {
+        let reply = self.api.call("POST", "/v1/images/pull", Some(json!({ "reference": reference }))).await?;
+        anyhow::ensure!(
+            reply.status.is_success(),
+            "the krun engine's pull of {reference}: [{}] {}",
+            reply.status.as_u16(),
+            reply.message_or_error()
+        );
+        crate::note!("image {reference} pulled by the krun engine");
+        Ok(reference.to_string())
     }
 
     /// The session's end: the cache collected below its limits, its disk
@@ -609,7 +635,7 @@ impl Builder {
         if known.is_none() {
             let ignore = crate::build_context::Ignore::parse(&ignore_text).with_context(|| format!("parse {:?}", ignore_path))?;
             written = crate::build_context::write(&mut tar, &spec.context, &rel(&context_dir), &ignore)?;
-            if shared && ignore.excludes(".dockerignore") {
+            if shared && ignore.matches_using_parent(".dockerignore", None).0 {
                 append_bytes(&mut tar, &format!("{}/.dockerignore", rel(&context_dir)), ignore_text.as_bytes())?;
             }
         }
@@ -629,7 +655,18 @@ impl Builder {
 
     /// One `buildctl build`, failing with its output's tail, and the VM's
     /// end when it ended under the build.
+    ///
+    /// BuildKit's copy of a local source (`--local`) from an earlier build is
+    /// dropped first: BuildKit sends only the files whose size, mode or
+    /// time changed since it, and a tar keeps whole seconds, so a file
+    /// rewritten at its length within its second (or another context's file
+    /// at the same path) came from that copy (seen 2026-11-25). The context
+    /// goes over whole each build, and a `COPY` of unchanged bytes is still
+    /// cached: BuildKit keys it by the bytes.
     async fn buildctl(&self, vm: &str, args: &[String]) -> anyhow::Result<Progress> {
+        let prune = ["buildctl", "prune", "--filter", "type==source.local"].map(String::from);
+        let (code, _, p) = self.run(vm, &prune, None, tokio::io::sink(), STEP_MAX).await?;
+        anyhow::ensure!(code == 0, "drop BuildKit's earlier context: {}{}", p.tail(), self.ended(vm).await);
         let (code, _, p) = match self.run(vm, args, None, tokio::io::sink(), BUILD_MAX).await {
             Ok(ran) => ran,
             Err(e) => bail!("{e:#}{}", self.ended(vm).await),
@@ -652,7 +689,16 @@ impl Builder {
     /// The tar at `tar` in the VM, written to `file` on this machine;
     /// answers its bytes.
     async fn fetch(&self, vm: &str, tar: &str, file: &Path) -> anyhow::Result<u64> {
-        let out = tokio::fs::File::create(file).await.with_context(|| format!("create {}", file.display()))?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // The image's layers hold the project's files: this user's alone.
+        let out = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(file)
+            .with_context(|| format!("create {}", file.display()))?;
+        let out = tokio::fs::File::from_std(out);
         let cat = ["cat".to_string(), tar.to_string()];
         let (code, out, p) = match self.run(vm, &cat, None, Counted { inner: out, bytes: 0 }, BUILD_MAX).await {
             Ok(ran) => ran,
@@ -793,6 +839,25 @@ impl Builder {
 /// The KiB used, from `df -kP`'s line for one filesystem.
 fn used_kib(df: &str) -> Option<u64> {
     df.lines().nth(1)?.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// A session dropped before its end, as `celld dev`'s Ctrl-C drops a
+/// deploy mid-build: its builder is destroyed at once, still on the
+/// session's turn, and its staged images go; the turn goes with the lock's
+/// file. `finish` leaves nothing for this to do.
+impl Drop for Builder {
+    fn drop(&mut self) {
+        if let Some(vm) = self.vm.take() {
+            match destroy_blocking(&self.socket, &vm) {
+                Ok(200 | 404) => {}
+                Ok(status) => tracing::warn!(vm = %vm, status, "the builder was not destroyed"),
+                Err(e) => tracing::warn!(vm = %vm, error = %format!("{e:#}"), "the builder was not destroyed"),
+            }
+        }
+        for staged in self.staged.drain(..) {
+            let _ = std::fs::remove_file(&staged.file);
+        }
+    }
 }
 
 /// A file of `bytes` at `path` in `tar`, mode 644.

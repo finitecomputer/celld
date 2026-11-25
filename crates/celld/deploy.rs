@@ -900,7 +900,7 @@ impl ImageBuilder {
         }
         match self {
             Self::Docker => docker_pull(image, platform),
-            Self::Krun(builder) => builder.pull(image, platform).await,
+            Self::Krun(builder) => builder.pull(image).await,
         }
     }
 }

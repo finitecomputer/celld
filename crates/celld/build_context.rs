@@ -6,14 +6,13 @@
 //! leaves out; a builder in a VM gets it the same way, as a tar streamed
 //! into the VM.
 //!
-//! The rules are Docker's (moby/patternmatcher and its `ignorefile`,
-//! which BuildKit's own client applies): patterns in order, the last that
-//! matches a path or one of its parents deciding, `!` taking a path back.
-//! BuildKit applies the same file again when it reads the context in the
-//! VM, so this filter only has to never leave out what BuildKit keeps:
-//! where it would keep more, the build is the same and the tar larger. A
-//! directory is skipped whole only when it is left out and no `!` pattern
-//! could take back anything below it.
+//! The rules are BuildKit's own client's: moby/patternmatcher v0.6.1 (its
+//! `ignorefile` and `MatchesUsingParentResults`) as fsutil's walk applies
+//! them, so the tar holds exactly what `docker build` would send, no
+//! excluded file entering the VM. Patterns go in order, the last match
+//! deciding, `!` taking a path back; a path below a directory reuses what
+//! each pattern made of that directory; a directory left out is skipped
+//! whole as fsutil skips it (`prunes`).
 //!
 //! Bespoke because no maintained crate implements these rules (`glob` and
 //! the gitignore matchers anchor and treat `**` differently), and the tar
@@ -224,25 +223,17 @@ impl Pattern {
         }
     }
 
-    /// Whether this pattern could match a path strictly below `dir`: false
-    /// only when its literal leading parts leave `dir`'s, or it names
-    /// `dir` itself or one of its parents.
-    fn could_match_below(&self, dir: &str) -> bool {
-        let parts: Vec<&str> = self.text.split('/').collect();
-        let dirs: Vec<&str> = dir.split('/').collect();
-        for (i, part) in parts.iter().enumerate() {
-            if part.contains(['*', '?', '[', '\\']) {
-                return true;
-            }
-            match dirs.get(i) {
-                Some(d) if d == part => {}
-                Some(_) => return false,
-                None => return true,
-            }
-        }
-        false
+    /// fsutil's `patternWithoutTrailingGlob`: the pattern less a trailing
+    /// `/**` or `/*`.
+    fn without_trailing_glob(&self) -> &str {
+        let t = self.text.strip_suffix("/**").unwrap_or(&self.text);
+        t.strip_suffix("/*").unwrap_or(t)
     }
 }
+
+/// What each pattern made of a directory (patternmatcher's `MatchInfo`):
+/// whether it matched, `false` for one passed over.
+pub type MatchInfo = Vec<bool>;
 
 /// A `.dockerignore`, compiled.
 #[derive(Debug, Clone, Default)]
@@ -288,6 +279,7 @@ impl Ignore {
 
     /// patternmatcher's `MatchesOrParentMatches`: whether `path` (relative,
     /// slash-separated) is left out.
+    #[cfg(test)]
     pub fn excludes(&self, path: &str) -> bool {
         let parents: Vec<&str> = match path.rfind('/') {
             Some(i) => path[..i].split('/').collect(),
@@ -316,10 +308,47 @@ impl Ignore {
         matched
     }
 
-    /// Whether the directory `dir`, left out, can be skipped whole: no `!`
-    /// pattern could take back a path below it.
+    /// patternmatcher's `MatchesUsingParentResults`: whether `path` is left
+    /// out, given what each pattern made of its directory (`parent`; `None`
+    /// at the context's top), and what each made of `path`, for below it.
+    pub fn matches_using_parent(&self, path: &str, parent: Option<&MatchInfo>) -> (bool, MatchInfo) {
+        let mut matched = false;
+        let mut info = vec![false; self.patterns.len()];
+        for (i, pattern) in self.patterns.iter().enumerate() {
+            let mut hit = parent.is_some_and(|p| p[i]);
+            if !hit {
+                // An inclusion when already matched, or an exclusion when
+                // not, is passed over, and recorded as no match.
+                if pattern.exclusion != matched {
+                    continue;
+                }
+                hit = pattern.matches(path);
+                if !hit && parent.is_none() {
+                    if let Some((dir, _)) = path.rsplit_once('/') {
+                        let dirs: Vec<&str> = dir.split('/').collect();
+                        hit = (0..dirs.len()).any(|j| pattern.matches(&dirs[..=j].join("/")));
+                    }
+                }
+            }
+            info[i] = hit;
+            if hit {
+                matched = !pattern.exclusion;
+            }
+        }
+        (matched, info)
+    }
+
+    /// fsutil's walk: a directory left out is skipped whole unless a `!`
+    /// pattern below it names it by its path (a `!` pattern with a glob
+    /// short of its last part has every directory walked).
     fn prunes(&self, dir: &str) -> bool {
-        !self.patterns.iter().any(|p| p.exclusion && p.could_match_below(dir))
+        let exclusions: Vec<&Pattern> = self.patterns.iter().filter(|p| p.exclusion).collect();
+        let prefix_only = !exclusions.iter().any(|p| p.without_trailing_glob().contains(['*', '[', ']', '?', '^', '\\']));
+        if !prefix_only {
+            return false;
+        }
+        let below = format!("{dir}/");
+        !exclusions.iter().any(|p| format!("{}/", p.without_trailing_glob()).starts_with(&below))
     }
 }
 
@@ -358,9 +387,9 @@ pub fn write<W: std::io::Write>(
     tar.append_dir(prefix, context)
         .with_context(|| format!("add {} to the build context", context.display()))?;
     written.entries += 1;
-    let mut stack = vec![(context.to_path_buf(), String::new(), 0usize)];
+    let mut stack: Vec<(PathBuf, String, usize, Option<MatchInfo>)> = vec![(context.to_path_buf(), String::new(), 0, None)];
     // Bounded by ENTRIES_MAX and DEPTH_MAX.
-    while let Some((dir, rel, depth)) = stack.pop() {
+    while let Some((dir, rel, depth, parent)) = stack.pop() {
         anyhow::ensure!(depth <= DEPTH_MAX, "the build context nests past {DEPTH_MAX} directories at {}", dir.display());
         let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .with_context(|| format!("read {}", dir.display()))?
@@ -379,7 +408,7 @@ pub fn write<W: std::io::Write>(
                 format!("{rel}/{name}")
             };
             let kind = entry.file_type().with_context(|| format!("stat {}", entry.path().display()))?;
-            let excluded = ignore.excludes(&path);
+            let (excluded, info) = ignore.matches_using_parent(&path, parent.as_ref());
             if kind.is_dir() {
                 if excluded && ignore.prunes(&path) {
                     continue;
@@ -389,7 +418,7 @@ pub fn write<W: std::io::Write>(
                 tar.append_dir(format!("{prefix}/{path}"), entry.path())
                     .with_context(|| format!("add {}", entry.path().display()))?;
                 written.entries += 1;
-                stack.push((entry.path(), path, depth + 1));
+                stack.push((entry.path(), path, depth + 1, Some(info)));
             } else if (kind.is_file() || kind.is_symlink()) && !excluded {
                 if kind.is_file() {
                     let len = entry.metadata().with_context(|| format!("stat {}", entry.path().display()))?.len();
@@ -474,18 +503,36 @@ mod tests {
         assert!(Ignore::parse("[").is_err());
     }
 
-    // Goal: a directory is skipped only when nothing below it could be
-    // taken back.
+    // Goal: a directory is skipped as fsutil skips it.
     #[test]
-    fn a_directory_is_pruned_only_when_nothing_below_comes_back() {
+    fn a_directory_is_pruned_as_fsutil_prunes_it() {
         let i = ignore("*\n!Cargo.toml\n!cli\n**/target\n");
         assert!(i.excludes("target") && i.prunes("target"));
         assert!(i.excludes("cli/target") && i.prunes("cli/target"));
         let deep = ignore("*\n!docs/keep.md\n");
         assert!(deep.excludes("docs") && !deep.prunes("docs"));
         assert!(deep.prunes("src"));
+        assert!(!ignore("*\n!docs/**\n").prunes("docs"), "a trailing glob is a prefix");
         let glob = ignore("*\n!**/keep\n");
-        assert!(!glob.prunes("anything"));
+        assert!(!glob.prunes("anything"), "a glob in a ! pattern walks every directory");
+        assert!(ignore("*\n").prunes("x"), "no ! pattern at all");
+    }
+
+    // Goal: below a directory, each pattern is what it was for the
+    // directory, and one passed over there stays no match: `!src` after
+    // `src/.env` takes `src` back, never `src/.env`.
+    #[test]
+    fn a_path_below_reuses_its_directorys_matches() {
+        let i = ignore("src/.env\n!src\n");
+        let (src, info) = i.matches_using_parent("src", None);
+        assert!(!src);
+        assert!(i.matches_using_parent("src/.env", Some(&info)).0, "the secret stays out");
+        assert!(!i.matches_using_parent("src/main.rs", Some(&info)).0);
+        let j = ignore("*\n!**/keep\n");
+        let (a, info) = j.matches_using_parent("a", None);
+        assert!(a);
+        assert!(!j.matches_using_parent("a/keep", Some(&info)).0, "taken back below an excluded directory");
+        assert!(j.matches_using_parent("a/other", Some(&info)).0);
     }
 
     fn listed(dir: &Path, ignore_text: &str) -> Vec<String> {
@@ -511,7 +558,8 @@ mod tests {
             std::fs::write(root.join(f), f).unwrap();
         }
         std::os::unix::fs::symlink("main.rs", root.join("cli/src/link.rs")).unwrap();
-        let names = listed(root, "*\n!Cargo.toml\n!cli\n!docs/keep.md\n**/target\n");
+        std::fs::write(root.join("cli/.env"), "SECRET").unwrap();
+        let names = listed(root, "*\n!Cargo.toml\n!cli\ncli/.env\n!docs/keep.md\n**/target\n");
         assert_eq!(
             names,
             ["context", "context/Cargo.toml", "context/cli", "context/cli/src", "context/cli/src/link.rs", "context/cli/src/main.rs", "context/docs", "context/docs/keep.md"]
