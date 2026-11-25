@@ -37,6 +37,13 @@ const LIST_HEADS: usize = 16;
 /// one request. Above S3's 5 MiB floor, and a round number of pages.
 const STREAM_PART: usize = 8 << 20;
 
+/// The largest streamed body a conditional `put` takes. R2 applies `onlyIf`
+/// to a put of any size it takes in one request (5 GiB); a multipart
+/// completion here takes no precondition, so a conditional body is held
+/// whole and written as one conditional request, up to this, and refused
+/// past it. Room for a 100 MiB Worker request body forwarded whole.
+const CONDITIONAL_PUT_MAX: usize = 256 << 20;
+
 /// The user-metadata name the R2 object record lives under. See
 /// [`Envelope`]. The bucket stores it as `celld_r2` on Azure, which
 /// refuses a hyphen in a metadata name.
@@ -624,6 +631,17 @@ impl PutStream {
         self.digests.update(&chunk);
         self.size += chunk.len() as u64;
         self.buffered.extend_from_slice(&chunk);
+        // a conditional body goes out whole, as one conditional request
+        if self.request.only_if.is_some() {
+            if self.buffered.len() > CONDITIONAL_PUT_MAX {
+                return Err(format!(
+                    "R2 put of {}: celld writes a conditional (`onlyIf`) put as one request, \
+                     and holds its body for it up to {CONDITIONAL_PUT_MAX} bytes",
+                    self.key
+                ));
+            }
+            return Ok(());
+        }
         while self.buffered.len() > STREAM_PART {
             let part = self.buffered.drain(..STREAM_PART).collect::<Vec<_>>();
             self.part(part).await?;
@@ -636,17 +654,9 @@ impl PutStream {
     async fn part(&mut self, bytes: Vec<u8>) -> Result<(), String> {
         if self.upload.is_none() {
             // A precondition is checked against the version a write is
-            // about to replace, and a multipart completion takes none. A
-            // small streamed body still goes out as one conditional
-            // request; this one has outgrown that.
-            if self.request.only_if.is_some() {
-                return Err(format!(
-                    "R2 put of {}: celld cannot apply `onlyIf` to a streamed body larger than \
-                     {STREAM_PART} bytes, because it is written as a multipart upload and a \
-                     multipart completion takes no precondition",
-                    self.key
-                ));
-            }
+            // about to replace, and a multipart completion takes none: a
+            // conditional body is held whole (`push`), never parted.
+            assert!(self.request.only_if.is_none(), "a conditional put is written as one request");
             // The record is fixed when the upload opens, so it can only
             // carry checksums already known: the ones the caller asserted,
             // which the completion refuses to apply if the bytes disagree.
